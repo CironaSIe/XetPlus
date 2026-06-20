@@ -47,7 +47,7 @@ class CASClient:
         self,
         endpoint: str,
         access_token: str,
-        session: requests.Session,
+        session: Optional[requests.Session] = None,
         auth: Optional[XetAuth] = None,
         repo_id: str = "",
         auth_url: Optional[str] = None,
@@ -72,7 +72,7 @@ class CASClient:
         """
         self.endpoint = endpoint.rstrip('/')
         self.access_token = access_token
-        self.session = session
+        self.session = session or requests.Session()
         self._auth = auth
         self._repo_id = repo_id
         self._auth_url = auth_url
@@ -80,6 +80,7 @@ class CASClient:
         self._url_coordinator = url_coordinator
         self._acc = acc
         self.retry_max = retry_max
+        self.timeout = 30  # 默认 30 秒超时
         # Session ID 用于 CloudFront 会话跟踪
         self.session_id = uuid.uuid4().hex[:16]
         # V2 API 版本探测缓存
@@ -136,7 +137,7 @@ class CASClient:
                 url_v2 = f"{self.endpoint}/v2/reconstructions/{file_hash}"
                 logger.debug(f"[CAS] 尝试 V2 API: {url_v2[:80]}...")
                 resp = self.session.get(
-                    url_v2, headers=headers, timeout=self.session.timeout
+                    url_v2, headers=headers, timeout=self.timeout
                 )
 
                 if resp.status_code == 200:
@@ -147,7 +148,7 @@ class CASClient:
                     self._refresh_token()
                     headers = self._get_headers()
                     resp = self.session.get(
-                        url_v2, headers=headers, timeout=self.session.timeout
+                        url_v2, headers=headers, timeout=self.timeout
                     )
                     resp.raise_for_status()
                     self._v2_available = True
@@ -170,14 +171,14 @@ class CASClient:
         url_v1 = f"{self.endpoint}/v1/reconstructions/{file_hash}"
         logger.debug(f"[CAS] 使用 V1 API: {url_v1[:80]}...")
 
-        resp = self.session.get(url_v1, headers=headers, timeout=self.session.timeout)
+        resp = self.session.get(url_v1, headers=headers, timeout=self.timeout)
 
         if resp.status_code == 401:
             # 401: Token 过期，刷新后重试
             self._refresh_token()
             headers = self._get_headers()
             resp = self.session.get(
-                url_v1, headers=headers, timeout=self.session.timeout
+                url_v1, headers=headers, timeout=self.timeout
             )
 
         resp.raise_for_status()
@@ -216,7 +217,7 @@ class CASClient:
             f"range={url_range.start}-{url_range.end} ({url_range.length()} bytes)"
         )
 
-        resp = self.session.get(url, headers=headers, timeout=self.session.timeout)
+        resp = self.session.get(url, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
 
         return resp.content
@@ -263,7 +264,7 @@ class CASClient:
         )
 
         resp = self.session.get(
-            url, headers=headers, timeout=self.session.timeout, stream=True
+            url, headers=headers, timeout=self.timeout, stream=True
         )
         resp.raise_for_status()
 
@@ -499,6 +500,7 @@ class CASClient:
     def get_xet_file_info(
         url: str,
         session: requests.Session,
+        timeout: int = 30,
     ) -> XetFileInfo:
         """从 HuggingFace URL 获取 Xet 文件信息。
 
@@ -508,6 +510,7 @@ class CASClient:
         Args:
             url: HuggingFace 文件完整 URL
             session: requests.Session 实例（含代理等配置）
+            timeout: 超时时间（秒）
 
         Returns:
             XetFileInfo 包含 xet_hash、sha256、size、location 等信息
@@ -517,7 +520,7 @@ class CASClient:
             requests.HTTPError: 请求失败
         """
         resp = session.head(
-            url, allow_redirects=False, timeout=session.timeout
+            url, allow_redirects=False, timeout=timeout
         )
         resp.raise_for_status()
 

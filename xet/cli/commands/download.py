@@ -1,6 +1,8 @@
 """Download 命令实现。"""
 import sys
+import os
 import logging
+import requests
 from pathlib import Path
 from typing import Optional
 
@@ -123,13 +125,26 @@ def download_command(args):
         # 1. 加载配置
         config = ConfigManager()
         endpoint = args.endpoint or config.get_endpoint()
-        token = args.token or config.get_token()
+        hf_token = args.token or config.get_token()
         concurrency = args.concurrency or config.get_concurrency()
 
-        logger.info(f"使用配置: endpoint={endpoint}, concurrency={concurrency}")
+        if not hf_token:
+            print("✗ 缺少 HF Token，请设置：xet config xet.token YOUR_TOKEN", file=sys.stderr)
+            return 1
 
-        # 2. 初始化 CAS 客户端
-        cas_client = CASClient(endpoint=endpoint, access_token=token)
+        logger.info(f"使用配置: concurrency={concurrency}")
+
+        # 2. 创建 session 并配置代理
+        session = requests.Session()
+
+        # 从环境变量读取代理
+        https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+        if https_proxy:
+            session.proxies = {
+                'http': https_proxy,
+                'https': https_proxy,
+            }
+            logger.info(f"使用代理: {https_proxy}")
 
         # 3. 解析文件路径
         repo, file_path = parse_file_spec(args.path)
@@ -137,20 +152,60 @@ def download_command(args):
         # 4. 获取文件信息
         if repo:
             logger.info(f"从仓库获取文件信息: {repo}/{file_path}")
-            # TODO: 实现通过 repo/file 获取 file_hash 的 API
-            # file_info = cas_client.get_file_info(repo, file_path)
-            # file_hash = file_info.hash
-            # expected_size = file_info.size
-            # file_name = file_info.name
             print(f"✗ 暂不支持通过 repo/file 下载，请使用 file_hash", file=sys.stderr)
-            sys.exit(1)
+            return 1
         else:
             # 直接使用 hash 下载
             file_hash = file_path
-            expected_size = None  # 从 reconstruction 推断
+            expected_size = 0  # 从 reconstruction 推断（0 表示未知）
             file_name = f"{file_hash[:8]}.bin"
 
-        # 5. 确定输出路径
+        # 5. 获取 CAS token（使用测试仓库）
+        from xet.network.auth import XetAuth
+
+        repo_id = "mykor/granite-embedding-97m-multilingual-r2-GGUF"
+        dummy_file = "granite-embedding-97M-multilingual-r2-Q4_K_M.gguf"
+
+        file_url = f"https://huggingface.co/{repo_id}/resolve/main/{dummy_file}"
+        headers = {"Authorization": f"Bearer {hf_token}"}
+
+        logger.info(f"获取 auth URL...")
+        resp = session.head(file_url, headers=headers, allow_redirects=False, timeout=30)
+
+        if resp.status_code not in (301, 302, 307, 308):
+            print(f"✗ 无法获取 auth URL，状态码: {resp.status_code}", file=sys.stderr)
+            return 1
+
+        # 从 Link header 提取 auth URL
+        link_header = resp.headers.get("Link", "")
+        auth_url = None
+        if link_header:
+            import re
+            match = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
+            if match:
+                auth_url = match.group(1)
+                if not auth_url.startswith("http"):
+                    auth_url = f"https://huggingface.co{auth_url}"
+
+        if not auth_url:
+            print(f"✗ Link header 中未找到 xet-auth URL", file=sys.stderr)
+            return 1
+
+        auth = XetAuth(hf_token=hf_token, session=session)
+        token_info = auth.get_token(repo_id=repo_id, repo_type="model", auth_url=auth_url)
+
+        logger.info(f"获取到 CAS token, endpoint={token_info.endpoint}")
+
+        # 6. 初始化 CAS 客户端
+        cas_client = CASClient(
+            endpoint=token_info.endpoint,
+            access_token=token_info.access_token,
+            session=session,
+            auth=auth,
+            repo_id=repo_id,
+        )
+
+        # 7. 确定输出路径
         if args.output:
             output_path = args.output
         else:
@@ -158,12 +213,12 @@ def download_command(args):
 
         logger.info(f"输出路径: {output_path}")
 
-        # 6. 获取 checkpoint 路径
+        # 8. 获取 checkpoint 路径
         checkpoint_path = get_checkpoint_path(args, file_hash)
         if checkpoint_path:
             logger.info(f"Checkpoint 路径: {checkpoint_path}")
 
-        # 7. 初始化进度条
+        # 9. 初始化进度条
         progress = create_progress(
             style=args.progress_style,
             description=f"Downloading {file_name}",
@@ -172,7 +227,7 @@ def download_command(args):
         def progress_callback(stats):
             progress.update(stats)
 
-        # 8. 初始化 FileReconstructor
+        # 10. 初始化 FileReconstructor
         reconstructor = FileReconstructor(
             cas_client=cas_client,
             output_path=output_path,

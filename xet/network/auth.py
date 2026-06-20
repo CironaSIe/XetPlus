@@ -114,7 +114,7 @@ class XetAuth:
 
         headers = {"Authorization": f"Bearer {self.hf_token}"} if self.hf_token else {}
         resp = self.session.head(
-            url, headers=headers, allow_redirects=False, timeout=self.session.timeout
+            url, headers=headers, allow_redirects=False, timeout=30
         )
 
         if resp.status_code in (301, 302, 307, 308):
@@ -184,7 +184,7 @@ class XetAuth:
 
         logger.info(f"[XetAuth] 从 URL 请求 token: {auth_url}")
 
-        resp = self.session.get(auth_url, headers=headers, timeout=self.session.timeout)
+        resp = self.session.get(auth_url, headers=headers, timeout=30)
         resp.raise_for_status()
 
         data = resp.json()
