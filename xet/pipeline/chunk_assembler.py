@@ -1,6 +1,7 @@
 """数据组装器 - 解压 xorb 并组装最终文件。
 
-负责解压 xorb、应用 term operations（copy/reference）、流式写入目标文件。
+负责解压 xorb、按 terms 顺序拼接数据、流式写入目标文件。
+基于 ~/xet.py/xet/reconstructor.py 的实现逻辑。
 """
 import logging
 from pathlib import Path
@@ -16,8 +17,8 @@ class ChunkAssembler:
     """文件数据组装器。
 
     职责：
-    - 解压所有 xorb → chunks
-    - 应用 term operations（copy/reference）
+    - 解压所有 xorb → XorbBlockData
+    - 按 terms 顺序提取数据片段
     - 流式写入目标文件
 
     Attributes:
@@ -43,6 +44,11 @@ class ChunkAssembler:
     ) -> None:
         """组装最终文件。
 
+        按照 ~/xet.py 的逻辑：
+        1. 解压所有 xorb → 构建 xorb_hash → XorbBlockData 缓存
+        2. 按 terms 顺序从 xorb 提取数据片段并写入文件
+        3. 第一个 term 需要跳过 offset_into_first_range
+
         Args:
             recon: Reconstruction 响应
             xorb_data_map: {xorb_hash: compressed_xorb_data} 映射
@@ -55,78 +61,71 @@ class ChunkAssembler:
         """
         logger.info(f"[ChunkAssembler] 开始组装文件: {output_path}")
 
-        # 1. 解压所有 xorb → 构建 chunk 缓存
-        chunk_cache = self._decompress_all_xorbs(xorb_data_map)
-        logger.info(f"[ChunkAssembler] 解压完成，共 {len(chunk_cache)} 个 chunk")
+        # 1. 解压所有 xorb → 构建 xorb_hash → XorbBlockData 缓存
+        xorb_cache = self._decompress_all_xorbs_to_xorb_data(xorb_data_map, recon)
+        logger.info(f"[ChunkAssembler] 解压完成，共 {len(xorb_cache)} 个 xorb")
 
         # 2. 确保输出目录存在
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 3. 流式写入文件（应用 term operations）
+        # 3. 按 terms 顺序重建文件
         total_written = 0
 
         with open(output_path, 'wb') as f:
-            # 跳过 offset_into_first_range（如果有）
-            offset = recon.offset_into_first_range
-            if offset > 0:
-                logger.debug(
-                    f"[ChunkAssembler] 跳过 offset_into_first_range: {offset} bytes"
-                )
-
-            # 处理每个 term
             for idx, term in enumerate(recon.terms):
-                if term.op == "copy":
-                    # Copy 操作：从 chunk 读取数据
-                    chunk_data = self._get_chunk_data(
-                        chunk_hash=term.chunk_hash,
-                        chunk_cache=chunk_cache,
+                # 从缓存中获取 xorb 数据
+                if term.hash not in xorb_cache:
+                    raise ValueError(
+                        f"[ChunkAssembler] Term #{idx} 引用的 xorb 不在缓存中: {term.hash[:16]}..."
                     )
 
-                    # 应用 offset 和 length
-                    start = term.offset
-                    end = start + term.unpacked_length
-                    segment = chunk_data[start:end]
+                xorb_data = xorb_cache[term.hash]
 
-                    if len(segment) != term.unpacked_length:
+                # 使用 dict 提高查询效率（O(1) vs O(n)）
+                chunk_offset_dict = dict(xorb_data.chunk_offsets)
+
+                # 获取起始 chunk 的字节偏移
+                start_chunk_idx = term.range.start
+                start_byte = chunk_offset_dict.get(start_chunk_idx)
+
+                if start_byte is None:
+                    raise ValueError(
+                        f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
+                    )
+
+                # 使用 unpacked_length 计算结束位置
+                end_byte = start_byte + term.unpacked_length
+
+                # 边界检查
+                if end_byte > len(xorb_data.data):
+                    raise ValueError(
+                        f"[ChunkAssembler] Term #{idx} 数据范围越界: "
+                        f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                    )
+
+                # 提取数据片段
+                segment = xorb_data.data[start_byte:end_byte]
+
+                # 第一个 term 需要跳过 offset_into_first_range
+                if idx == 0 and recon.offset_into_first_range > 0:
+                    offset = recon.offset_into_first_range
+                    if offset >= len(segment):
                         raise ValueError(
-                            f"[ChunkAssembler] Chunk {term.chunk_hash[:16]}... "
-                            f"数据长度不匹配: 期望 {term.unpacked_length}, "
-                            f"实际 {len(segment)}"
+                            f"[ChunkAssembler] offset_into_first_range ({offset}) >= "
+                            f"第一个 term 长度 ({len(segment)})"
                         )
+                    segment = segment[offset:]
+                    logger.debug(
+                        f"[ChunkAssembler] 第一个 term 跳过 offset: {offset} bytes"
+                    )
 
-                    f.write(segment)
-                    total_written += len(segment)
-
-                elif term.op == "reference":
-                    # Reference 操作：从已写入的文件内容复制
-                    # 1. 刷新缓冲区
-                    f.flush()
-
-                    # 2. 定位到 reference_offset
-                    f.seek(term.reference_offset)
-
-                    # 3. 读取数据
-                    data = f.read(term.unpacked_length)
-
-                    if len(data) != term.unpacked_length:
-                        raise ValueError(
-                            f"[ChunkAssembler] Reference 读取长度不匹配: "
-                            f"期望 {term.unpacked_length}, 实际 {len(data)}"
-                        )
-
-                    # 4. 回到文件末尾
-                    f.seek(0, 2)
-
-                    # 5. 写入引用的数据
-                    f.write(data)
-                    total_written += len(data)
-
-                else:
-                    raise ValueError(f"[ChunkAssembler] 未知操作: {term.op}")
+                # 写入文件
+                f.write(segment)
+                total_written += len(segment)
 
                 # 更新进度
                 if progress_tracker:
-                    progress_tracker.increment_assembled(term.unpacked_length)
+                    progress_tracker.increment_assembled(len(segment))
 
                 # 每 100 个 term 记录一次进度
                 if (idx + 1) % 100 == 0:
@@ -139,31 +138,33 @@ class ChunkAssembler:
             f"({total_written} bytes, {len(recon.terms)} terms)"
         )
 
-    def _decompress_all_xorbs(
-        self, xorb_data_map: Dict[str, bytes]
-    ) -> Dict[str, bytes]:
-        """解压所有 xorb，返回 {chunk_hash: decompressed_data} 缓存。
+    def _decompress_all_xorbs_to_xorb_data(
+        self, xorb_data_map: Dict[str, bytes], recon: QueryReconstructionResponse
+    ) -> Dict[str, "XorbBlockData"]:
+        """解压所有 xorb，返回 {xorb_hash: XorbBlockData} 缓存。
 
-        调用 merkle-hash-rust 库进行解压。
+        从 recon.fetch_info 获取每个 xorb segment 的 chunk_range，
+        将本地 chunk 索引转换为全局索引（合并多个 segments）。
 
         Args:
             xorb_data_map: {xorb_hash: compressed_xorb_data}
+            recon: Reconstruction 响应（包含 fetch_info）
 
         Returns:
-            {chunk_hash: chunk_data} 映射
+            {xorb_hash: XorbBlockData} 映射（chunk_offsets 使用全局索引）
 
         Raises:
-            ImportError: merkle-hash-rust 未安装
+            ImportError: lz4 或 blake3 未安装
             RuntimeError: 解压失败
         """
         try:
-            from xet.storage.merkle_hash import decompress_xorb
+            from xet.storage.xorb_deserializer import XorbDeserializer, XorbBlockData
         except ImportError as e:
             raise ImportError(
-                "[ChunkAssembler] 需要 merkle-hash-rust 库: pip install merkle-hash-rust"
+                "[ChunkAssembler] 需要 lz4 和 blake3 库: pip install lz4 blake3"
             ) from e
 
-        chunk_cache = {}
+        xorb_cache = {}
 
         for xorb_hash, compressed_data in xorb_data_map.items():
             logger.debug(
@@ -171,45 +172,60 @@ class ChunkAssembler:
                 f"({len(compressed_data)} bytes)"
             )
 
-            # 调用 Rust 解压函数
+            # 调用反序列化函数（返回本地索引的 chunk_offsets）
             try:
-                chunks = decompress_xorb(compressed_data)
+                xorb_data_local = XorbDeserializer.deserialize(compressed_data)
 
-                # 合并到缓存
-                for chunk_hash, chunk_data in chunks.items():
-                    chunk_cache[chunk_hash] = chunk_data
+                # 从 fetch_info 获取所有 segments 的 chunk_range
+                # 一个 xorb 可能有多个 segments（不连续的 chunk 范围）
+                if xorb_hash in recon.fetch_info:
+                    fetch_infos = recon.fetch_info[xorb_hash]
+
+                    # 假设下载的数据按 fetch_info 的顺序排列
+                    # 每个 segment 的 chunks 在解压后是连续的
+                    combined_chunk_offsets = []
+                    local_chunk_idx = 0
+
+                    for fetch_info in fetch_infos:
+                        base_chunk_start = fetch_info.chunk_range.start
+                        segment_chunk_count = fetch_info.chunk_range.length()
+
+                        # 将这个 segment 的本地索引转换为全局索引
+                        for i in range(segment_chunk_count):
+                            if local_chunk_idx < len(xorb_data_local.chunk_offsets):
+                                _, byte_offset = xorb_data_local.chunk_offsets[local_chunk_idx]
+                                global_chunk_idx = base_chunk_start + i
+                                combined_chunk_offsets.append((global_chunk_idx, byte_offset))
+                                local_chunk_idx += 1
+
+                    xorb_data_global = XorbBlockData(
+                        chunk_offsets=combined_chunk_offsets,
+                        data=xorb_data_local.data
+                    )
+
+                    logger.debug(
+                        f"[ChunkAssembler] Xorb {xorb_hash[:16]}... "
+                        f"有 {len(fetch_infos)} 个 segments, "
+                        f"共 {len(combined_chunk_offsets)} 个 chunks"
+                    )
+                else:
+                    # 如果没有 fetch_info，假设从 0 开始（单个 segment）
+                    logger.warning(
+                        f"[ChunkAssembler] Xorb {xorb_hash[:16]}... 没有 fetch_info"
+                    )
+                    xorb_data_global = xorb_data_local
+
+                xorb_cache[xorb_hash] = xorb_data_global
 
                 logger.debug(
                     f"[ChunkAssembler] Xorb {xorb_hash[:16]}... "
-                    f"解压得到 {len(chunks)} 个 chunk"
+                    f"解压得到 {len(xorb_data_local.chunk_offsets)} 个 chunk, "
+                    f"{len(xorb_data_local.data)} bytes total"
                 )
 
             except Exception as e:
                 raise RuntimeError(
-                    f"[ChunkAssembler] 解压 xorb 失败: {xorb_hash[:16]}..., {e}"
+                    f"[ChunkAssembler] 解压 xorb {xorb_hash[:16]}... 失败: {e}"
                 ) from e
 
-        return chunk_cache
-
-    def _get_chunk_data(
-        self, chunk_hash: str, chunk_cache: Dict[str, bytes]
-    ) -> bytes:
-        """从缓存获取 chunk 数据。
-
-        Args:
-            chunk_hash: Chunk 的 MerkleHash
-            chunk_cache: Chunk 缓存
-
-        Returns:
-            Chunk 数据
-
-        Raises:
-            ValueError: Chunk 缺失
-        """
-        if chunk_hash not in chunk_cache:
-            raise ValueError(
-                f"[ChunkAssembler] Chunk 缺失: {chunk_hash[:16]}... "
-                f"(可能 xorb 解压不完整或 reconstruction 数据错误)"
-            )
-
-        return chunk_cache[chunk_hash]
+        return xorb_cache
