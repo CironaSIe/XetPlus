@@ -143,11 +143,14 @@ class ChunkAssembler:
     ) -> Dict[str, "XorbBlockData"]:
         """解压所有 xorb，返回 {xorb_hash: XorbBlockData} 缓存。
 
-        从 recon.fetch_info 获取每个 xorb segment 的 chunk_range，
-        将本地 chunk 索引转换为全局索引（合并多个 segments）。
+        处理 multipart segments:
+        - xorb_data_map 中的数据已经是合并后的（所有 segments 按顺序拼接）
+        - 需要分别反序列化每个 segment，然后按 XET.SPEC.md 合并 chunk_offsets
+
+        参考 XET.SPEC.md 的 append_chunk_segment 逻辑。
 
         Args:
-            xorb_data_map: {xorb_hash: compressed_xorb_data}
+            xorb_data_map: {xorb_hash: merged_compressed_data}
             recon: Reconstruction 响应（包含 fetch_info）
 
         Returns:
@@ -166,66 +169,85 @@ class ChunkAssembler:
 
         xorb_cache = {}
 
-        for xorb_hash, compressed_data in xorb_data_map.items():
+        for xorb_hash, merged_data in xorb_data_map.items():
             logger.debug(
                 f"[ChunkAssembler] 解压 xorb: {xorb_hash[:16]}... "
-                f"({len(compressed_data)} bytes)"
+                f"({len(merged_data)} bytes)"
             )
 
-            # 调用反序列化函数（返回本地索引的 chunk_offsets）
-            try:
-                xorb_data_local = XorbDeserializer.deserialize(compressed_data)
+            # 获取该 xorb 的所有 segments（按 chunk_range.start 排序）
+            if xorb_hash not in recon.fetch_info:
+                logger.warning(
+                    f"[ChunkAssembler] Xorb {xorb_hash[:16]}... 没有 fetch_info"
+                )
+                continue
 
-                # 从 fetch_info 获取所有 segments 的 chunk_range
-                # 一个 xorb 可能有多个 segments（不连续的 chunk 范围）
-                if xorb_hash in recon.fetch_info:
-                    fetch_infos = recon.fetch_info[xorb_hash]
+            fetch_infos = sorted(
+                recon.fetch_info[xorb_hash],
+                key=lambda fi: fi.chunk_range.start
+            )
 
-                    # 假设下载的数据按 fetch_info 的顺序排列
-                    # 每个 segment 的 chunks 在解压后是连续的
-                    combined_chunk_offsets = []
-                    local_chunk_idx = 0
+            # 分别反序列化每个 segment 并合并
+            # 参考 XET.SPEC.md 的 append_chunk_segment 逻辑
+            all_chunk_offsets = []
+            all_data = bytearray()
+            data_offset = 0
 
-                    for fetch_info in fetch_infos:
-                        base_chunk_start = fetch_info.chunk_range.start
-                        segment_chunk_count = fetch_info.chunk_range.length()
+            for seg_idx, fi in enumerate(fetch_infos):
+                # 提取这个 segment 的数据
+                segment_byte_length = fi.url_range.length()
+                segment_data = merged_data[data_offset:data_offset + segment_byte_length]
+                data_offset += segment_byte_length
 
-                        # 将这个 segment 的本地索引转换为全局索引
-                        for i in range(segment_chunk_count):
-                            if local_chunk_idx < len(xorb_data_local.chunk_offsets):
-                                _, byte_offset = xorb_data_local.chunk_offsets[local_chunk_idx]
-                                global_chunk_idx = base_chunk_start + i
-                                combined_chunk_offsets.append((global_chunk_idx, byte_offset))
-                                local_chunk_idx += 1
+                # 反序列化这个 segment
+                try:
+                    segment_xorb = XorbDeserializer.deserialize(segment_data)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[ChunkAssembler] 解压 xorb {xorb_hash[:16]}... "
+                        f"segment {seg_idx} 失败: {e}"
+                    ) from e
 
-                    xorb_data_global = XorbBlockData(
-                        chunk_offsets=combined_chunk_offsets,
-                        data=xorb_data_local.data
-                    )
+                # 合并 chunk_offsets
+                # 注意：XET.SPEC.md 的逻辑是针对 [0, offset1, offset2, ...] 这样的偏移列表
+                # 但 XorbDeserializer 返回的是 [(chunk_idx, byte_offset), ...] 元组列表
+                # 两者逻辑不同！
 
-                    logger.debug(
-                        f"[ChunkAssembler] Xorb {xorb_hash[:16]}... "
-                        f"有 {len(fetch_infos)} 个 segments, "
-                        f"共 {len(combined_chunk_offsets)} 个 chunks"
-                    )
-                else:
-                    # 如果没有 fetch_info，假设从 0 开始（单个 segment）
-                    logger.warning(
-                        f"[ChunkAssembler] Xorb {xorb_hash[:16]}... 没有 fetch_info"
-                    )
-                    xorb_data_global = xorb_data_local
+                base_chunk_idx = fi.chunk_range.start
+                base_data_offset = len(all_data)
 
-                xorb_cache[xorb_hash] = xorb_data_global
+                for local_chunk_idx, local_byte_offset in segment_xorb.chunk_offsets:
+                    # 全局 chunk 索引 = segment 起始索引 + 本地索引
+                    global_chunk_idx = base_chunk_idx + local_chunk_idx
+
+                    # 全局字节偏移 = 当前累积数据长度 + 本地偏移
+                    global_byte_offset = base_data_offset + local_byte_offset
+
+                    all_chunk_offsets.append((global_chunk_idx, global_byte_offset))
+
+                # 追加数据
+                all_data.extend(segment_xorb.data)
 
                 logger.debug(
-                    f"[ChunkAssembler] Xorb {xorb_hash[:16]}... "
-                    f"解压得到 {len(xorb_data_local.chunk_offsets)} 个 chunk, "
-                    f"{len(xorb_data_local.data)} bytes total"
+                    f"[ChunkAssembler] Segment {seg_idx + 1}/{len(fetch_infos)}: "
+                    f"chunks=[{fi.chunk_range.start},{fi.chunk_range.end}), "
+                    f"{len(segment_xorb.chunk_offsets)} chunks, "
+                    f"{len(segment_xorb.data)} bytes"
                 )
 
-            except Exception as e:
-                raise RuntimeError(
-                    f"[ChunkAssembler] 解压 xorb {xorb_hash[:16]}... 失败: {e}"
-                ) from e
+            # 创建合并后的 XorbBlockData
+            xorb_data_merged = XorbBlockData(
+                chunk_offsets=all_chunk_offsets,
+                data=bytes(all_data)
+            )
+
+            xorb_cache[xorb_hash] = xorb_data_merged
+
+            logger.debug(
+                f"[ChunkAssembler] Xorb {xorb_hash[:16]}... 解压完成: "
+                f"{len(fetch_infos)} segments, "
+                f"{len(all_chunk_offsets)} chunks total, "
+                f"{len(all_data)} bytes total"
+            )
 
         return xorb_cache
