@@ -12,6 +12,8 @@ from xet.pipeline.download_scheduler import DownloadScheduler
 from xet.pipeline.chunk_assembler import ChunkAssembler
 from xet.pipeline.checkpoint_manager import CheckpointManager
 from xet.pipeline.progress_tracker import ProgressTracker
+from xet.pipeline.xorb_disk_cache import XorbDiskCache
+from xet.pipeline.chunk_disk_cache import ChunkDiskCache
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,14 @@ class FileReconstructor:
         max_workers: int = 4,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         stop_event: Optional[threading.Event] = None,
+        xorb_cache: Optional[XorbDiskCache] = None,
+        chunk_cache: Optional[ChunkDiskCache] = None,
+        max_memory_mb: int = 200,
+        prefetch_low_mb: int = 48,
+        prefetch_high_mb: int = 192,
+        prefetch_max: int = 8,
+        checkpoint_interval: int = 10,
+        retry_max: int = 5,
     ):
         """初始化文件重建协调器。
 
@@ -65,11 +75,25 @@ class FileReconstructor:
             max_workers: 最大并发下载数
             progress_callback: 进度更新回调函数
             stop_event: 中断信号（用于 Ctrl+C）
+            xorb_cache: Xorb 磁盘缓存（可选，用于回退）
+            chunk_cache: Chunk 磁盘缓存（可选，优先使用）
+            max_memory_mb: 解压缓冲区内存限制（MB，默认 200）
+            prefetch_low_mb: 预取低水位线（MB，默认 48）
+            prefetch_high_mb: 预取高水位线（MB，默认 192）
+            prefetch_max: 单次最多预取 xorb 数量（默认 8）
+            checkpoint_interval: 每 N terms 保存 checkpoint（默认 10）
+            retry_max: 最大重试次数（默认 5）
         """
         self.cas_client = cas_client
         self.output_path = output_path
         self.temp_dir = temp_dir or Path.cwd() / ".xet_temp"
         self._stop_event = stop_event or threading.Event()
+        self.xorb_cache = xorb_cache
+        self.chunk_cache = chunk_cache
+        self.max_memory_mb = max_memory_mb
+        self.prefetch_max = prefetch_max
+        self.checkpoint_interval = checkpoint_interval
+        self.retry_max = retry_max
 
         # 初始化子组件
         self.checkpoint_manager = CheckpointManager(checkpoint_path) if checkpoint_path else None
@@ -80,13 +104,35 @@ class FileReconstructor:
             progress_tracker=self.progress_tracker,
             checkpoint_manager=self.checkpoint_manager,
             stop_event=self._stop_event,
+            xorb_cache=xorb_cache,
         )
-        self.assembler = ChunkAssembler(temp_dir=self.temp_dir)
+        self.assembler = ChunkAssembler(
+            temp_dir=self.temp_dir,
+            max_memory_mb=max_memory_mb,
+            prefetch_low_mb=prefetch_low_mb,
+            prefetch_high_mb=prefetch_high_mb,
+            prefetch_max=prefetch_max,
+            checkpoint_interval=checkpoint_interval,
+            max_concurrent_downloads=max_workers,
+        )
+
+        # 缓存状态日志
+        cache_status_parts = []
+        if chunk_cache and chunk_cache.enabled:
+            cache_status_parts.append("chunk-level enabled")
+        if xorb_cache and xorb_cache.enabled:
+            cache_status_parts.append("xorb-level fallback")
+        if not cache_status_parts:
+            cache_status_parts.append("disabled")
+        cache_status = ", ".join(cache_status_parts)
 
         logger.info(
             f"[FileReconstructor] 初始化完成: "
             f"output={output_path}, max_workers={max_workers}, "
-            f"checkpoint={'enabled' if checkpoint_path else 'disabled'}"
+            f"checkpoint={'enabled' if checkpoint_path else 'disabled'}, "
+            f"cache={cache_status}, "
+            f"max_memory={max_memory_mb}MB, "
+            f"prefetch={prefetch_low_mb}-{prefetch_high_mb}MB"
         )
 
     def reconstruct_file(
@@ -131,7 +177,7 @@ class FileReconstructor:
                 f"{len(recon.fetch_info)} 唯一 xorb"
             )
 
-            # 2. 设置进度跟踪器总大小
+            # 2. 设置进度跟踪器总大小和总数
             if expected_size > 0:
                 self.progress_tracker.set_total_bytes(expected_size)
             else:
@@ -139,6 +185,14 @@ class FileReconstructor:
                 total_size = sum(term.unpacked_length for term in recon.terms)
                 self.progress_tracker.set_total_bytes(total_size)
                 logger.info(f"[FileReconstructor] 计算文件大小: {total_size} bytes")
+
+            # 设置 xorb 和 term 总数
+            self.progress_tracker.set_total_xorbs(len(recon.fetch_info))
+            self.progress_tracker.set_total_terms(len(recon.terms))
+
+            # 计算总 segment 数
+            total_segments = sum(len(segments) for segments in recon.fetch_info.values())
+            self.progress_tracker.set_total_segments(total_segments)
 
             # 3. 检查并加载 checkpoint（可选）
             checkpoint = None
@@ -151,33 +205,34 @@ class FileReconstructor:
                         f"{checkpoint.completion_count()} 个 xorb 已完成"
                     )
 
-            # 4. 下载所有 xorb
-            logger.info("[FileReconstructor] 开始下载 xorb...")
-            xorb_data_map = self.scheduler.download_all_xorbs(
-                recon=recon,
-                file_hash=file_hash,
-                checkpoint=checkpoint,
-            )
-            logger.info(
-                f"[FileReconstructor] Xorb 下载完成: {len(xorb_data_map)} 个"
+            # 4. 组装文件（使用预取模式，避免一次性下载所有 xorb）
+            logger.info("[FileReconstructor] 开始组装文件（预取模式）...")
+
+            # 创建缓存适配器
+            from xet.pipeline.chunk_cache_adapter import ChunkCacheAdapter
+            cache_adapter = ChunkCacheAdapter(
+                chunk_cache=self.chunk_cache,
+                xorb_cache=self.xorb_cache
             )
 
-            # 5. 组装文件
-            logger.info("[FileReconstructor] 开始组装文件...")
-            self.assembler.assemble_file(
+            self.assembler.assemble_file_with_prefetch(
                 recon=recon,
-                xorb_data_map=xorb_data_map,
+                cas_client=self.cas_client,
                 output_path=self.output_path,
+                file_hash=file_hash,
                 progress_tracker=self.progress_tracker,
+                cache_adapter=cache_adapter,
+                stop_event=self._stop_event,
+                checkpoint_manager=self.checkpoint_manager,
             )
             logger.info(f"[FileReconstructor] 文件组装完成: {self.output_path}")
 
-            # 6. 清理 checkpoint
+            # 5. 清理 checkpoint
             if self.checkpoint_manager:
                 logger.info("[FileReconstructor] 清理 checkpoint...")
                 self.checkpoint_manager.clear(file_hash)
 
-            # 7. 验证文件大小
+            # 6. 验证文件大小
             actual_size = self.output_path.stat().st_size
             if expected_size > 0 and actual_size != expected_size:
                 raise ReconstructionError(
@@ -185,7 +240,7 @@ class FileReconstructor:
                 )
 
             logger.info(
-                f"[FileReconstructor] 文件重建成功: {self.output_path} "
+                f"[FileReconstructor] ✅ 文件重建成功: {self.output_path} "
                 f"({actual_size} bytes)"
             )
 

@@ -1,12 +1,16 @@
 """自适应并发控制器 - 对齐 Rust xet-core 实现。
 
 基于 EWMA (Exponential Weighted Moving Average) 跟踪成功率，
-动态调整并发数。失败时快速降级，成功时缓慢恢复。
+并结合 RTT/带宽预测，动态调整并发数。
+
+增强版：集成 OnlineLinearRegression 预测 RTT。
 """
 import threading
 import time
 import logging
 from typing import Optional
+
+from xet.network.online_regression import OnlineLinearRegression
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +42,8 @@ class AdaptiveConcurrencyController:
         success_threshold: float = 0.8,
         ewma_alpha: float = 0.3,
         adjustment_interval: float = 0.5,
+        enable_rtt_prediction: bool = True,
+        target_max_rtt: float = 5.0,
     ):
         """初始化自适应并发控制器。
 
@@ -48,6 +54,8 @@ class AdaptiveConcurrencyController:
             success_threshold: 触发增加的成功率阈值（0.0-1.0）
             ewma_alpha: EWMA 衰减因子（0.0-1.0，越大越敏感）
             adjustment_interval: 最小调整间隔（秒）
+            enable_rtt_prediction: 是否启用 RTT 预测（默认 True）
+            target_max_rtt: 目标最大 RTT（秒，默认 5.0）
         """
         if not (1 <= initial <= max_concurrency):
             raise ValueError(f"initial={initial} 必须在 [1, {max_concurrency}] 范围内")
@@ -62,6 +70,8 @@ class AdaptiveConcurrencyController:
         self._success_threshold = success_threshold
         self._alpha = ewma_alpha
         self._adjustment_interval = adjustment_interval
+        self._enable_rtt_prediction = enable_rtt_prediction
+        self._target_max_rtt = target_max_rtt
 
         # 当前并发数和信号量
         self._current = initial
@@ -75,6 +85,15 @@ class AdaptiveConcurrencyController:
 
         # 调整时间戳
         self._last_adjustment_time: float = 0.0
+
+        # RTT 预测器（可选）
+        self._rtt_predictor: Optional[OnlineLinearRegression] = None
+        if enable_rtt_prediction:
+            self._rtt_predictor = OnlineLinearRegression(
+                max_samples=100,
+                target_max_rtt=target_max_rtt
+            )
+            logger.debug(f"[ACC] RTT 预测已启用: target_rtt={target_max_rtt}s")
 
     def acquire(self, timeout: float = 300.0) -> bool:
         """获取下载许可（阻塞直到获得或超时）。
@@ -95,14 +114,24 @@ class AdaptiveConcurrencyController:
         """释放下载许可。"""
         self._semaphore.release()
 
-    def report_success(self, bytes_transferred: int = 0):
+    def report_success(self, bytes_transferred: int = 0, rtt: Optional[float] = None):
         """报告成功，可能触发并发数增加。
 
         Args:
             bytes_transferred: 传输字节数（可选，用于统计）
+            rtt: 往返时间（秒，可选，用于 RTT 预测）
         """
         self._update_ewma(success=True)
-        self._maybe_increase()
+
+        # 更新 RTT 预测器
+        if self._rtt_predictor and rtt is not None and bytes_transferred > 0:
+            self._rtt_predictor.add_sample(
+                size=bytes_transferred,
+                concurrency=self._current,
+                observed_rtt=rtt
+            )
+
+        self._maybe_increase(bytes_transferred)
 
     def report_failure(self, status_code: int = 0):
         """报告失败，快速降级并发数。
@@ -130,8 +159,12 @@ class AdaptiveConcurrencyController:
                 self._alpha * current_value + (1 - self._alpha) * self._ewma_success_rate
             )
 
-    def _maybe_increase(self):
-        """尝试增加并发数（成功率高且冷却期已过）。"""
+    def _maybe_increase(self, bytes_transferred: int = 0):
+        """尝试增加并发数（成功率高且冷却期已过）。
+
+        Args:
+            bytes_transferred: 传输字节数（用于 RTT 预测）
+        """
         now = time.time()
         with self._lock:
             # 检查冷却期
@@ -146,13 +179,25 @@ class AdaptiveConcurrencyController:
             if self._current >= self._max:
                 return
 
+            # 如果启用 RTT 预测，检查预测的 RTT
+            if self._rtt_predictor and bytes_transferred > 0:
+                if not self._rtt_predictor.should_increase_concurrency(
+                    size=bytes_transferred,
+                    current_concurrency=self._current
+                ):
+                    logger.debug(
+                        f"[ACC] RTT 预测阻止增加: 预测 RTT 超过目标 "
+                        f"({self._target_max_rtt}s)"
+                    )
+                    return
+
             # 增加并发
             old_value = self._current
             self._current += 1
             self._semaphore.release()  # 增加一个许可
             self._last_adjustment_time = now
 
-            logger.debug(
+            logger.info(
                 f"[ACC] 并发数增加: {old_value} → {self._current} "
                 f"(EWMA={self._ewma_success_rate:.3f})"
             )
