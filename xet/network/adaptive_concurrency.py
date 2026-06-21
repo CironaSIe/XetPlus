@@ -3,14 +3,14 @@
 基于 EWMA (Exponential Weighted Moving Average) 跟踪成功率，
 并结合 RTT/带宽预测，动态调整并发数。
 
-增强版：集成 OnlineLinearRegression 预测 RTT。
+增强版：集成 RTTPredictor 预测 RTT（基于指数加权在线线性回归）。
 """
 import threading
 import time
 import logging
 from typing import Optional
 
-from xet.network.online_regression import OnlineLinearRegression
+from xet.network.online_regression import RTTPredictor
 
 
 logger = logging.getLogger(__name__)
@@ -87,13 +87,12 @@ class AdaptiveConcurrencyController:
         self._last_adjustment_time: float = 0.0
 
         # RTT 预测器（可选）
-        self._rtt_predictor: Optional[OnlineLinearRegression] = None
+        self._rtt_predictor: Optional[RTTPredictor] = None
         if enable_rtt_prediction:
-            self._rtt_predictor = OnlineLinearRegression(
-                max_samples=100,
-                target_max_rtt=target_max_rtt
+            self._rtt_predictor = RTTPredictor(
+                decay_half_life_count=100.0
             )
-            logger.debug(f"[ACC] RTT 预测已启用: target_rtt={target_max_rtt}s")
+            logger.debug(f"[ACC] RTT 预测已启用: half_life=100.0")
 
     def acquire(self, timeout: float = 300.0) -> bool:
         """获取下载许可（阻塞直到获得或超时）。
@@ -118,17 +117,18 @@ class AdaptiveConcurrencyController:
         """报告成功，可能触发并发数增加。
 
         Args:
-            bytes_transferred: 传输字节数（可选，用于统计）
+            bytes_transferred: 传输字节数（可选，用于 RTT 预测）
             rtt: 往返时间（秒，可选，用于 RTT 预测）
         """
         self._update_ewma(success=True)
 
         # 更新 RTT 预测器
         if self._rtt_predictor and rtt is not None and bytes_transferred > 0:
-            self._rtt_predictor.add_sample(
-                size=bytes_transferred,
-                concurrency=self._current,
-                observed_rtt=rtt
+            self._rtt_predictor.update(
+                size_bytes=bytes_transferred,
+                duration_secs=rtt,
+                avg_concurrent=float(self._current),
+                weight=1.0
             )
 
         self._maybe_increase(bytes_transferred)
@@ -181,13 +181,16 @@ class AdaptiveConcurrencyController:
 
             # 如果启用 RTT 预测，检查预测的 RTT
             if self._rtt_predictor and bytes_transferred > 0:
-                if not self._rtt_predictor.should_increase_concurrency(
-                    size=bytes_transferred,
-                    current_concurrency=self._current
-                ):
+                # 预测增加 1 个并发后的 RTT
+                predicted_rtt = self._rtt_predictor.predicted_rtt(
+                    size_bytes=bytes_transferred,
+                    avg_concurrent=float(self._current + 1)
+                )
+
+                if predicted_rtt is not None and predicted_rtt > self._target_max_rtt:
                     logger.debug(
-                        f"[ACC] RTT 预测阻止增加: 预测 RTT 超过目标 "
-                        f"({self._target_max_rtt}s)"
+                        f"[ACC] RTT 预测阻止增加: predicted_rtt={predicted_rtt:.3f}s "
+                        f"> target={self._target_max_rtt}s"
                     )
                     return
 
