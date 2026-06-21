@@ -359,9 +359,10 @@ class PrefetchHelpers:
             segments.append(segment_data)
             total_size += len(segment_data)
 
-            # 更新 segment 进度
+            # 更新进度
             if progress_tracker:
-                progress_tracker.increment_segments(1)
+                progress_tracker.increment_downloaded(len(segment_data))  # 更新下载字节数
+                progress_tracker.increment_segments(1)  # 更新 segment 计数
 
         # 合并
         merged_data = b''.join(segments)
