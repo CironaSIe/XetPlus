@@ -124,6 +124,13 @@ def register_download_command(subparsers):
              "也可通过环境变量 HTTPS_PROXY 设置",
     )
 
+    parser.add_argument(
+        "--dns-servers",
+        help="自定义 DoH 服务器列表（逗号分隔）。"
+             "示例: https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
+             "默认使用内置服务器列表（国内优先 + 海外备选）",
+    )
+
     # 分段下载参数
     parser.add_argument(
         "--segment-size",
@@ -782,6 +789,13 @@ def download_command(args):
 
         refresh_hosts = getattr(args, 'refresh_hosts', False)
 
+        # 解析 DNS 服务器列表
+        dns_servers = None
+        if hasattr(args, 'dns_servers') and args.dns_servers:
+            dns_servers = [s.strip() for s in args.dns_servers.split(',') if s.strip()]
+            if dns_servers:
+                logger.info(f"[Download] 使用自定义 DNS 服务器: {len(dns_servers)} 个")
+
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")
 
@@ -789,6 +803,7 @@ def download_command(args):
             proxy=proxy or "",
             optimize_hosts=optimize_hosts,
             refresh_hosts=refresh_hosts,
+            dns_servers=dns_servers,
         )
 
         if optimize_hosts and host_optimizer:
