@@ -121,6 +121,7 @@ class ChunkAssembler(PrefetchHelpers):
         cache_adapter = None,
         stop_event: Optional[threading.Event] = None,
         checkpoint_manager = None,
+        parallel_write: bool = False,
     ) -> None:
         """组装最终文件（预取模式，推荐）。
 
@@ -135,6 +136,7 @@ class ChunkAssembler(PrefetchHelpers):
             cache_adapter: 缓存适配器（可选）
             stop_event: 停止事件（用于中断）
             checkpoint_manager: Checkpoint 管理器（可选，支持 term 级断点续传）
+            parallel_write: 是否启用并行批量写入（默认 False）
 
         Raises:
             ValueError: 数据缺失或格式错误
@@ -144,7 +146,8 @@ class ChunkAssembler(PrefetchHelpers):
         logger.info(
             f"[ChunkAssembler] 开始组装文件（预取模式）: {output_path}, "
             f"内存限制: {self.max_memory_mb}MB, "
-            f"水位线: {self.prefetch_low_mb}-{self.prefetch_high_mb}MB"
+            f"水位线: {self.prefetch_low_mb}-{self.prefetch_high_mb}MB, "
+            f"并行写入: {'启用' if parallel_write else '禁用'}"
         )
 
         if stop_event:
@@ -457,6 +460,40 @@ class ChunkAssembler(PrefetchHelpers):
         # 使用 .part 文件显示真实进度
         part_path = output_path.with_suffix(output_path.suffix + ".part")
 
+        # 并行写入模式
+        if parallel_write:
+            self._assemble_with_parallel_write(
+                recon, cas_client, part_path, output_path, file_hash,
+                start_term_idx, progress_tracker, cache_adapter,
+                stop_event, checkpoint_manager, start_time
+            )
+        else:
+            # 顺序写入模式（现有逻辑）
+            self._assemble_with_sequential_write(
+                recon, cas_client, part_path, output_path, file_hash,
+                start_term_idx, progress_tracker, cache_adapter,
+                stop_event, checkpoint_manager, start_time
+            )
+
+    def _assemble_with_sequential_write(
+        self,
+        recon,
+        cas_client,
+        part_path,
+        output_path,
+        file_hash,
+        start_term_idx,
+        progress_tracker,
+        cache_adapter,
+        stop_event,
+        checkpoint_manager,
+        start_time,
+    ):
+        """顺序写入模式（现有逻辑）。"""
+        low_watermark = self.prefetch_low_mb * 1024 * 1024
+        high_watermark = self.prefetch_high_mb * 1024 * 1024
+        total_written = 0
+
         try:
             with open(part_path, 'wb') as f:
                 for term_idx, term in enumerate(recon.terms):
@@ -580,3 +617,174 @@ class ChunkAssembler(PrefetchHelpers):
                 except Exception as e:
                     logger.warning(f"[ChunkAssembler] 清理 .part 文件失败: {e}")
             raise
+
+    def _assemble_with_parallel_write(
+        self,
+        recon,
+        cas_client,
+        part_path,
+        output_path,
+        file_hash,
+        start_term_idx,
+        progress_tracker,
+        cache_adapter,
+        stop_event,
+        checkpoint_manager,
+        start_time,
+    ):
+        """并行写入模式（使用 GlobalWriter）。"""
+        from xet.pipeline.global_writer import GlobalWriter
+
+        low_watermark = self.prefetch_low_mb * 1024 * 1024
+        high_watermark = self.prefetch_high_mb * 1024 * 1024
+
+        # 创建 GlobalWriter
+        writer = GlobalWriter(
+            output_path=part_path,
+            batch_size=self.max_concurrent_downloads,
+            progress_callback=lambda n: progress_tracker.increment_assembled(n) if progress_tracker else None,
+            stop_event=stop_event,
+        )
+        writer.start()
+
+        try:
+            # 计算文件偏移量
+            current_offset = 0
+            if start_term_idx == 0 and recon.offset_into_first_range > 0:
+                # 第一个 term 需要跳过 offset
+                current_offset = -recon.offset_into_first_range
+
+            for term_idx, term in enumerate(recon.terms):
+                # 跳过已完成的 terms（checkpoint 恢复）
+                if term_idx < start_term_idx:
+                    # 计算偏移量（即使跳过也要累加）
+                    if term_idx == 0 and recon.offset_into_first_range > 0:
+                        current_offset += max(0, term.unpacked_length - recon.offset_into_first_range)
+                    else:
+                        current_offset += term.unpacked_length
+                    continue
+
+                # 检查中断
+                if self._stop_event.is_set():
+                    logger.info("[ChunkAssembler] 检测到中断信号")
+                    raise KeyboardInterrupt("用户中断")
+
+                # 确保 xorb 已加载（触发下载/解压）
+                self._ensure_xorb_ready(
+                    term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
+                )
+
+                # 检查水位线，预取后续 xorb
+                current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
+                if current_cache_bytes < low_watermark:
+                    self._prefetch_upcoming_xorbs(
+                        term_idx, recon, cas_client, file_hash,
+                        cache_adapter, high_watermark, progress_tracker
+                    )
+
+                # 从 xorb 提取数据
+                xorb_data = self._xorb_cache[term.hash]
+                chunk_offset_dict = dict(xorb_data.chunk_offsets)
+
+                start_chunk_idx = term.range.start
+                start_byte = chunk_offset_dict.get(start_chunk_idx)
+
+                if start_byte is None:
+                    raise ValueError(
+                        f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
+                    )
+
+                end_byte = start_byte + term.unpacked_length
+
+                if end_byte > len(xorb_data.data):
+                    raise ValueError(
+                        f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
+                        f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                    )
+
+                segment = xorb_data.data[start_byte:end_byte]
+
+                # 第一个 term 需要跳过 offset_into_first_range
+                if term_idx == 0 and recon.offset_into_first_range > 0:
+                    offset = recon.offset_into_first_range
+                    if offset >= len(segment):
+                        raise ValueError(
+                            f"[ChunkAssembler] offset_into_first_range ({offset}) >= "
+                            f"第一个 term 长度 ({len(segment)})"
+                        )
+                    segment = segment[offset:]
+
+                # 计算写入偏移量
+                write_offset = max(0, current_offset)
+
+                # 放入写队列（异步）
+                writer.put(write_offset, segment)
+
+                # 更新偏移量
+                current_offset += len(segment)
+
+                # 更新完成速率估算器
+                self._rate_estimator.update(len(segment))
+
+                # Term 计数（进度由 GlobalWriter 回调更新）
+                if progress_tracker:
+                    progress_tracker.increment_terms(1)
+
+                # Term 级 checkpoint
+                if checkpoint_manager:
+                    checkpoint_manager.mark_term_completed(
+                        file_hash=file_hash,
+                        term_idx=term_idx,
+                        xorb_hash=term.hash,
+                        save_interval=self.checkpoint_interval
+                    )
+
+                # 检查是否可以释放 xorb
+                if not self._is_xorb_needed_later(term.hash, term_idx, recon):
+                    if term.hash in self._xorb_cache:
+                        released_size = len(self._xorb_cache[term.hash].data)
+                        del self._xorb_cache[term.hash]
+                        logger.debug(
+                            f"[ChunkAssembler] 释放 xorb {term.hash[:16]}... "
+                            f"({released_size / 1024 / 1024:.1f}MB)"
+                        )
+
+                # 定期日志
+                if (term_idx + 1) % 100 == 0:
+                    cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
+                    logger.debug(
+                        f"[ChunkAssembler] 进度: {term_idx + 1}/{len(recon.terms)} terms, "
+                        f"缓存: {cache_mb:.1f}MB"
+                    )
+
+            # 完成写入，等待 writer 线程
+            total_written = writer.finish()
+
+            # 重命名 .part -> 目标文件
+            part_path.rename(output_path)
+
+            # 完成统计
+            duration = time.time() - start_time
+            speed_mbps = (total_written / max(duration, 0.001)) / (1024 * 1024)
+            unique_xorbs = len(set(t.hash for t in recon.terms))
+
+            logger.info(
+                f"[ChunkAssembler] ✅ 下载完成统计 (并行写入):\n"
+                f"  - 文件: {output_path.name}\n"
+                f"  - 大小: {total_written / 1024 / 1024:.2f} MB\n"
+                f"  - Terms: {len(recon.terms)} 个\n"
+                f"  - Xorbs: {unique_xorbs} 个\n"
+                f"  - 耗时: {duration:.1f} 秒\n"
+                f"  - 速度: {speed_mbps:.2f} MB/s"
+            )
+
+        except Exception:
+            # 异常时清理 .part 文件
+            if part_path.exists():
+                try:
+                    part_path.unlink()
+                    logger.debug(f"[ChunkAssembler] 清理 .part 文件: {part_path}")
+                except Exception as e:
+                    logger.warning(f"[ChunkAssembler] 清理 .part 文件失败: {e}")
+            raise
+

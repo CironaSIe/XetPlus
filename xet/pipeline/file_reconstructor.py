@@ -64,6 +64,7 @@ class FileReconstructor:
         prefetch_max: int = 8,
         checkpoint_interval: int = 10,
         retry_max: int = 5,
+        parallel_write: bool = False,
     ):
         """初始化文件重建协调器。
 
@@ -83,6 +84,7 @@ class FileReconstructor:
             prefetch_max: 单次最多预取 xorb 数量（默认 8）
             checkpoint_interval: 每 N terms 保存 checkpoint（默认 10）
             retry_max: 最大重试次数（默认 5）
+            parallel_write: 启用并行批量写入（默认 False）
         """
         self.cas_client = cas_client
         self.output_path = output_path
@@ -94,6 +96,7 @@ class FileReconstructor:
         self.prefetch_max = prefetch_max
         self.checkpoint_interval = checkpoint_interval
         self.retry_max = retry_max
+        self.parallel_write = parallel_write
 
         # 初始化子组件
         self.checkpoint_manager = CheckpointManager(checkpoint_path) if checkpoint_path else None
@@ -224,6 +227,7 @@ class FileReconstructor:
                 cache_adapter=cache_adapter,
                 stop_event=self._stop_event,
                 checkpoint_manager=self.checkpoint_manager,
+                parallel_write=self.parallel_write,
             )
             logger.info(f"[FileReconstructor] 文件组装完成: {self.output_path}")
 
