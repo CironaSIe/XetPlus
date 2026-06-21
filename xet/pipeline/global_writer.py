@@ -80,6 +80,7 @@ class GlobalWriter:
         self._writer_thread = None
         self._writer_exception = None
         self._bytes_written = 0
+        self._bytes_lock = threading.Lock()  # 保护 _bytes_written
         self._started = False
 
     def start(self):
@@ -150,12 +151,40 @@ class GlobalWriter:
         if self._writer_exception is not None:
             raise RuntimeError(f"GlobalWriter 线程异常: {self._writer_exception}")
 
+        # 读取最终字节数（线程安全）
+        with self._bytes_lock:
+            final_bytes = self._bytes_written
+
         logger.info(
             f"[GlobalWriter] 写入完成: {self.output_path.name}, "
-            f"{self._bytes_written / 1024 / 1024:.2f} MB"
+            f"{final_bytes / 1024 / 1024:.2f} MB"
         )
 
-        return self._bytes_written
+        return final_bytes
+
+    def __enter__(self):
+        """上下文管理器入口。"""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器退出（自动完成写入或清理）。"""
+        if exc_type is None:
+            # 正常退出，完成写入
+            try:
+                self.finish()
+            except Exception as e:
+                logger.error(f"[GlobalWriter] 完成写入失败: {e}")
+                return False
+        else:
+            # 异常退出，设置停止信号并等待线程退出
+            logger.warning(f"[GlobalWriter] 异常退出: {exc_type.__name__}: {exc_val}")
+            self.stop_event.set()
+            if self._writer_thread and self._writer_thread.is_alive():
+                self._writer_thread.join(timeout=5)
+                if self._writer_thread.is_alive():
+                    logger.error("[GlobalWriter] 线程等待超时（5秒）")
+        return False  # 不抑制异常
 
     def _open_file_shared_write(self, path: str):
         """以允许并发读写的模式打开文件（Windows 兼容）。
@@ -290,9 +319,10 @@ class GlobalWriter:
         f.flush()
         os.fsync(f.fileno())
 
-        # 更新进度
+        # 更新进度（线程安全）
         total = sum(len(d) for _, d in batch)
-        self._bytes_written += total
+        with self._bytes_lock:
+            self._bytes_written += total
 
         if self.progress_callback:
             self.progress_callback(total)

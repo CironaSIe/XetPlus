@@ -659,7 +659,7 @@ class ChunkAssembler(PrefetchHelpers):
             # 计算文件偏移量
             current_offset = 0
             if start_term_idx == 0 and recon.offset_into_first_range > 0:
-                # 第一个 term 需要跳过 offset
+                # 第一个 term 需要跳过 offset（使用负数初始化）
                 current_offset = -recon.offset_into_first_range
 
             for term_idx, term in enumerate(recon.terms):
@@ -667,7 +667,8 @@ class ChunkAssembler(PrefetchHelpers):
                 if term_idx < start_term_idx:
                     # 计算偏移量（即使跳过也要累加）
                     if term_idx == 0 and recon.offset_into_first_range > 0:
-                        current_offset += max(0, term.unpacked_length - recon.offset_into_first_range)
+                        # 第一个 term：只累加实际写入的部分（与 segment[offset:] 一致）
+                        current_offset += term.unpacked_length - recon.offset_into_first_range
                     else:
                         current_offset += term.unpacked_length
                     continue
