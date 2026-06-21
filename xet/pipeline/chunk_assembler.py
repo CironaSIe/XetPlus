@@ -509,93 +509,93 @@ class ChunkAssembler(PrefetchHelpers):
                         continue
 
                     # 检查中断
-                if self._stop_event.is_set():
-                    logger.info("[ChunkAssembler] 检测到中断信号")
-                    raise KeyboardInterrupt("用户中断")
+                    if self._stop_event.is_set():
+                        logger.info("[ChunkAssembler] 检测到中断信号")
+                        raise KeyboardInterrupt("用户中断")
 
-                # 确保 xorb 已加载（触发下载/解压）
-                self._ensure_xorb_ready(
-                    term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
-                )
-
-                # 检查水位线，预取后续 xorb
-                current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
-                if current_cache_bytes < low_watermark:
-                    self._prefetch_upcoming_xorbs(
-                        term_idx, recon, cas_client, file_hash,
-                        cache_adapter, high_watermark, progress_tracker
+                    # 确保 xorb 已加载（触发下载/解压）
+                    self._ensure_xorb_ready(
+                        term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
                     )
 
-                # 从 xorb 提取数据
-                xorb_data = self._xorb_cache[term.hash]
-                chunk_offset_dict = dict(xorb_data.chunk_offsets)
+                    # 检查水位线，预取后续 xorb
+                    current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
+                    if current_cache_bytes < low_watermark:
+                        self._prefetch_upcoming_xorbs(
+                            term_idx, recon, cas_client, file_hash,
+                            cache_adapter, high_watermark, progress_tracker
+                        )
 
-                start_chunk_idx = term.range.start
-                start_byte = chunk_offset_dict.get(start_chunk_idx)
+                    # 从 xorb 提取数据
+                    xorb_data = self._xorb_cache[term.hash]
+                    chunk_offset_dict = dict(xorb_data.chunk_offsets)
 
-                if start_byte is None:
-                    raise ValueError(
-                        f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
-                    )
+                    start_chunk_idx = term.range.start
+                    start_byte = chunk_offset_dict.get(start_chunk_idx)
 
-                end_byte = start_byte + term.unpacked_length
-
-                if end_byte > len(xorb_data.data):
-                    raise ValueError(
-                        f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
-                        f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
-                    )
-
-                segment = xorb_data.data[start_byte:end_byte]
-
-                # 第一个 term 需要跳过 offset_into_first_range
-                if term_idx == 0 and recon.offset_into_first_range > 0:
-                    offset = recon.offset_into_first_range
-                    if offset >= len(segment):
+                    if start_byte is None:
                         raise ValueError(
-                            f"[ChunkAssembler] offset_into_first_range ({offset}) >= "
-                            f"第一个 term 长度 ({len(segment)})"
+                            f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
                         )
-                    segment = segment[offset:]
 
-                # 写入文件
-                f.write(segment)
-                total_written += len(segment)
+                    end_byte = start_byte + term.unpacked_length
 
-                # 更新完成速率估算器
-                self._rate_estimator.update(len(segment))
+                    if end_byte > len(xorb_data.data):
+                        raise ValueError(
+                            f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
+                            f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                        )
 
-                if progress_tracker:
-                    progress_tracker.increment_assembled(len(segment))
-                    progress_tracker.increment_terms(1)
+                    segment = xorb_data.data[start_byte:end_byte]
 
-                # Term 级 checkpoint（使用配置的保存间隔）
-                if checkpoint_manager:
-                    checkpoint_manager.mark_term_completed(
-                        file_hash=file_hash,
-                        term_idx=term_idx,
-                        xorb_hash=term.hash,
-                        save_interval=self.checkpoint_interval
-                    )
+                    # 第一个 term 需要跳过 offset_into_first_range
+                    if term_idx == 0 and recon.offset_into_first_range > 0:
+                        offset = recon.offset_into_first_range
+                        if offset >= len(segment):
+                            raise ValueError(
+                                f"[ChunkAssembler] offset_into_first_range ({offset}) >= "
+                                f"第一个 term 长度 ({len(segment)})"
+                            )
+                        segment = segment[offset:]
 
-                # 检查是否可以释放 xorb
-                if not self._is_xorb_needed_later(term.hash, term_idx, recon):
-                    if term.hash in self._xorb_cache:
-                        released_size = len(self._xorb_cache[term.hash].data)
-                        del self._xorb_cache[term.hash]
+                    # 写入文件
+                    f.write(segment)
+                    total_written += len(segment)
+
+                    # 更新完成速率估算器
+                    self._rate_estimator.update(len(segment))
+
+                    if progress_tracker:
+                        progress_tracker.increment_assembled(len(segment))
+                        progress_tracker.increment_terms(1)
+
+                    # Term 级 checkpoint（使用配置的保存间隔）
+                    if checkpoint_manager:
+                        checkpoint_manager.mark_term_completed(
+                            file_hash=file_hash,
+                            term_idx=term_idx,
+                            xorb_hash=term.hash,
+                            save_interval=self.checkpoint_interval
+                        )
+
+                    # 检查是否可以释放 xorb
+                    if not self._is_xorb_needed_later(term.hash, term_idx, recon):
+                        if term.hash in self._xorb_cache:
+                            released_size = len(self._xorb_cache[term.hash].data)
+                            del self._xorb_cache[term.hash]
+                            logger.debug(
+                                f"[ChunkAssembler] 释放 xorb {term.hash[:16]}... "
+                                f"({released_size / 1024 / 1024:.1f}MB)"
+                            )
+
+                    # 定期日志
+                    if (term_idx + 1) % 100 == 0:
+                        cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
                         logger.debug(
-                            f"[ChunkAssembler] 释放 xorb {term.hash[:16]}... "
-                            f"({released_size / 1024 / 1024:.1f}MB)"
+                            f"[ChunkAssembler] 进度: {term_idx + 1}/{len(recon.terms)} terms, "
+                            f"缓存: {cache_mb:.1f}MB, "
+                            f"已写入: {total_written / 1024 / 1024:.1f}MB"
                         )
-
-                # 定期日志
-                if (term_idx + 1) % 100 == 0:
-                    cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
-                    logger.debug(
-                        f"[ChunkAssembler] 进度: {term_idx + 1}/{len(recon.terms)} terms, "
-                        f"缓存: {cache_mb:.1f}MB, "
-                        f"已写入: {total_written / 1024 / 1024:.1f}MB"
-                    )
 
             # 写入完成后重命名 .part -> 目标文件
             part_path.rename(output_path)
