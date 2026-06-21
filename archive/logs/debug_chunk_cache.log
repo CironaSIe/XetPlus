@@ -1,7 +1,0 @@
-Traceback (most recent call last):
-  File "/data/data/com.termux/files/home/xetplus/debug_chunk_cache.py", line 396, in <module>
-    main()
-    ~~~~^^
-  File "/data/data/com.termux/files/home/xetplus/debug_chunk_cache.py", line 362, in main
-    auth = XetAuth()
-TypeError: XetAuth.__init__() missing 2 required positional arguments: 'hf_token' and 'session'

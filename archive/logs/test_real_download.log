@@ -1,5 +1,0 @@
-<frozen runpy>:128: RuntimeWarning: 'xet.cli.main' found in sys.modules after import of package 'xet.cli', but prior to execution of 'xet.cli.main'; this may result in unpredictable behaviour
-usage: xet [-h] [-v] [--log-level {DEBUG,INFO,WARNING,ERROR}]
-           [--log-file LOG_FILE] [--no-log-file] [--version]
-           {download,info,config} ...
-xet: error: unrecognized arguments: --hf-token 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
