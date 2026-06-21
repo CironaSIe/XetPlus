@@ -228,6 +228,14 @@ def register_download_command(subparsers):
              "通过批量 seek + write + 统一 fsync 减少系统调用，大文件性能提升 2-3 倍。"
              "注意：Windows 需要 CreateFileW 支持，Linux/macOS 默认兼容。",
     )
+    parser.add_argument(
+        "--buffer-mb",
+        help="写入缓冲区大小（单位：MB，默认: 32）。"
+             "控制 GlobalWriter 的批量写入缓冲大小。"
+             "推荐值: 8-16（内存受限）、32（默认）、64+（高性能 SSD）",
+        type=int,
+        default=32,
+    )
 
     parser.set_defaults(func=download_command)
 
@@ -701,6 +709,7 @@ def download_single_file(
                     checkpoint_interval=getattr(args, 'checkpoint_interval', 10),
                     retry_max=getattr(args, 'retry_max', 5),
                     parallel_write=getattr(args, 'parallel_write', False),
+                    buffer_mb=getattr(args, 'buffer_mb', 32),
                 )
 
                 result_path = reconstructor.reconstruct_file(

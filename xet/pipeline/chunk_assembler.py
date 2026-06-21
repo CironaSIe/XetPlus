@@ -51,6 +51,7 @@ class ChunkAssembler(PrefetchHelpers):
         prefetch_max: int = 8,
         checkpoint_interval: int = 10,
         max_concurrent_downloads: int = 4,
+        buffer_mb: int = 32,
     ):
         """初始化数据组装器。
 
@@ -62,6 +63,7 @@ class ChunkAssembler(PrefetchHelpers):
             prefetch_max: 单次最多预取 xorb 数量（默认 8）
             checkpoint_interval: 每 N terms 保存 checkpoint（默认 10）
             max_concurrent_downloads: 最大并发下载数
+            buffer_mb: 写入缓冲区大小（MB，默认 32）
         """
         self.temp_dir = temp_dir
         self.max_memory_mb = max_memory_mb
@@ -70,6 +72,7 @@ class ChunkAssembler(PrefetchHelpers):
         self.prefetch_max = prefetch_max
         self.checkpoint_interval = checkpoint_interval
         self.max_concurrent_downloads = max_concurrent_downloads
+        self.buffer_mb = buffer_mb
 
         # 内存缓存：{xorb_hash: XorbBlockData}
         self._xorb_cache: OrderedDict = OrderedDict()
@@ -639,9 +642,14 @@ class ChunkAssembler(PrefetchHelpers):
         high_watermark = self.prefetch_high_mb * 1024 * 1024
 
         # 创建 GlobalWriter
+        # 根据 buffer_mb 计算 batch_size
+        # buffer_mb 越大，可以容纳更多的写入项
+        # 假设平均每个写入项约 4-8 MB，batch_size = buffer_mb / 4
+        batch_size = max(4, self.buffer_mb // 4)
+
         writer = GlobalWriter(
             output_path=part_path,
-            batch_size=self.max_concurrent_downloads,
+            batch_size=batch_size,
             progress_callback=lambda n: progress_tracker.increment_assembled(n) if progress_tracker else None,
             stop_event=stop_event,
         )

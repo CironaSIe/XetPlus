@@ -65,6 +65,7 @@ class FileReconstructor:
         checkpoint_interval: int = 10,
         retry_max: int = 5,
         parallel_write: bool = False,
+        buffer_mb: int = 32,
     ):
         """初始化文件重建协调器。
 
@@ -85,6 +86,7 @@ class FileReconstructor:
             checkpoint_interval: 每 N terms 保存 checkpoint（默认 10）
             retry_max: 最大重试次数（默认 5）
             parallel_write: 启用并行批量写入（默认 False）
+            buffer_mb: 写入缓冲区大小（MB，默认 32）
         """
         self.cas_client = cas_client
         self.output_path = output_path
@@ -97,6 +99,7 @@ class FileReconstructor:
         self.checkpoint_interval = checkpoint_interval
         self.retry_max = retry_max
         self.parallel_write = parallel_write
+        self.buffer_mb = buffer_mb
 
         # 初始化子组件
         self.checkpoint_manager = CheckpointManager(checkpoint_path) if checkpoint_path else None
@@ -117,6 +120,7 @@ class FileReconstructor:
             prefetch_max=prefetch_max,
             checkpoint_interval=checkpoint_interval,
             max_concurrent_downloads=max_workers,
+            buffer_mb=buffer_mb,
         )
 
         # 缓存状态日志
@@ -135,7 +139,9 @@ class FileReconstructor:
             f"checkpoint={'enabled' if checkpoint_path else 'disabled'}, "
             f"cache={cache_status}, "
             f"max_memory={max_memory_mb}MB, "
-            f"prefetch={prefetch_low_mb}-{prefetch_high_mb}MB"
+            f"prefetch={prefetch_low_mb}-{prefetch_high_mb}MB, "
+            f"buffer={buffer_mb}MB, "
+            f"parallel_write={'enabled' if parallel_write else 'disabled'}"
         )
 
     def reconstruct_file(
