@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/data/data/com.termux/files/usr/bin/bash
 # test_cli_download_basic.sh - 基础下载功能测试（P0）
 
 set -e
