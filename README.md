@@ -75,7 +75,7 @@ HTTPS_PROXY=http://127.0.0.1:7890 \
 python -m xet.cli.main download user/repo/file.gguf --optimize-hosts
 ```
 
-完整网络选项说明请参考：[docs/NETWORK_OPTIONS_GUIDE.md](docs/NETWORK_OPTIONS_GUIDE.md)
+完整网络选项说明请参考：[docs/网络选项指南.md](docs/网络选项指南.md)
 
 ## 🔧 配置选项
 
@@ -223,7 +223,7 @@ xetplus/
 └── README.md                 # 本文档
 ```
 
-详细架构说明：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+详细架构说明：[docs/架构设计.md](docs/架构设计.md)
 
 ## 💡 核心技术
 
@@ -240,7 +240,7 @@ xetplus/
 任何 URL 中的 64 字符 hex + rel=xet*
 ```
 
-参考：[docs/XET_HASH_EXTRACTION_METHODS.md](docs/XET_HASH_EXTRACTION_METHODS.md)
+参考：[docs/XET_Hash提取方法.md](docs/XET_Hash提取方法.md)
 
 ### 2. DomainAwareSession - 智能代理路由
 按域名动态切换直连/代理，优选的域名自动跳过代理：
@@ -338,14 +338,14 @@ xorb_hash_abc... → 读取缓存 → 跳过网络（36x 加速）
 ## 📚 文档
 
 ### 用户文档
-- [快速开始](docs/QUICKSTART.md) - 5 分钟上手指南
-- [用户指南](docs/USER_GUIDE.md) - 完整使用说明
-- [网络选项指南](docs/NETWORK_OPTIONS_GUIDE.md) - 代理/优选/镜像完整说明
+- [快速开始](docs/快速开始.md) - 5 分钟上手指南
+- [用户指南](docs/用户指南.md) - 完整使用说明
+- [网络选项指南](docs/网络选项指南.md) - 代理/优选/镜像完整说明
 
 ### 技术文档
-- [架构设计](docs/ARCHITECTURE.md) - 完整架构说明
-- [XET Hash 提取方法](docs/XET_HASH_EXTRACTION_METHODS.md) - HEAD 命令和提取策略
-- [HuggingFace vs hf-mirror](docs/HUGGINGFACE_VS_HFMIRROR.md) - 两个端点对比
+- [架构设计](docs/架构设计.md) - 完整架构说明
+- [XET Hash 提取方法](docs/XET_Hash提取方法.md) - HEAD 命令和提取策略
+- [HuggingFace vs hf-mirror](docs/HuggingFace与hf-mirror对比.md) - 两个端点对比
 - [XET 元数据提取改进](docs/XET_METADATA_EXTRACTION_IMPROVEMENTS.md) - 完整改进报告
 
 ### 测试报告
@@ -353,8 +353,8 @@ xorb_hash_abc... → 读取缓存 → 跳过网络（36x 加速）
 - [更多测试报告](docs/reports/) - 历史测试记录
 
 ### 开发文档
-- [贡献指南](docs/CONTRIBUTING.md) - 如何参与开发
-- [测试指南](docs/TESTING_GUIDE.md) - 测试编写和运行
+- [贡献指南](docs/贡献指南.md) - 如何参与开发
+- [测试指南](docs/测试指南.md) - 测试编写和运行
 - [已知问题](docs/dev/KNOWN_ISSUES.md) - 问题跟踪
 - [测试计划](docs/dev/TEST_PLAN.md) - 测试策略
 
@@ -377,7 +377,7 @@ bash test_cli_p3_integration.sh
 black xet/
 ```
 
-参考：[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)
+参考：[docs/贡献指南.md](docs/贡献指南.md)
 
 ## 📄 许可证
 

@@ -9,10 +9,10 @@
 **第一次接触项目？按此顺序阅读**：
 
 1. 📖 [README.md](../README.md) - 5 分钟了解项目 ⭐
-2. 🚀 [QUICKSTART.md](QUICKSTART.md) - 快速开始（安装、基本使用）
-3. 👤 [USER_GUIDE.md](USER_GUIDE.md) - 完整使用指南
-4. 🌐 [NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md) - 网络选项完整说明
-5. 🏗️ [ARCHITECTURE.md](ARCHITECTURE.md) - 深入架构设计
+2. 🚀 [快速开始.md](快速开始.md) - 快速开始（安装、基本使用）
+3. 👤 [用户指南.md](用户指南.md) - 完整使用指南
+4. 🌐 [网络选项指南.md](网络选项指南.md) - 网络选项完整说明
+5. 🏗️ [架构设计.md](架构设计.md) - 深入架构设计
 
 ---
 
@@ -20,21 +20,21 @@
 
 ### 用户文档
 
-- **[QUICKSTART.md](QUICKSTART.md)** - 快速开始（安装、基本使用）
-- **[USER_GUIDE.md](USER_GUIDE.md)** - 完整使用指南（命令、参数、示例）
-- **[NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md)** - 网络选项完整说明（代理/HOST优选/镜像）
+- **[快速开始.md](快速开始.md)** - 快速开始（安装、基本使用）
+- **[用户指南.md](用户指南.md)** - 完整使用指南（命令、参数、示例）
+- **[网络选项指南.md](网络选项指南.md)** - 网络选项完整说明（代理/HOST优选/镜像）
 
 ### 开发文档
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - 系统架构设计 ⭐ 必读
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** - 贡献指南（编码规范、PR 流程）
-- **[TESTING_GUIDE.md](TESTING_GUIDE.md)** - 测试指南（如何编写和运行测试）
+- **[架构设计.md](架构设计.md)** - 系统架构设计 ⭐ 必读
+- **[贡献指南.md](贡献指南.md)** - 贡献指南（编码规范、PR 流程）
+- **[测试指南.md](测试指南.md)** - 测试指南（如何编写和运行测试）
 - **[FEATURE_REQUESTS.md](FEATURE_REQUESTS.md)** - 功能请求
 
 ### 技术深入
 
-- **[XET_HASH_EXTRACTION_METHODS.md](XET_HASH_EXTRACTION_METHODS.md)** - XET Hash 提取方法（HEAD 命令和三级 fallback）
-- **[HUGGINGFACE_VS_HFMIRROR.md](HUGGINGFACE_VS_HFMIRROR.md)** - HuggingFace vs hf-mirror 完整对比
+- **[XET_Hash提取方法.md](XET_Hash提取方法.md)** - XET Hash 提取方法（HEAD 命令和三级 fallback）
+- **[HuggingFace与hf-mirror对比.md](HuggingFace与hf-mirror对比.md)** - HuggingFace vs hf-mirror 完整对比
 - **[XET_METADATA_EXTRACTION_IMPROVEMENTS.md](XET_METADATA_EXTRACTION_IMPROVEMENTS.md)** - XET 元数据提取完整改进报告
 - **[CONFIG_COMMAND_TEST_IMPROVEMENTS.md](CONFIG_COMMAND_TEST_IMPROVEMENTS.md)** - Config 命令测试改进（已完成）
 - **[VISUAL_IMPROVEMENTS_SUMMARY.md](VISUAL_IMPROVEMENTS_SUMMARY.md)** - 视觉优化和文档完善总结 ⭐ 新增
@@ -58,8 +58,8 @@
 
 ### 开发者资源
 
-- [dev/KNOWN_ISSUES.md](dev/KNOWN_ISSUES.md) - 已知问题跟踪
-- [dev/TEST_PLAN.md](dev/TEST_PLAN.md) - 测试计划
+- [dev/已知问题.md](dev/已知问题.md) - 已知问题跟踪
+- [dev/测试计划.md](dev/测试计划.md) - 测试计划
 - [dev/HOST_OPTIMIZER_DESIGN.md](dev/HOST_OPTIMIZER_DESIGN.md) - HOST 优选器设计
 - [dev/HOST_OPTIMIZER_ANALYSIS_FINAL.md](dev/HOST_OPTIMIZER_ANALYSIS_FINAL.md) - HOST 优选器完整分析
 
@@ -98,19 +98,19 @@ xetplus/
 │   ├── INDEX.md                          # 本文件（文档索引）
 │   │
 │   ├── 用户文档
-│   │   ├── QUICKSTART.md                 # 快速开始
-│   │   ├── USER_GUIDE.md                 # 完整使用指南
-│   │   └── NETWORK_OPTIONS_GUIDE.md      # 网络选项完整说明
+│   │   ├── 快速开始.md                 # 快速开始
+│   │   ├── 用户指南.md                 # 完整使用指南
+│   │   └── 网络选项指南.md      # 网络选项完整说明
 │   │
 │   ├── 开发文档
-│   │   ├── ARCHITECTURE.md               # 系统架构
-│   │   ├── CONTRIBUTING.md               # 贡献指南
-│   │   ├── TESTING_GUIDE.md              # 测试指南
+│   │   ├── 架构设计.md               # 系统架构
+│   │   ├── 贡献指南.md               # 贡献指南
+│   │   ├── 测试指南.md              # 测试指南
 │   │   └── FEATURE_REQUESTS.md           # 功能请求
 │   │
 │   ├── 技术文档
-│   │   ├── XET_HASH_EXTRACTION_METHODS.md       # Hash 提取方法
-│   │   ├── HUGGINGFACE_VS_HFMIRROR.md           # 端点对比
+│   │   ├── XET_Hash提取方法.md       # Hash 提取方法
+│   │   ├── HuggingFace与hf-mirror对比.md           # 端点对比
 │   │   ├── XET_METADATA_EXTRACTION_IMPROVEMENTS.md  # 元数据提取改进
 │   │   └── CONFIG_COMMAND_TEST_IMPROVEMENTS.md  # Config 命令改进
 │   │
@@ -148,19 +148,19 @@ xetplus/
 ## 🔍 按主题查找
 
 ### 想快速上手使用？
-→ [QUICKSTART.md](QUICKSTART.md) ⭐
+→ [快速开始.md](快速开始.md) ⭐
 
 ### 国内网络如何优化？
-→ [NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md) ⭐
+→ [网络选项指南.md](网络选项指南.md) ⭐
 
 ### 想深入了解功能？
-→ [USER_GUIDE.md](USER_GUIDE.md)
+→ [用户指南.md](用户指南.md)
 
 ### 想理解系统架构？
-→ [ARCHITECTURE.md](ARCHITECTURE.md) ⭐
+→ [架构设计.md](架构设计.md) ⭐
 
 ### 想贡献代码？
-→ [CONTRIBUTING.md](CONTRIBUTING.md) + [TESTING_GUIDE.md](TESTING_GUIDE.md)
+→ [贡献指南.md](贡献指南.md) + [测试指南.md](测试指南.md)
 
 ### 想了解 XET 协议细节？
 → [spec/XET.SPEC.md](spec/XET.SPEC.md)
@@ -169,10 +169,10 @@ xetplus/
 → [reports/P3_INTEGRATION_TEST_REPORT.md](reports/P3_INTEGRATION_TEST_REPORT.md) ⭐
 
 ### 想了解 XET Hash 提取？
-→ [XET_HASH_EXTRACTION_METHODS.md](XET_HASH_EXTRACTION_METHODS.md)
+→ [XET_Hash提取方法.md](XET_Hash提取方法.md)
 
 ### HuggingFace 和 hf-mirror 有什么区别？
-→ [HUGGINGFACE_VS_HFMIRROR.md](HUGGINGFACE_VS_HFMIRROR.md)
+→ [HuggingFace与hf-mirror对比.md](HuggingFace与hf-mirror对比.md)
 
 ---
 
@@ -181,14 +181,14 @@ xetplus/
 | 文档 | 状态 | 最后更新 | 说明 |
 |------|------|---------|------|
 | README.md | ✅ 完整 | 2026-06-21 | v0.5.0-dev |
-| QUICKSTART.md | ✅ 完整 | 2026-06-21 | |
-| USER_GUIDE.md | ✅ 完整 | 2026-06-20 | |
-| NETWORK_OPTIONS_GUIDE.md | ✅ 完整 | 2026-06-21 | 新增 |
-| ARCHITECTURE.md | ✅ 完整 | 2026-06-18 | |
-| TESTING_GUIDE.md | ✅ 完整 | 2026-06-20 | |
+| 快速开始.md | ✅ 完整 | 2026-06-21 | |
+| 用户指南.md | ✅ 完整 | 2026-06-20 | |
+| 网络选项指南.md | ✅ 完整 | 2026-06-21 | 新增 |
+| 架构设计.md | ✅ 完整 | 2026-06-18 | |
+| 测试指南.md | ✅ 完整 | 2026-06-20 | |
 | P3_INTEGRATION_TEST_REPORT.md | ✅ 完整 | 2026-06-21 | 100% 通过 |
-| XET_HASH_EXTRACTION_METHODS.md | ✅ 完整 | 2026-06-21 | 新增 |
-| HUGGINGFACE_VS_HFMIRROR.md | ✅ 完整 | 2026-06-21 | 新增 |
+| XET_Hash提取方法.md | ✅ 完整 | 2026-06-21 | 新增 |
+| HuggingFace与hf-mirror对比.md | ✅ 完整 | 2026-06-21 | 新增 |
 | spec/*.md | ✅ 完整 | 2026-06-18 | |
 
 ---
@@ -205,9 +205,9 @@ xetplus/
 
 **文档更新**：
 - ✅ 更新 README.md - 反映 v0.5.0-dev 状态
-- ✅ 新增 NETWORK_OPTIONS_GUIDE.md - 网络选项完整说明
-- ✅ 新增 XET_HASH_EXTRACTION_METHODS.md - Hash 提取方法详解
-- ✅ 新增 HUGGINGFACE_VS_HFMIRROR.md - 端点对比
+- ✅ 新增 网络选项指南.md - 网络选项完整说明
+- ✅ 新增 XET_Hash提取方法.md - Hash 提取方法详解
+- ✅ 新增 HuggingFace与hf-mirror对比.md - 端点对比
 - ✅ 新增 XET_METADATA_EXTRACTION_IMPROVEMENTS.md - 元数据提取改进
 - ✅ 新增 CONFIG_COMMAND_TEST_IMPROVEMENTS.md - Config 命令改进建议
 - ✅ 新增 P3_INTEGRATION_TEST_REPORT.md - P3 测试报告
@@ -220,12 +220,12 @@ xetplus/
 - ✅ 修复 test_cli_p3_integration.sh - 配置文件路径修正
 
 ### 2026-06-20
-- ✅ 更新 USER_GUIDE.md - 完善使用指南
-- ✅ 更新 TESTING_GUIDE.md - 添加测试示例
+- ✅ 更新 用户指南.md - 完善使用指南
+- ✅ 更新 测试指南.md - 添加测试示例
 
 ### 2026-06-18
-- ✅ 创建 ARCHITECTURE.md - 系统架构文档
-- ✅ 创建 CONTRIBUTING.md - 贡献指南
+- ✅ 创建 架构设计.md - 系统架构文档
+- ✅ 创建 贡献指南.md - 贡献指南
 
 ---
 
@@ -249,7 +249,7 @@ xetplus/
 
 1. 在 [Issues](https://github.com/yourusername/xetplus/issues) 中报告
 2. 提交 Pull Request
-3. 遵循 [贡献指南](CONTRIBUTING.md)
+3. 遵循 [贡献指南](贡献指南.md)
 
 ---
 
