@@ -51,6 +51,12 @@ def register_download_command(subparsers):
     )
 
     parser.add_argument(
+        "-r", "--revision",
+        help="Git revision (分支名或 commit hash，默认: main)",
+        default="main",
+    )
+
+    parser.add_argument(
         "-c", "--concurrency", "--concurrent",
         help="并发下载数（默认: 从配置读取或 4）",
         type=int,
@@ -350,6 +356,7 @@ def detect_xet_file(
     filename: str,
     token: str,
     session: requests.Session,
+    revision: str = "main",
 ) -> Optional[dict]:
     """检测文件是否为 XET 文件并获取元数据。
 
@@ -359,6 +366,7 @@ def detect_xet_file(
         filename: 文件名
         token: HF Token
         session: requests.Session
+        revision: 分支名或 commit hash，默认 "main"
 
     Returns:
         {
@@ -370,54 +378,59 @@ def detect_xet_file(
     """
     # 根据 repo_type 构造文件 URL
     if repo_type == "dataset":
-        file_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+        file_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{filename}"
     else:
-        file_url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+        file_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
 
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        # HEAD 请求获取 Link header
+        # HEAD 请求获取 X-Xet-Hash header
         resp = session.head(file_url, headers=headers, allow_redirects=False, timeout=30)
 
         if resp.status_code not in (301, 302, 307, 308):
             logger.warning(f"文件不是 XET 格式: {filename}")
             return None
 
-        # 解析 Link header
-        link_header = resp.headers.get("Link", "")
-        if not link_header:
+        # 直接从 header 读取 xet-hash（不依赖 Link header）
+        xet_hash = resp.headers.get("X-Xet-Hash")
+        if not xet_hash:
+            logger.debug(f"文件缺少 X-Xet-Hash header: {filename}")
             return None
 
-        # 提取 xet-auth URL
+        # 解析 Link header 获取 auth URL
+        link_header = resp.headers.get("Link", "")
         auth_url = None
-        match = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
-        if match:
-            auth_url = match.group(1)
-            if not auth_url.startswith("http"):
-                auth_url = f"https://huggingface.co{auth_url}"
+        if link_header:
+            match = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
+            if match:
+                auth_url = match.group(1)
+                if not auth_url.startswith("http"):
+                    auth_url = f"https://huggingface.co{auth_url}"
 
         if not auth_url:
+            logger.debug(f"文件缺少 xet-auth URL: {filename}")
             return None
 
-        # 提取 xet-hash
-        xet_hash = None
-        match = re.search(r'<xet://([^>]+)>;\s*rel="xet-hash"', link_header)
-        if match:
-            xet_hash = match.group(1)
+        # 获取文件大小和 SHA256
+        size = 0
+        sha256 = ""
 
-        if not xet_hash:
-            return None
+        # X-Linked-Size: 实际文件大小（未压缩）
+        linked_size = resp.headers.get("X-Linked-Size")
+        if linked_size:
+            size = int(linked_size)
 
-        # 获取文件大小
-        content_length = resp.headers.get("Content-Length")
-        size = int(content_length) if content_length else 0
+        # X-Linked-ETag: SHA256 (去掉引号)
+        linked_etag = resp.headers.get("X-Linked-ETag", "")
+        if linked_etag:
+            sha256 = linked_etag.strip('"')
 
         return {
             "xet_hash": xet_hash,
             "auth_url": auth_url,
             "size": size,
-            "sha256": "",  # 可选
+            "sha256": sha256,
         }
 
     except requests.RequestException as e:
@@ -581,6 +594,7 @@ def download_single_file(
     args,
     repo_type: str = "model",
     xorb_cache: Optional[XorbDiskCache] = None,
+    chunk_cache = None,
 ) -> bool:
     """下载单个文件。
 
@@ -592,6 +606,8 @@ def download_single_file(
         cas_client: CAS 客户端
         args: 命令行参数
         repo_type: 仓库类型（model 或 dataset）
+        xorb_cache: Xorb 缓存实例
+        chunk_cache: Chunk 缓存实例
 
     Returns:
         成功返回 True，失败返回 False
@@ -736,9 +752,8 @@ def download_single_file(
 
     except Exception as e:
         print(f"✗ 下载失败: {e}", file=sys.stderr)
-        if logger.level == logging.DEBUG:
-            import traceback
-            traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -838,7 +853,7 @@ def download_command(args):
             dummy_file = "granite-embedding-97M-multilingual-r2-Q4_K_M.gguf"
 
             # 获取 auth URL
-            dummy_xet = detect_xet_file(dummy_repo, "model", dummy_file, hf_token, session)
+            dummy_xet = detect_xet_file(dummy_repo, "model", dummy_file, hf_token, session, revision="main")
             if not dummy_xet:
                 print("✗ 无法获取 CAS token，请改用 user/repo/file 格式", file=sys.stderr)
                 return 1
@@ -856,8 +871,8 @@ def download_command(args):
 
         elif filename:
             # 单个文件: user/repo/file
-            logger.info(f"检测文件: {repo_id}/{filename} (repo_type={repo_type})")
-            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session)
+            logger.info(f"检测文件: {repo_id}/{filename} (repo_type={repo_type}, revision={args.revision})")
+            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session, revision=args.revision)
 
             if not xet_info:
                 print(f"✗ 文件不是 XET 格式: {filename}", file=sys.stderr)
@@ -892,7 +907,7 @@ def download_command(args):
 
             # 检测每个文件是否为 XET
             for fname in matched_files:
-                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session)
+                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, revision=args.revision)
                 if xet_info:
                     files_to_download.append((repo_id, fname, xet_info, repo_type))
                 else:
@@ -1003,7 +1018,9 @@ def download_command(args):
         else:
             output_base = Path.cwd() / "downloads"
 
-        output_base.mkdir(parents=True, exist_ok=True)
+        # 只在明确是目录时创建（批量下载或未指定文件名）
+        if not args.output or not args.output.suffix:
+            output_base.mkdir(parents=True, exist_ok=True)
 
         # 9. 逐个下载文件
         success_count = 0
@@ -1025,7 +1042,7 @@ def download_command(args):
 
             # 下载
             try:
-                if download_single_file(repo_id, filename, xet_info, output_path, cas_client, args, repo_type, xorb_cache):
+                if download_single_file(repo_id, filename, xet_info, output_path, cas_client, args, repo_type, xorb_cache, chunk_cache):
                     success_count += 1
             except KeyboardInterrupt:
                 interrupted = True
