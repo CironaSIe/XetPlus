@@ -308,7 +308,7 @@ xorb_hash_abc... → 读取缓存 → 跳过网络（36x 加速）
 **成功率**: 100% (4/4)  
 **用时**: 25 秒
 
-详细报告：[docs/P3_INTEGRATION_TEST_REPORT.md](docs/reports/P3_INTEGRATION_TEST_REPORT.md)
+详细报告：[docs/P3_INTEGRATION_TEST_REPORT.md](docs/P3集成测试报告.md)
 
 ## 🔮 Roadmap
 
@@ -349,7 +349,7 @@ xorb_hash_abc... → 读取缓存 → 跳过网络（36x 加速）
 - [XET 元数据提取改进](docs/XET_METADATA_EXTRACTION_IMPROVEMENTS.md) - 完整改进报告
 
 ### 测试报告
-- [P3 集成测试报告](docs/reports/P3_INTEGRATION_TEST_REPORT.md) - 最新测试结果
+- [P3 集成测试报告](docs/P3集成测试报告.md) - 最新测试结果
 - [更多测试报告](docs/reports/) - 历史测试记录
 
 ### 开发文档
