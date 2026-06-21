@@ -9,6 +9,7 @@
 """
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Optional, List
 from collections import OrderedDict
@@ -166,7 +167,8 @@ class ChunkAssembler(PrefetchHelpers):
             # 按 term 顺序处理
             self._assemble_with_prefetch(
                 recon, cas_client, output_path, file_hash,
-                progress_tracker, cache_adapter, checkpoint_manager
+                progress_tracker, cache_adapter, checkpoint_manager,
+                stop_event, parallel_write
             )
 
         finally:
@@ -406,6 +408,8 @@ class ChunkAssembler(PrefetchHelpers):
         progress_tracker: Optional[ProgressTracker],
         cache_adapter,
         checkpoint_manager=None,
+        stop_event: Optional[threading.Event] = None,
+        parallel_write: bool = False,
     ) -> None:
         """预取模式：按需下载和解压，水位线控制内存。"""
         # 1. 确保输出目录存在

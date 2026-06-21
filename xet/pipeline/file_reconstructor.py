@@ -141,7 +141,7 @@ class FileReconstructor:
             f"max_memory={max_memory_mb}MB, "
             f"prefetch={prefetch_low_mb}-{prefetch_high_mb}MB, "
             f"buffer={buffer_mb}MB, "
-            f"parallel_write={'enabled' if parallel_write else 'disabled'}"
+            f"parallel_write={'enabled' if self.parallel_write else 'disabled'}"
         )
 
     def reconstruct_file(

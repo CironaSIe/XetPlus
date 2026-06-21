@@ -355,7 +355,6 @@ class PrefetchHelpers:
             segment_data = cas_client.get_xorb_data(
                 url=fi.url,
                 url_range=fi.url_range,
-                file_hash=file_hash,
             )
             segments.append(segment_data)
             total_size += len(segment_data)
