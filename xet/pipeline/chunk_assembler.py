@@ -270,17 +270,38 @@ class ChunkAssembler(PrefetchHelpers):
 
                 # 从缓存中提取数据并写入
                 xorb_data = current_batch[term.hash]
-                chunk_offset_dict = dict(xorb_data.chunk_offsets)
 
-                start_chunk_idx = term.range.start
-                start_byte = chunk_offset_dict.get(start_chunk_idx)
+                # xorb_data.chunk_offsets 存储的是 (全局chunk_id, byte_offset)
+                # term.range 也使用全局 chunk ID，可以直接查询
+                chunk_offsets_dict = dict(xorb_data.chunk_offsets)
 
-                if start_byte is None:
+                start_chunk = term.range.start
+                end_chunk = term.range.end
+
+                if start_chunk not in chunk_offsets_dict:
                     raise ValueError(
-                        f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
+                        f"[ChunkAssembler] Term #{term_idx} start chunk {start_chunk} "
+                        f"不在 chunk_offsets 中"
                     )
 
-                end_byte = start_byte + term.unpacked_length
+                start_byte = chunk_offsets_dict[start_chunk]
+
+                # end_chunk 可能不在 chunk_offsets 中（表示最后一个 chunk 之后）
+                if end_chunk not in chunk_offsets_dict:
+                    # 查找 end_chunk 之后的第一个 offset，或使用数据末尾
+                    # chunk_offsets 是按全局 chunk ID 顺序的
+                    sorted_chunks = sorted(chunk_offsets_dict.items())
+                    found = False
+                    for chunk_id, offset in sorted_chunks:
+                        if chunk_id >= end_chunk:
+                            end_byte = offset
+                            found = True
+                            break
+                    if not found:
+                        # end_chunk 超过所有已知 chunk，使用数据末尾
+                        end_byte = len(xorb_data.data)
+                else:
+                    end_byte = chunk_offsets_dict[end_chunk]
 
                 if end_byte > len(xorb_data.data):
                     raise ValueError(
@@ -528,17 +549,37 @@ class ChunkAssembler(PrefetchHelpers):
 
                     # 从 xorb 提取数据
                     xorb_data = self._xorb_cache[term.hash]
-                    chunk_offset_dict = dict(xorb_data.chunk_offsets)
 
-                    start_chunk_idx = term.range.start
-                    start_byte = chunk_offset_dict.get(start_chunk_idx)
+                    # xorb_data.chunk_offsets 存储的是 (全局chunk_id, byte_offset)
+                    # term.range 也使用全局 chunk ID，可以直接查询
+                    chunk_offsets_dict = dict(xorb_data.chunk_offsets)
 
-                    if start_byte is None:
+                    start_chunk = term.range.start
+                    end_chunk = term.range.end
+
+                    if start_chunk not in chunk_offsets_dict:
                         raise ValueError(
-                            f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
+                            f"[ChunkAssembler] Term #{term_idx} start chunk {start_chunk} "
+                            f"不在 chunk_offsets 中"
                         )
 
-                    end_byte = start_byte + term.unpacked_length
+                    start_byte = chunk_offsets_dict[start_chunk]
+
+                    # end_chunk 可能不在 chunk_offsets 中（表示最后一个 chunk 之后）
+                    if end_chunk not in chunk_offsets_dict:
+                        # 查找 end_chunk 之后的第一个 offset，或使用数据末尾
+                        sorted_chunks = sorted(chunk_offsets_dict.items())
+                        found = False
+                        for chunk_id, offset in sorted_chunks:
+                            if chunk_id >= end_chunk:
+                                end_byte = offset
+                                found = True
+                                break
+                        if not found:
+                            # end_chunk 超过所有已知 chunk，使用数据末尾
+                            end_byte = len(xorb_data.data)
+                    else:
+                        end_byte = chunk_offsets_dict[end_chunk]
 
                     if end_byte > len(xorb_data.data):
                         raise ValueError(
@@ -700,14 +741,29 @@ class ChunkAssembler(PrefetchHelpers):
                 chunk_offset_dict = dict(xorb_data.chunk_offsets)
 
                 start_chunk_idx = term.range.start
-                start_byte = chunk_offset_dict.get(start_chunk_idx)
+                end_chunk_idx = term.range.end
 
-                if start_byte is None:
-                    raise ValueError(
-                        f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
-                    )
+                # 根据 chunk range 计算 byte range
+                # start_chunk_idx 的偏移量
+                if start_chunk_idx == 0:
+                    start_byte = 0
+                else:
+                    start_byte = chunk_offset_dict.get(start_chunk_idx)
+                    if start_byte is None:
+                        raise ValueError(
+                            f"[ChunkAssembler] Chunk {start_chunk_idx} 未在 xorb {term.hash[:16]}... 中找到"
+                        )
 
-                end_byte = start_byte + term.unpacked_length
+                # end_chunk_idx 的结束偏移量（使用 end-1 的下一个位置，或数据末尾）
+                if end_chunk_idx == 0:
+                    end_byte = 0
+                else:
+                    # end_chunk_idx-1 是最后一个包含的 chunk
+                    # 我们需要找到 end_chunk_idx 的起始位置（即 end_chunk_idx-1 的结束位置）
+                    end_byte = chunk_offset_dict.get(end_chunk_idx)
+                    if end_byte is None:
+                        # 如果 end_chunk_idx 超出范围，使用数据末尾
+                        end_byte = len(xorb_data.data)
 
                 if end_byte > len(xorb_data.data):
                     raise ValueError(
@@ -800,4 +856,16 @@ class ChunkAssembler(PrefetchHelpers):
                 except Exception as e:
                     logger.warning(f"[ChunkAssembler] 清理 .part 文件失败: {e}")
             raise
+
+        finally:
+            # 确保 writer 线程被正确关闭
+            try:
+                if writer and writer._started:
+                    # 发送停止信号
+                    writer.stop_event.set()
+                    # 尝试等待线程结束（短超时）
+                    if writer._writer_thread and writer._writer_thread.is_alive():
+                        writer._writer_thread.join(timeout=5)
+            except Exception as e:
+                logger.warning(f"[ChunkAssembler] 关闭 GlobalWriter 失败: {e}")
 

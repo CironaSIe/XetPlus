@@ -47,8 +47,8 @@ class RichProgress(ProgressDisplay):
 
     def __enter__(self):
         self.progress = Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=40),
+            TextColumn("[bold cyan]{task.description}", justify="left"),
+            BarColumn(bar_width=40, style="cyan", complete_style="green"),
             "[progress.percentage]{task.percentage:>3.1f}%",
             "•",
             DownloadColumn(),
@@ -57,6 +57,7 @@ class RichProgress(ProgressDisplay):
             "•",
             TimeRemainingColumn(),
             console=self.console,
+            transient=False,  # 完成后保留进度条
         )
         self.progress.__enter__()
         self.task = self.progress.add_task(self.description, total=100)
@@ -118,39 +119,34 @@ class SimpleProgress(ProgressDisplay):
         active_xorbs = stats.get("active_xorbs", 0)
         total_segments = stats.get("total_segments", 0)
         completed_segments = stats.get("completed_segments", 0)
-        total_terms = stats.get("total_terms", 0)
-        processed_terms = stats.get("processed_terms", 0)
 
         # 只在百分比变化时更新（减少闪烁）
         if int(pct) > self.last_pct:
-            bar_width = 30  # 稍微缩小进度条以腾出空间
+            bar_width = 40
             filled = int(pct / 100 * bar_width)
-            bar = "=" * filled + ">" + " " * (bar_width - filled - 1)
+            bar = "█" * filled + "░" * (bar_width - filled)
 
-            # 构建进度字符串
-            progress_str = (
-                f"\rDownloading: {pct:>5.1f}% [{bar}] "
-                f"{self._format_bytes(assembled)}/{self._format_bytes(total)}  "
-                f"{self._format_bytes(speed)}/s  "
-                f"ETA: {self._format_time(eta)}"
-            )
+            # 构建进度字符串 - 使用更紧凑的格式
+            progress_parts = [
+                f"\r📥 {pct:>5.1f}% [{bar}]",
+                f"{self._format_bytes(assembled)}/{self._format_bytes(total)}",
+                f"⚡ {self._format_bytes(speed)}/s",
+                f"⏱ {self._format_time(eta)}",
+            ]
 
-            # 添加 xorb 进度
+            # 添加 xorb 进度（紧凑格式）
             if total_xorbs > 0:
-                xorb_str = f"  Xorb: {completed_xorbs}/{total_xorbs}"
+                xorb_str = f"📦 {completed_xorbs}/{total_xorbs}"
                 if active_xorbs > 0:
                     xorb_str += f"(+{active_xorbs})"
-                progress_str += xorb_str
+                progress_parts.append(xorb_str)
 
-            # 添加 segment 进度（可选，避免太长）
+            # 添加 segment 进度（仅当分段下载时）
             if total_segments > 0 and total_segments > total_xorbs:
-                progress_str += f"  Seg: {completed_segments}/{total_segments}"
+                progress_parts.append(f"🧩 {completed_segments}/{total_segments}")
 
-            # 添加 term 进度（可选）
-            if total_terms > 0 and total_terms > 100:  # 只在 term 数量较多时显示
-                progress_str += f"  Term: {processed_terms}/{total_terms}"
-
-            sys.stdout.write(progress_str)
+            progress_str = " │ ".join(progress_parts)
+            sys.stdout.write(progress_str + " " * 10)  # 额外空格清除旧内容
             sys.stdout.flush()
             self.last_pct = int(pct)
 

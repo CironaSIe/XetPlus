@@ -131,6 +131,14 @@ def register_download_command(subparsers):
     )
 
     parser.add_argument(
+        "--hf-endpoint",
+        help="HuggingFace 镜像站端点（默认: https://huggingface.co）。"
+             "示例: https://hf-mirror.com (国内镜像，可直连)。"
+             "用于替换所有 huggingface.co 请求，包括认证、元数据和文件下载。"
+             "也可通过环境变量 HF_ENDPOINT 设置",
+    )
+
+    parser.add_argument(
         "--dns-servers",
         help="自定义 DoH 服务器列表（逗号分隔）。"
              "示例: https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
@@ -303,6 +311,7 @@ def list_hf_files(
     repo_type: str,
     token: str,
     session: requests.Session,
+    hf_endpoint: str = "https://huggingface.co",
 ) -> List[str]:
     """列出 HuggingFace 仓库中的所有文件。
 
@@ -311,15 +320,16 @@ def list_hf_files(
         repo_type: 仓库类型 ("model" 或 "dataset")
         token: HF Token
         session: requests.Session
+        hf_endpoint: HF 端点 URL（默认: https://huggingface.co）
 
     Returns:
         文件路径列表
     """
     # 根据 repo_type 构造 API URL
     if repo_type == "dataset":
-        url = f"https://huggingface.co/api/datasets/{repo_id}"
+        url = f"{hf_endpoint}/api/datasets/{repo_id}"
     else:
-        url = f"https://huggingface.co/api/models/{repo_id}"
+        url = f"{hf_endpoint}/api/models/{repo_id}"
 
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -357,6 +367,7 @@ def detect_xet_file(
     token: str,
     session: requests.Session,
     revision: str = "main",
+    hf_endpoint: str = "https://huggingface.co",
 ) -> Optional[dict]:
     """检测文件是否为 XET 文件并获取元数据。
 
@@ -367,6 +378,7 @@ def detect_xet_file(
         token: HF Token
         session: requests.Session
         revision: 分支名或 commit hash，默认 "main"
+        hf_endpoint: HF 端点 URL（默认: https://huggingface.co）
 
     Returns:
         {
@@ -378,9 +390,9 @@ def detect_xet_file(
     """
     # 根据 repo_type 构造文件 URL
     if repo_type == "dataset":
-        file_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{filename}"
+        file_url = f"{hf_endpoint}/datasets/{repo_id}/resolve/{revision}/{filename}"
     else:
-        file_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+        file_url = f"{hf_endpoint}/{repo_id}/resolve/{revision}/{filename}"
 
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -393,7 +405,7 @@ def detect_xet_file(
             logger.info(f"main 分支不存在，尝试获取最新 commit...")
 
             # 方法 1: 通过 API 获取仓库信息
-            api_url = f"https://huggingface.co/api/models/{repo_id}" if repo_type != "dataset" else f"https://huggingface.co/api/datasets/{repo_id}"
+            api_url = f"{hf_endpoint}/api/models/{repo_id}" if repo_type != "dataset" else f"{hf_endpoint}/api/datasets/{repo_id}"
             try:
                 api_resp = session.get(api_url, headers=headers, timeout=10)
                 if api_resp.status_code == 200:
@@ -402,7 +414,7 @@ def detect_xet_file(
                     if latest_sha:
                         logger.info(f"检测到最新 commit: {latest_sha[:12]}...")
                         # 递归调用，使用最新 commit
-                        return detect_xet_file(repo_id, repo_type, filename, token, session, revision=latest_sha)
+                        return detect_xet_file(repo_id, repo_type, filename, token, session, revision=latest_sha, hf_endpoint=hf_endpoint)
             except Exception as e:
                 logger.debug(f"API 获取失败: {e}")
 
@@ -413,21 +425,66 @@ def detect_xet_file(
             logger.warning(f"文件不是 XET 格式: {filename}")
             return None
 
-        # 直接从 header 读取 xet-hash（不依赖 Link header）
-        xet_hash = resp.headers.get("X-Xet-Hash")
-        if not xet_hash:
-            logger.debug(f"文件缺少 X-Xet-Hash header: {filename}")
-            return None
-
-        # 解析 Link header 获取 auth URL
+        # 解析 Link header（需要先解析以便提取 xet_hash）
         link_header = resp.headers.get("Link", "")
         auth_url = None
+        recon_url = None
+
         if link_header:
-            match = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
-            if match:
-                auth_url = match.group(1)
+            # 提取 xet-auth URL
+            auth_match = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
+            if auth_match:
+                auth_url = auth_match.group(1)
                 if not auth_url.startswith("http"):
-                    auth_url = f"https://huggingface.co{auth_url}"
+                    auth_url = f"{hf_endpoint}{auth_url}"
+
+            # 提取 xet-reconstruction-info URL
+            recon_match = re.search(r'<([^>]+)>;\s*rel="xet-reconstruction-info"', link_header)
+            if recon_match:
+                recon_url = recon_match.group(1)
+
+        # 提取 xet-hash（多级 fallback，支持未来协议变化）
+        xet_hash = None
+
+        # 方法1: X-Xet-Hash 头（直接提供 hash）
+        xet_hash = resp.headers.get("X-Xet-Hash")
+
+        # 方法2: 标准 xet:// 协议格式 (rel="xet-hash")
+        if not xet_hash and link_header:
+            match = re.search(
+                r'<xet://([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet-hash["\']?',
+                link_header,
+                re.IGNORECASE
+            )
+            if match:
+                xet_hash = match.group(1)
+                logger.debug(f"从 xet:// URI 提取 xet_hash: {xet_hash[:16]}...")
+
+        # 方法3: reconstruction-info URL 中的 hash（通用版本）
+        if not xet_hash and recon_url:
+            match = re.search(
+                r'/reconstructions?/([0-9a-f]{64})',
+                recon_url,
+                re.IGNORECASE
+            )
+            if match:
+                xet_hash = match.group(1)
+                logger.debug(f"从 reconstruction URL 提取 xet_hash: {xet_hash[:16]}...")
+
+        # 方法4: 任何 URL 中的 64 字符 hex 串（最后的 fallback）
+        if not xet_hash and link_header:
+            match = re.search(
+                r'<[^>]*?([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet',
+                link_header,
+                re.IGNORECASE
+            )
+            if match:
+                xet_hash = match.group(1)
+                logger.debug(f"从通用 xet Link 提取 xet_hash: {xet_hash[:16]}...")
+
+        if not xet_hash:
+            logger.debug(f"文件缺少 X-Xet-Hash header 且无法从 Link 提取: {filename}")
+            return None
 
         if not auth_url:
             logger.debug(f"文件缺少 xet-auth URL: {filename}")
@@ -523,6 +580,7 @@ def download_file_direct(
     output_path: Path,
     args,
     repo_type: str = "model",
+    hf_endpoint: str = "https://huggingface.co",
 ) -> bool:
     """使用 presigned URL 直接下载文件（不经过 XET 重建）。
 
@@ -547,9 +605,9 @@ def download_file_direct(
     # 1. 获取 presigned URL
     # 直接构造下载 URL（HuggingFace 会重定向到 presigned URL）
     if repo_type == "dataset":
-        file_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+        file_url = f"{hf_endpoint}/datasets/{repo_id}/resolve/main/{filename}"
     else:
-        file_url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+        file_url = f"{hf_endpoint}/{repo_id}/resolve/main/{filename}"
 
     # 2. 创建 session（复用全局 session 更好，但这里简化处理）
     import requests
@@ -592,7 +650,9 @@ def download_file_direct(
         if expected_size > 0 and actual_size != expected_size:
             print(f"⚠ 警告: 文件大小不匹配 ({actual_size} != {expected_size})")
 
-        print(f"✓ 下载完成: {output_path}")
+        from rich.console import Console
+        console = Console()
+        console.print(f"[green]✓[/green] 下载完成: [cyan]{output_path}[/cyan]")
         return True
 
     except Exception as e:
@@ -616,6 +676,7 @@ def download_single_file(
     repo_type: str = "model",
     xorb_cache: Optional[XorbDiskCache] = None,
     chunk_cache = None,
+    hf_endpoint: str = "https://huggingface.co",
 ) -> bool:
     """下载单个文件。
 
@@ -629,6 +690,7 @@ def download_single_file(
         repo_type: 仓库类型（model 或 dataset）
         xorb_cache: Xorb 缓存实例
         chunk_cache: Chunk 缓存实例
+        hf_endpoint: HF 端点 URL
 
     Returns:
         成功返回 True，失败返回 False
@@ -674,6 +736,7 @@ def download_single_file(
                 output_path=output_path,
                 args=args,
                 repo_type=repo_type,
+                hf_endpoint=hf_endpoint,
             )
         except Exception as e:
             print(f"⚠ Direct 模式失败 ({e})，回退到 XET 重建模式")
@@ -762,9 +825,18 @@ def download_single_file(
                     resume=args.resume,
                 )
 
+        # 下载完成，显示美化的成功消息
         file_size = result_path.stat().st_size
-        print(f"✓ 下载完成: {result_path}")
-        print(f"  文件大小: {file_size:,} 字节")
+        from rich.console import Console
+        from rich.panel import Panel
+        console = Console()
+
+        success_msg = (
+            f"[green]✓[/green] 文件已保存: [cyan]{result_path}[/cyan]\n"
+            f"[green]✓[/green] 文件大小: [yellow]{format_bytes(file_size)}[/yellow] ({file_size:,} bytes)"
+        )
+
+        console.print(Panel(success_msg, title="[bold green]下载完成[/bold green]", border_style="green"))
         return True
 
     except KeyboardInterrupt:
@@ -809,6 +881,17 @@ def download_command(args):
         if not proxy:
             proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
 
+        # 2.5. 从命令行或环境变量读取 HF_ENDPOINT
+        hf_endpoint = args.hf_endpoint if hasattr(args, 'hf_endpoint') and args.hf_endpoint else None
+        if not hf_endpoint:
+            hf_endpoint = os.environ.get('HF_ENDPOINT') or "https://huggingface.co"
+
+        # 标准化：移除尾部斜杠
+        hf_endpoint = hf_endpoint.rstrip('/')
+
+        if hf_endpoint != "https://huggingface.co":
+            logger.info(f"[Download] 使用自定义 HF 端点: {hf_endpoint}")
+
         # 3. 创建 Session（集成 IP 优选）
         from xet.network.host_optimizer import create_optimized_session
 
@@ -834,6 +917,32 @@ def download_command(args):
 
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")
+
+            # 如果使用自定义 HF_ENDPOINT，先检测其 XET 支持
+            if hf_endpoint != "https://huggingface.co":
+                from xet.network.host_optimizer import check_hf_endpoint_xet_support
+
+                print(f"   检测 {hf_endpoint} 的 XET 支持...")
+                check_result = check_hf_endpoint_xet_support(
+                    endpoint=hf_endpoint,
+                    proxy=proxy or "",
+                    timeout=10,
+                )
+
+                if check_result["reachable"]:
+                    if check_result["supports_xet"]:
+                        print(f"   ✅ {hf_endpoint} 支持 XET 协议（响应时间: {check_result['response_time']:.2f}s）")
+                        if check_result["xet_headers"].get("x-linked-etag"):
+                            etag = check_result["xet_headers"]["x-linked-etag"][:16]
+                            print(f"      x-linked-etag: {etag}...")
+                    else:
+                        if check_result["has_xet_headers"]:
+                            print(f"   ⚠️  {hf_endpoint} 有 XET 头但缺少 Link 头")
+                        else:
+                            print(f"   ⚠️  {hf_endpoint} 不支持 XET 协议，可能无法下载")
+                else:
+                    print(f"   ❌ {hf_endpoint} 不可达: {check_result.get('error', 'Unknown')}")
+                    print(f"      建议检查网络连接或尝试添加 --proxy 参数")
 
         session, host_optimizer = create_optimized_session(
             proxy=proxy or "",
@@ -874,7 +983,7 @@ def download_command(args):
             dummy_file = "granite-embedding-97M-multilingual-r2-Q4_K_M.gguf"
 
             # 获取 auth URL
-            dummy_xet = detect_xet_file(dummy_repo, "model", dummy_file, hf_token, session, revision="main")
+            dummy_xet = detect_xet_file(dummy_repo, "model", dummy_file, hf_token, session, revision="main", hf_endpoint=hf_endpoint)
             if not dummy_xet:
                 print("✗ 无法获取 CAS token，请改用 user/repo/file 格式", file=sys.stderr)
                 return 1
@@ -893,7 +1002,7 @@ def download_command(args):
         elif filename:
             # 单个文件: user/repo/file
             logger.info(f"检测文件: {repo_id}/{filename} (repo_type={repo_type}, revision={args.revision})")
-            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session, revision=args.revision)
+            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
 
             if not xet_info:
                 print(f"✗ 文件不是 XET 格式: {filename}", file=sys.stderr)
@@ -913,7 +1022,7 @@ def download_command(args):
             print(f"   匹配: {args.include}")
 
             # 列出所有文件
-            all_files = list_hf_files(repo_id, repo_type, hf_token, session)
+            all_files = list_hf_files(repo_id, repo_type, hf_token, session, hf_endpoint=hf_endpoint)
             if not all_files:
                 print(f"✗ 无法列出仓库文件", file=sys.stderr)
                 return 1
@@ -928,7 +1037,7 @@ def download_command(args):
 
             # 检测每个文件是否为 XET
             for fname in matched_files:
-                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, revision=args.revision)
+                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
                 if xet_info:
                     files_to_download.append((repo_id, fname, xet_info, repo_type))
                 else:
@@ -1063,20 +1172,37 @@ def download_command(args):
 
             # 下载
             try:
-                if download_single_file(repo_id, filename, xet_info, output_path, cas_client, args, repo_type, xorb_cache, chunk_cache):
+                if download_single_file(repo_id, filename, xet_info, output_path, cas_client, args, repo_type, xorb_cache, chunk_cache, hf_endpoint):
                     success_count += 1
             except KeyboardInterrupt:
                 interrupted = True
                 print(f"\n⚠ 用户中断")
                 break
 
-        # 10. 汇总
-        print(f"\n{'='*60}")
-        print(f"📊 汇总: {success_count}/{len(files_to_download)} 成功")
+        # 10. 汇总 - 使用美化输出
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+
+        console = Console()
+
+        # 创建汇总表格
+        table = Table(show_header=False, box=None)
+        table.add_column("状态", style="bold")
+        table.add_column("数量", justify="right")
+
+        table.add_row("✓ 成功", f"[green]{success_count}[/green]")
 
         if success_count < len(files_to_download):
             failed_count = len(files_to_download) - success_count
-            print(f"  ⚠️ {failed_count} 个文件失败，已保存断点，重新运行相同命令即可续传")
+            table.add_row("✗ 失败", f"[red]{failed_count}[/red]")
+            table.add_row("", "")
+            table.add_row("💡 提示", "[yellow]已保存断点，重新运行相同命令即可续传[/yellow]")
+
+        table.add_row("", "")
+        table.add_row("📦 总计", f"[cyan]{len(files_to_download)}[/cyan]")
+
+        console.print(Panel(table, title="[bold cyan]批量下载汇总[/bold cyan]", border_style="cyan"))
 
         # 11. 清理缓存（如果不保留）
         if xorb_cache:

@@ -38,9 +38,19 @@ class PrefetchHelpers:
                 # 构造 XorbBlockData
                 from xet.storage.xorb_deserializer import XorbBlockData
 
+                # 从 fetch_infos 获取全局 chunk ID 范围
+                # fetch_infos 可能包含多个段，需要合并所有的 chunk 范围
+                all_chunk_ids = []
+                for fi in fetch_infos:
+                    chunk_range = fi.chunk_range
+                    for chunk_id in range(chunk_range.start, chunk_range.end):
+                        all_chunk_ids.append(chunk_id)
+
+                # 构建 chunk_offsets: [(global_chunk_id, byte_offset), ...]
                 chunk_offsets = []
                 for i in range(len(chunk_byte_indices) - 1):
-                    chunk_offsets.append((i, chunk_byte_indices[i]))
+                    if i < len(all_chunk_ids):
+                        chunk_offsets.append((all_chunk_ids[i], chunk_byte_indices[i]))
 
                 xorb_data = XorbBlockData(
                     chunk_offsets=chunk_offsets,

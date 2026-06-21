@@ -135,6 +135,59 @@ class ConfigManager:
         # 保存到用户配置文件
         self._save_user_config()
 
+    def unset(self, key: str) -> bool:
+        """删除配置值（从用户配置中删除）。
+
+        Args:
+            key: 配置键（支持点号分隔）
+
+        Returns:
+            True 如果键存在并被删除，False 如果键不存在
+        """
+        keys = key.split(".")
+        current = self.config
+
+        # 导航到父级
+        for k in keys[:-1]:
+            if isinstance(current, dict) and k in current:
+                current = current[k]
+            else:
+                return False  # 键不存在
+
+        # 删除最后一个键
+        if isinstance(current, dict) and keys[-1] in current:
+            del current[keys[-1]]
+
+            # 清理空的父级字典
+            self._cleanup_empty_dicts()
+
+            # 保存到用户配置文件
+            self._save_user_config()
+            return True
+
+        return False  # 键不存在
+
+    def _cleanup_empty_dicts(self):
+        """清理空的嵌套字典。"""
+        def _cleanup(d: dict) -> bool:
+            """递归清理空字典，返回 True 如果字典为空。"""
+            if not isinstance(d, dict):
+                return False
+
+            # 清理子字典
+            keys_to_delete = []
+            for k, v in list(d.items()):
+                if isinstance(v, dict) and _cleanup(v):
+                    keys_to_delete.append(k)
+
+            # 删除空子字典
+            for k in keys_to_delete:
+                del d[k]
+
+            return len(d) == 0
+
+        _cleanup(self.config)
+
     def _save_user_config(self):
         """保存配置到用户配置文件。"""
         user_config = Path.home() / ".xetrc"

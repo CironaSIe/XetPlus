@@ -1,226 +1,345 @@
-# 快速开始
+# XET+ 快速开始
 
-## 安装
+> 5 分钟快速上手 XET+ - 高性能 XET 协议下载工具
 
-### 开发环境
+---
+
+## 📦 安装
+
+### 前置要求
+
+- Python 3.9+
+- pip
+
+### 安装步骤
 
 ```bash
-cd ~/xetplus
+# 1. 克隆仓库
+git clone https://github.com/yourusername/xetplus.git
+cd xetplus
 
-# 安装开发依赖
-pip install -e ".[dev,cli]"
+# 2. 安装依赖
+pip install -r requirements.txt
 
-# 验证安装
-python -c "import xet; print(xet.__version__)"
+# 3. 验证安装
+python -m xet.cli.main --help
 ```
 
-### 运行测试
+---
+
+## 🚀 基础使用
+
+### 查看文件信息
+
+快速查看 XET 文件的元数据：
 
 ```bash
-# 运行所有测试
-pytest
-
-# 查看覆盖率
-pytest --cov=xet --cov-report=html
-open htmlcov/index.html
-
-# 运行特定测试
-pytest tests/unit/test_xorb_format.py -v
-
-# 只运行快速测试
-pytest -m "not slow"
+python -m xet.cli.main info mykor/granite-embedding-97m-multilingual-r2-GGUF/model.gguf
 ```
 
-### 代码质量检查
+**输出示例**：
+```
+📄 model.gguf
+  类型: XET ✅
+  大小: 100.6 MB (105,467,232 bytes)
+  Xet Hash: e0aacd103e054264f5ede71ce63218c1...
+  SHA256: 355f1f30ac3bdad09de420c5d78dd369...
+  Terms: 17
+  Xorbs: 10 (unique)
+```
+
+### 下载单个文件
 
 ```bash
-# 格式化代码
-black xet/ tests/
-
-# 检查代码质量
-ruff check xet/ tests/
-
-# 类型检查
-mypy xet/
-
-# 全部运行
-black xet/ tests/ && ruff check xet/ tests/ && mypy xet/ && pytest
+python -m xet.cli.main download mykor/granite-embedding-97m-multilingual-r2-GGUF/model.gguf
 ```
 
----
-
-## 当前进度
-
-### ✅ 已完成
-
-- [x] 项目结构搭建
-- [x] 文档框架（README, ARCHITECTURE, ROADMAP）
-- [x] 开发规范（CONTRIBUTING, pyproject.toml）
-
-### 🚧 进行中（Phase 1）
-
-**当前任务**: 协议层纯函数提取
-
-**下一步行动**:
+默认下载到当前目录，使用 `-o` 指定输出路径：
 
 ```bash
-# Step 1: 复制数据结构
-cp ~/xet.py/xet/types.py ~/xetplus/xet/protocol/types.py
-
-# Step 2: 开始提取 xorb_format.py
-vim ~/xetplus/xet/protocol/xorb_format.py
-
-# Step 3: 编写测试
-vim ~/xetplus/tests/unit/test_xorb_format.py
+python -m xet.cli.main download user/repo/file.gguf -o ./models/model.gguf
 ```
 
----
+### 批量下载
 
-## 项目结构速查
-
-```
-xetplus/
-├── README.md              # 项目介绍
-├── ARCHITECTURE.md        # 架构设计文档 ⭐
-├── ROADMAP.md             # 开发路线图 ⭐
-├── ISSUES.md              # 问题跟踪
-├── CONTRIBUTING.md        # 贡献指南
-├── pyproject.toml         # 项目配置
-│
-├── xet/                   # 核心库
-│   ├── protocol/          # 协议层（纯逻辑）
-│   ├── network/           # 网络层（HTTP）
-│   ├── storage/           # 存储层（文件 I/O）
-│   └── pipeline/          # 管道层（编排）
-│
-├── tests/                 # 测试套件
-│   ├── unit/              # 单元测试
-│   ├── integration/       # 集成测试
-│   └── fixtures/          # 测试数据
-│
-└── docs/                  # 详细文档
-    ├── phase1-plan.md     # Phase 1 详细计划 ⭐
-    └── decisions/         # 设计决策记录
-```
-
----
-
-## 关键文档
-
-### 🎯 立即阅读
-
-1. **ARCHITECTURE.md** - 理解整体架构设计
-2. **ROADMAP.md** - 查看完整开发计划（12 周）
-3. **docs/phase1-plan.md** - 当前阶段详细任务
-
-### 📚 参考文档
-
-- **CONTRIBUTING.md** - 编码规范和提交流程
-- **ISSUES.md** - 问题跟踪和模板
-
----
-
-## 开发流程示例
-
-### 添加新功能
+使用 glob 模式匹配下载多个文件：
 
 ```bash
-# 1. 创建分支
-git checkout -b feature/xorb-parser
+# 下载所有 Q4 量化的 GGUF 文件
+python -m xet.cli.main download mykor/granite-embedding-97m-multilingual-r2-GGUF \
+    --include "*Q4*.gguf"
 
-# 2. 编写代码
-vim xet/protocol/xorb_format.py
-
-# 3. 编写测试
-vim tests/unit/test_xorb_format.py
-
-# 4. 运行测试
-pytest tests/unit/test_xorb_format.py -v
-
-# 5. 代码检查
-black xet/ tests/
-ruff check xet/
-mypy xet/
-
-# 6. 提交
-git add .
-git commit -m "feat: add xorb header parser"
-
-# 7. 推送（如果是协作）
-git push origin feature/xorb-parser
+# 下载所有 .safetensors 文件
+python -m xet.cli.main download user/repo \
+    --include "*.safetensors" \
+    -o ./models/
 ```
 
-### 修复 Bug
+---
+
+## 🌐 国内网络优化
+
+### 方案1：使用 hf-mirror（推荐）
+
+**无需代理**，直接使用国内镜像：
 
 ```bash
-# 1. 创建分支
-git checkout -b fix/deserialize-truncated
+python -m xet.cli.main download user/repo/file.gguf \
+    --hf-endpoint https://hf-mirror.com
+```
 
-# 2. 添加失败测试（TDD）
-vim tests/unit/test_xorb_format.py
-# def test_deserialize_truncated():
-#     with pytest.raises(ValueError):
-#         deserialize_xorb_stream(truncated_data)
+### 方案2：使用代理
 
-# 3. 运行测试（应该失败）
-pytest tests/unit/test_xorb_format.py::test_deserialize_truncated
+通过环境变量设置代理：
 
-# 4. 修复代码
-vim xet/protocol/xorb_format.py
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+python -m xet.cli.main download user/repo/file.gguf
+```
 
-# 5. 验证测试通过
-pytest tests/unit/test_xorb_format.py::test_deserialize_truncated
+或命令行参数：
 
-# 6. 提交
-git commit -am "fix: handle truncated xorb data"
+```bash
+python -m xet.cli.main download user/repo/file.gguf \
+    --proxy http://127.0.0.1:7890
+```
+
+### 方案3：启用 HOST 优选
+
+自动选择最快的 IP（需要代理配合）：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 \
+python -m xet.cli.main download user/repo/file.gguf \
+    --optimize-hosts
+```
+
+**效果**：国内网络速度提升 3-10x
+
+> 详细网络配置请参考：[docs/NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md)
+
+---
+
+## 🔧 配置管理
+
+### 持久化配置
+
+避免每次输入参数，配置保存到 `~/.xetrc`：
+
+```bash
+# 设置 HuggingFace token
+python -m xet.cli.main config xet.token YOUR_HF_TOKEN
+
+# 设置默认并发数
+python -m xet.cli.main config download.concurrency 16
+
+# 设置默认端点
+python -m xet.cli.main config xet.endpoint https://hf-mirror.com
+
+# 启用 HOST 优选
+python -m xet.cli.main config network.optimize_hosts true
+```
+
+### 查看配置
+
+```bash
+# 列出所有配置
+python -m xet.cli.main config --list
+
+# 获取单个配置
+python -m xet.cli.main config --get xet.token
+```
+
+### 删除配置
+
+```bash
+# 删除指定配置
+python -m xet.cli.main config --unset xet.token
+
+# 删除嵌套配置
+python -m xet.cli.main config --unset network.optimize_hosts
 ```
 
 ---
 
-## 常见问题
+## 🎯 常用场景
 
-### Q: 为什么要重构？
+### 场景1：下载 HuggingFace 大模型（国内）
 
-旧版 `xet.py` 存在：
-- 单文件过大（2,363 行 reconstructor.py）
-- 职责混乱（God Class）
-- 无单元测试（调试靠 19k 行日志）
-- Bug 修复困难（头疼医头）
+```bash
+# 一次性配置
+python -m xet.cli.main config xet.endpoint https://hf-mirror.com
+python -m xet.cli.main config xet.token YOUR_HF_TOKEN
 
-新版目标：
-- 模块化（每个文件 <500 行）
-- 职责清晰（每个模块单一职责）
-- 测试覆盖（80%+ 覆盖率）
-- 易于维护（bug 修复范围小）
+# 下载模型
+python -m xet.cli.main download Qwen/Qwen2.5-7B-Instruct-GGUF \
+    --include "*.gguf" \
+    -o ./models/qwen2.5-7b/
+```
 
-### Q: 会保持兼容吗？
+### 场景2：断点续传
 
-是的，渐进式迁移：
-- Phase 1-4: 独立开发新模块
-- Phase 5: 实现 CLI 兼容层
-- Phase 6: 性能对齐旧版
+网络中断？没问题，自动从断点恢复：
 
-用户可以无缝切换。
+```bash
+# 第一次下载（中断）
+python -m xet.cli.main download user/repo/large_file.gguf
 
-### Q: 性能会下降吗？
+# 恢复下载（自动检测 checkpoint）
+python -m xet.cli.main download user/repo/large_file.gguf
+```
 
-不会。通过：
-- Profile 找出热点
-- 必要时用 Rust 扩展优化
-- 内存管理优化（LRU 缓存）
+### 场景3：高并发下载
 
-目标：性能 ≥ 旧版。
+大文件？增加并发数：
+
+```bash
+python -m xet.cli.main download user/repo/large_file.gguf \
+    --concurrency 32
+```
+
+### 场景4：查看文件是否为 XET 格式
+
+```bash
+# 检查单个文件
+python -m xet.cli.main info user/repo/file.gguf
+
+# 批量检查
+python -m xet.cli.main info user/repo --include "*.gguf"
+```
 
 ---
 
-## 联系方式
+## ⚡ 性能优化技巧
 
-- **问题报告**: GitHub Issues
-- **功能建议**: GitHub Discussions
-- **紧急问题**: [邮件联系]
+### 1. Xorb 缓存加速
+
+XET+ 自动缓存下载的 xorb，重复下载速度提升 **36x**：
+
+```bash
+# 第一次：正常下载
+python -m xet.cli.main download user/repo/model_v1.gguf
+
+# 第二次：如果模型只是轻微修改，大部分 xorb 命中缓存
+python -m xet.cli.main download user/repo/model_v2.gguf
+```
+
+### 2. 并行批量写入（实验性）
+
+大文件写入性能提升 **2-3x**：
+
+```bash
+python -m xet.cli.main download user/repo/large_file.gguf \
+    --parallel-write
+```
+
+### 3. 调整预取水位线
+
+控制内存使用和下载速度的平衡：
+
+```bash
+# 低内存环境
+python -m xet.cli.main download user/repo/file.gguf \
+    --prefetch-low 24 \
+    --prefetch-high 96
+
+# 高内存环境（更激进预取）
+python -m xet.cli.main download user/repo/file.gguf \
+    --prefetch-low 96 \
+    --prefetch-high 384
+```
 
 ---
 
-## License
+## 🔍 故障排查
 
-MIT License - 查看 LICENSE 文件
+### 问题1：401 Unauthorized
+
+**原因**：需要 HuggingFace token
+
+**解决**：
+```bash
+# 设置 token
+python -m xet.cli.main config xet.token YOUR_HF_TOKEN
+
+# 或命令行传递
+python -m xet.cli.main download user/repo/file.gguf --token YOUR_TOKEN
+```
+
+### 问题2：下载速度慢（国内）
+
+**解决方案**（按优先级）：
+
+1. **使用 hf-mirror**（推荐）：
+   ```bash
+   python -m xet.cli.main config xet.endpoint https://hf-mirror.com
+   ```
+
+2. **启用 HOST 优选 + 代理**：
+   ```bash
+   HTTPS_PROXY=http://127.0.0.1:7890 \
+   python -m xet.cli.main download user/repo/file.gguf --optimize-hosts
+   ```
+
+3. **直接使用代理**：
+   ```bash
+   export HTTPS_PROXY=http://127.0.0.1:7890
+   ```
+
+### 问题3：文件校验失败
+
+**原因**：下载损坏或网络问题
+
+**解决**：
+```bash
+# 删除部分下载的文件
+rm -rf file.gguf file.gguf.part checkpoint_file.gguf.json
+
+# 重新下载
+python -m xet.cli.main download user/repo/file.gguf
+```
+
+### 问题4：磁盘空间不足
+
+XET+ 下载过程中会占用额外空间（checkpoint + xorb cache）：
+
+- **Checkpoint 文件**：与原文件同目录，`.json` 后缀
+- **Xorb 缓存**：`~/.cache/xet/xorbs/`
+
+清理缓存：
+```bash
+# 清理 xorb 缓存
+rm -rf ~/.cache/xet/xorbs/
+
+# 清理 checkpoint 文件
+rm -f *.json
+```
+
+---
+
+## 📚 进一步阅读
+
+### 用户文档
+- [完整使用指南](USER_GUIDE.md) - 所有命令和参数详解
+- [网络选项指南](NETWORK_OPTIONS_GUIDE.md) - 国内网络优化完整方案
+
+### 开发文档
+- [架构设计](ARCHITECTURE.md) - 理解 XET+ 内部结构
+- [贡献指南](CONTRIBUTING.md) - 如何参与开发
+- [测试指南](TESTING_GUIDE.md) - 运行和编写测试
+
+### 技术深入
+- [XET Hash 提取方法](XET_HASH_EXTRACTION_METHODS.md) - 协议细节
+- [HuggingFace vs hf-mirror](HUGGINGFACE_VS_HFMIRROR.md) - 端点对比
+
+---
+
+## 🤝 获取帮助
+
+- **命令帮助**：`python -m xet.cli.main --help`
+- **问题报告**：[GitHub Issues](https://github.com/yourusername/xetplus/issues)
+- **功能建议**：[GitHub Discussions](https://github.com/yourusername/xetplus/discussions)
+
+---
+
+**下一步**：查看 [用户指南](USER_GUIDE.md) 了解更多高级功能！

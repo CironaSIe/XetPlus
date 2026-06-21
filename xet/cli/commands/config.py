@@ -35,6 +35,12 @@ def register_config_command(subparsers):
         metavar="KEY",
     )
 
+    parser.add_argument(
+        "--unset",
+        help="删除配置值",
+        metavar="KEY",
+    )
+
     parser.set_defaults(func=config_command)
 
 
@@ -62,6 +68,15 @@ def config_command(args):
                 return 1
             print(value)
             return 0
+
+        # 删除配置
+        if args.unset:
+            if config.unset(args.unset):
+                print(f"✓ 已删除: {args.unset}")
+                return 0
+            else:
+                print(f"✗ 配置不存在: {args.unset}", file=sys.stderr)
+                return 1
 
         # 设置配置
         if args.key and args.value:

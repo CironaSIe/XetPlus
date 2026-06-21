@@ -1,6 +1,6 @@
-# XET Plus 文档索引
+# XET+ 文档索引
 
-> 快速导航 - 一站式查找所有文档
+> 完整文档导航 - 快速找到你需要的信息
 
 ---
 
@@ -11,7 +11,8 @@
 1. 📖 [README.md](../README.md) - 5 分钟了解项目 ⭐
 2. 🚀 [QUICKSTART.md](QUICKSTART.md) - 快速开始（安装、基本使用）
 3. 👤 [USER_GUIDE.md](USER_GUIDE.md) - 完整使用指南
-4. 🏗️ [ARCHITECTURE.md](ARCHITECTURE.md) - 深入架构设计
+4. 🌐 [NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md) - 网络选项完整说明
+5. 🏗️ [ARCHITECTURE.md](ARCHITECTURE.md) - 深入架构设计
 
 ---
 
@@ -21,6 +22,7 @@
 
 - **[QUICKSTART.md](QUICKSTART.md)** - 快速开始（安装、基本使用）
 - **[USER_GUIDE.md](USER_GUIDE.md)** - 完整使用指南（命令、参数、示例）
+- **[NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md)** - 网络选项完整说明（代理/HOST优选/镜像）
 
 ### 开发文档
 
@@ -28,6 +30,38 @@
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** - 贡献指南（编码规范、PR 流程）
 - **[TESTING_GUIDE.md](TESTING_GUIDE.md)** - 测试指南（如何编写和运行测试）
 - **[FEATURE_REQUESTS.md](FEATURE_REQUESTS.md)** - 功能请求
+
+### 技术深入
+
+- **[XET_HASH_EXTRACTION_METHODS.md](XET_HASH_EXTRACTION_METHODS.md)** - XET Hash 提取方法（HEAD 命令和三级 fallback）
+- **[HUGGINGFACE_VS_HFMIRROR.md](HUGGINGFACE_VS_HFMIRROR.md)** - HuggingFace vs hf-mirror 完整对比
+- **[XET_METADATA_EXTRACTION_IMPROVEMENTS.md](XET_METADATA_EXTRACTION_IMPROVEMENTS.md)** - XET 元数据提取完整改进报告
+- **[CONFIG_COMMAND_TEST_IMPROVEMENTS.md](CONFIG_COMMAND_TEST_IMPROVEMENTS.md)** - Config 命令测试改进（已完成）
+- **[VISUAL_IMPROVEMENTS_SUMMARY.md](VISUAL_IMPROVEMENTS_SUMMARY.md)** - 视觉优化和文档完善总结 ⭐ 新增
+
+---
+
+## 🧪 测试文档
+
+### 最新测试报告
+
+- **[P3_INTEGRATION_TEST_REPORT.md](reports/P3_INTEGRATION_TEST_REPORT.md)** - P3 集成测试报告（100% 通过）⭐
+
+### 历史测试报告
+
+- [P2_TEST_REPORT.md](reports/P2_TEST_REPORT.md) - P2 测试报告
+- [P1_TEST_PROGRESS.md](reports/P1_TEST_PROGRESS.md) - P1 测试进度
+- [P0_TEST_REPORT.md](reports/P0_TEST_REPORT.md) - P0 测试报告
+- [OPTIMIZER_FIX_AND_P3.md](reports/OPTIMIZER_FIX_AND_P3.md) - 优化器修复和 P3 测试
+- [XET_HASH_EXTRACTION_IMPROVEMENT.md](reports/XET_HASH_EXTRACTION_IMPROVEMENT.md) - Hash 提取改进设计
+- [XET_HASH_IMPROVEMENT_SUMMARY.md](reports/XET_HASH_IMPROVEMENT_SUMMARY.md) - Hash 提取改进总结
+
+### 开发者资源
+
+- [dev/KNOWN_ISSUES.md](dev/KNOWN_ISSUES.md) - 已知问题跟踪
+- [dev/TEST_PLAN.md](dev/TEST_PLAN.md) - 测试计划
+- [dev/HOST_OPTIMIZER_DESIGN.md](dev/HOST_OPTIMIZER_DESIGN.md) - HOST 优选器设计
+- [dev/HOST_OPTIMIZER_ANALYSIS_FINAL.md](dev/HOST_OPTIMIZER_ANALYSIS_FINAL.md) - HOST 优选器完整分析
 
 ---
 
@@ -56,24 +90,41 @@
 ## 🗂️ 文档组织
 
 ```
-.
-├── README.md                              # 项目主文档
+xetplus/
+├── README.md                              # 项目主文档 ⭐
 ├── README_CN.md                           # 中文说明
-├── 待修问题.md                            # 问题跟踪（已全部修复）
-├── CHUNK_CACHE_FIX_COMPLETION.md         # Chunk cache 修复总结
 │
-├── docs/
+├── docs/                                  # 文档目录
 │   ├── INDEX.md                          # 本文件（文档索引）
 │   │
 │   ├── 用户文档
 │   │   ├── QUICKSTART.md                 # 快速开始
-│   │   └── USER_GUIDE.md                 # 完整使用指南
+│   │   ├── USER_GUIDE.md                 # 完整使用指南
+│   │   └── NETWORK_OPTIONS_GUIDE.md      # 网络选项完整说明
 │   │
 │   ├── 开发文档
 │   │   ├── ARCHITECTURE.md               # 系统架构
 │   │   ├── CONTRIBUTING.md               # 贡献指南
 │   │   ├── TESTING_GUIDE.md              # 测试指南
 │   │   └── FEATURE_REQUESTS.md           # 功能请求
+│   │
+│   ├── 技术文档
+│   │   ├── XET_HASH_EXTRACTION_METHODS.md       # Hash 提取方法
+│   │   ├── HUGGINGFACE_VS_HFMIRROR.md           # 端点对比
+│   │   ├── XET_METADATA_EXTRACTION_IMPROVEMENTS.md  # 元数据提取改进
+│   │   └── CONFIG_COMMAND_TEST_IMPROVEMENTS.md  # Config 命令改进
+│   │
+│   ├── 测试报告 (reports/)
+│   │   ├── P3_INTEGRATION_TEST_REPORT.md  # P3 测试报告（最新）⭐
+│   │   ├── P2_TEST_REPORT.md             # P2 测试报告
+│   │   ├── P1_TEST_PROGRESS.md           # P1 测试进度
+│   │   └── P0_TEST_REPORT.md             # P0 测试报告
+│   │
+│   ├── 开发资源 (dev/)
+│   │   ├── KNOWN_ISSUES.md               # 已知问题
+│   │   ├── TEST_PLAN.md                  # 测试计划
+│   │   ├── HOST_OPTIMIZER_DESIGN.md      # 优选器设计
+│   │   └── HOST_OPTIMIZER_ANALYSIS_FINAL.md  # 优选器分析
 │   │
 │   ├── 规范文档 (spec/)
 │   │   ├── XET.SPEC.md                   # 协议规范
@@ -86,10 +137,10 @@
 │       ├── [设计分析文档]
 │       └── [实现总结文档]
 │
-└── debug_materials/
-    ├── COMPLETE_FIX_SUMMARY.md           # Chunk cache 完整修复总结 ⭐
-    ├── [测试脚本和数据]
-    └── archive/                          # 旧版修复记录
+├── tests/                                 # 测试套件
+│   └── test_cli_p3_integration.sh        # P3 集成测试脚本
+│
+└── archive/                               # 历史代码归档
 ```
 
 ---
@@ -98,6 +149,9 @@
 
 ### 想快速上手使用？
 → [QUICKSTART.md](QUICKSTART.md) ⭐
+
+### 国内网络如何优化？
+→ [NETWORK_OPTIONS_GUIDE.md](NETWORK_OPTIONS_GUIDE.md) ⭐
 
 ### 想深入了解功能？
 → [USER_GUIDE.md](USER_GUIDE.md)
@@ -111,11 +165,14 @@
 ### 想了解 XET 协议细节？
 → [spec/XET.SPEC.md](spec/XET.SPEC.md)
 
-### 想对齐 Rust 实现？
-→ [spec/XET.ALIGNMENT.md](spec/XET.ALIGNMENT.md)
+### 想了解最新测试结果？
+→ [reports/P3_INTEGRATION_TEST_REPORT.md](reports/P3_INTEGRATION_TEST_REPORT.md) ⭐
 
-### 想了解最新修复？
-→ [../CHUNK_CACHE_FIX_COMPLETION.md](../CHUNK_CACHE_FIX_COMPLETION.md) ⭐
+### 想了解 XET Hash 提取？
+→ [XET_HASH_EXTRACTION_METHODS.md](XET_HASH_EXTRACTION_METHODS.md)
+
+### HuggingFace 和 hf-mirror 有什么区别？
+→ [HUGGINGFACE_VS_HFMIRROR.md](HUGGINGFACE_VS_HFMIRROR.md)
 
 ---
 
@@ -123,33 +180,44 @@
 
 | 文档 | 状态 | 最后更新 | 说明 |
 |------|------|---------|------|
-| USER_GUIDE.md | ✅ 完整 | 2026-06-20 | |
+| README.md | ✅ 完整 | 2026-06-21 | v0.5.0-dev |
 | QUICKSTART.md | ✅ 完整 | 2026-06-21 | |
+| USER_GUIDE.md | ✅ 完整 | 2026-06-20 | |
+| NETWORK_OPTIONS_GUIDE.md | ✅ 完整 | 2026-06-21 | 新增 |
 | ARCHITECTURE.md | ✅ 完整 | 2026-06-18 | |
 | TESTING_GUIDE.md | ✅ 完整 | 2026-06-20 | |
-| CONTRIBUTING.md | ✅ 完整 | 2026-06-18 | |
-| CHUNK_CACHE_FIX_COMPLETION.md | ✅ 完整 | 2026-06-21 | 最新 |
+| P3_INTEGRATION_TEST_REPORT.md | ✅ 完整 | 2026-06-21 | 100% 通过 |
+| XET_HASH_EXTRACTION_METHODS.md | ✅ 完整 | 2026-06-21 | 新增 |
+| HUGGINGFACE_VS_HFMIRROR.md | ✅ 完整 | 2026-06-21 | 新增 |
 | spec/*.md | ✅ 完整 | 2026-06-18 | |
 
 ---
 
 ## 🔄 最近更新
 
-### 2026-06-21 - 文档清理 & Chunk Cache 完整修复 ✨
+### 2026-06-21 - v0.5.0-dev 里程碑 ✨
 
-**文档清理**：
-- ✅ 清理根目录：移动 7 个历史文档到 `docs/archive/`
-- ✅ 清理 docs/：移动 17 个历史文档到 `docs/archive/`
-- ✅ 根目录现在只保留 5 个核心文档
-- ✅ docs/ 现在只保留 6 个核心文档
-- ✅ 所有历史文档已归档，随时可查
+**重大改进**：
+- ✅ **XET Hash 提取健壮性大幅提升** - 三级 fallback 策略
+- ✅ **SHA256 校验支持** - 完整文件校验
+- ✅ **HuggingFace + hf-mirror 双支持** - 国内外网络全兼容
+- ✅ **P3 集成测试 100% 通过** - 4/4 测试用例全部通过
 
-**Chunk Cache 修复**：
-- ✅ 完整修复 chunk cache - 支持不连续 chunk ranges
-- ✅ 缓存成功率：0% → 100%
-- ✅ 所有 11 个待修问题已全部解决
-- ✅ 新增 `CHUNK_CACHE_FIX_COMPLETION.md` - 完整修复总结
-- ✅ 新增 `debug_materials/COMPLETE_FIX_SUMMARY.md` - 技术细节
+**文档更新**：
+- ✅ 更新 README.md - 反映 v0.5.0-dev 状态
+- ✅ 新增 NETWORK_OPTIONS_GUIDE.md - 网络选项完整说明
+- ✅ 新增 XET_HASH_EXTRACTION_METHODS.md - Hash 提取方法详解
+- ✅ 新增 HUGGINGFACE_VS_HFMIRROR.md - 端点对比
+- ✅ 新增 XET_METADATA_EXTRACTION_IMPROVEMENTS.md - 元数据提取改进
+- ✅ 新增 CONFIG_COMMAND_TEST_IMPROVEMENTS.md - Config 命令改进建议
+- ✅ 新增 P3_INTEGRATION_TEST_REPORT.md - P3 测试报告
+- ✅ 文档整理 - 移动临时文档到 reports/ 和 dev/
+
+**技术细节**：
+- ✅ 改进 xet/cli/commands/info.py - 三级 fallback
+- ✅ 改进 xet/cli/commands/download.py - 四级 fallback
+- ✅ 改进 xet/protocol/types.py - XetFileInfo.from_headers()
+- ✅ 修复 test_cli_p3_integration.sh - 配置文件路径修正
 
 ### 2026-06-20
 - ✅ 更新 USER_GUIDE.md - 完善使用指南
@@ -175,7 +243,25 @@
 
 ---
 
+## 📝 文档贡献
+
+发现文档问题或想要改进？
+
+1. 在 [Issues](https://github.com/yourusername/xetplus/issues) 中报告
+2. 提交 Pull Request
+3. 遵循 [贡献指南](CONTRIBUTING.md)
+
+---
+
+## 🔗 外部资源
+
+- [XetHub 官方文档](https://xethub.com/docs)
+- [HuggingFace XET 支持](https://huggingface.co/docs/hub/xet)
+- [hf-mirror.com](https://hf-mirror.com) - 国内镜像（完整支持 XET）
+
+---
+
 **文档维护者**: XET+ Team  
 **最后更新**: 2026-06-21  
-**项目状态**: v0.5.0 - 所有核心功能已完成 ✅  
-**待修问题**: 0 个（已全部解决）🎉
+**项目状态**: v0.5.0-dev - P3 测试 100% 通过 ✅  
+**核心功能**: 已完成 🎉

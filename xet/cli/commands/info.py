@@ -158,23 +158,57 @@ def detect_xet_file(repo_id: str, repo_type: str, filename: str, token: str, ses
             if not auth_url.startswith("http"):
                 auth_url = f"https://huggingface.co{auth_url}"
 
-        # 提取 xet-hash
+        # 提取 xet-hash（多级 fallback，支持未来协议变化）
         xet_hash = None
-        match = re.search(r'<xet://([^>]+)>;\s*rel="xet-hash"', link_header)
+
+        # 方法1: 标准 xet:// 协议格式 (rel="xet-hash")
+        match = re.search(
+            r'<xet://([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet-hash["\']?',
+            link_header,
+            re.IGNORECASE
+        )
         if match:
             xet_hash = match.group(1)
+
+        # 方法2: reconstruction-info URL 中的 hash（通用版本）
+        if not xet_hash:
+            match = re.search(
+                r'<https?://[^/]+/[^/]*/reconstructions?/([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet-reconstruction',
+                link_header,
+                re.IGNORECASE
+            )
+            if match:
+                xet_hash = match.group(1)
+
+        # 方法3: 任何 URL 中的 64 字符 hex 串（最后的 fallback）
+        if not xet_hash:
+            match = re.search(
+                r'<[^>]*?([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet',
+                link_header,
+                re.IGNORECASE
+            )
+            if match:
+                xet_hash = match.group(1)
 
         if not xet_hash or not auth_url:
             return None
 
-        # 文件大小
+        # 文件大小（优先使用 X-Linked-Size，它是真实文件大小）
+        linked_size = resp.headers.get("X-Linked-Size")
         content_length = resp.headers.get("Content-Length")
-        size = int(content_length) if content_length else 0
+        size = int(linked_size) if linked_size else (int(content_length) if content_length else 0)
+
+        # SHA256（从 X-Linked-ETag 提取，去掉引号）
+        sha256 = None
+        linked_etag = resp.headers.get("X-Linked-ETag")
+        if linked_etag:
+            sha256 = linked_etag.strip('"')
 
         return {
             "xet_hash": xet_hash,
             "auth_url": auth_url,
             "size": size,
+            "sha256": sha256,
         }
 
     except requests.RequestException as e:
@@ -190,10 +224,26 @@ def print_file_info(
     show_reconstruction: bool = True,
 ):
     """打印单个文件的信息。"""
-    print(f"{indent}📄 {filename}")
-    print(f"{indent}  类型: XET ✅")
-    print(f"{indent}  大小: {format_bytes(xet_info['size'])} ({xet_info['size']:,} bytes)")
-    print(f"{indent}  Xet Hash: {xet_info['xet_hash'][:32]}...")
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+
+    # 创建信息表格
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("属性", style="cyan")
+    table.add_column("值", style="white")
+
+    # 基本信息
+    table.add_row("📄 文件名", filename)
+    table.add_row("✅ 类型", "XET")
+    table.add_row("📦 大小", f"{format_bytes(xet_info['size'])} ({xet_info['size']:,} bytes)")
+    table.add_row("🔑 XET Hash", f"{xet_info['xet_hash'][:32]}...")
+
+    # SHA256（用于完整文件校验）
+    if xet_info.get('sha256'):
+        table.add_row("🔐 SHA256", xet_info['sha256'])
 
     if show_reconstruction:
         try:
@@ -203,19 +253,23 @@ def print_file_info(
             terms = len(recon.terms)
             xorbs = len(recon.fetch_info)
 
-            print(f"{indent}  Terms: {terms}")
-            print(f"{indent}  Xorbs: {xorbs} (unique)")
-            print(f"{indent}  Offset into first range: {recon.offset_into_first_range}")
+            table.add_row("📑 Terms", str(terms))
+            table.add_row("🧩 Xorbs", f"{xorbs} (unique)")
+            table.add_row("📍 Offset", str(recon.offset_into_first_range))
 
             # 统计 term 大小
             if terms > 0:
                 sizes = [t.unpacked_length for t in recon.terms]
-                print(f"{indent}  Term 大小: min={format_bytes(min(sizes))}, "
-                      f"max={format_bytes(max(sizes))}, "
-                      f"avg={format_bytes(sum(sizes) // len(sizes))}")
+                size_info = (f"min={format_bytes(min(sizes))}, "
+                           f"max={format_bytes(max(sizes))}, "
+                           f"avg={format_bytes(sum(sizes) // len(sizes))}")
+                table.add_row("📏 Term 大小", size_info)
 
         except Exception as e:
-            print(f"{indent}  Reconstruction: ✗ {e}")
+            table.add_row("⚠️  Reconstruction", f"✗ {e}")
+
+    # 用 Panel 包裹表格
+    console.print(Panel(table, title=f"[bold cyan]XET 文件信息[/bold cyan]", border_style="cyan"))
 
 
 def format_bytes(n: int) -> str:

@@ -564,6 +564,14 @@ class HostOptimizer:
                 logger.debug("[HostOpt] 优选缓存已过期")
                 return False
 
+            # 检查代理配置是否变化
+            cached_proxy = data.get("proxy_config", "")
+            if cached_proxy != self.proxy:
+                logger.info(
+                    f"[HostOpt] 代理配置变化（缓存: {cached_proxy or '无'} → 当前: {self.proxy or '无'}），清除缓存"
+                )
+                return False
+
             self.mappings = data.get("mappings", {})
 
             # 检查代理依赖：如果某些域名需要代理但当前没有代理配置
@@ -590,6 +598,11 @@ class HostOptimizer:
     def _save_cache(self) -> None:
         """保存优选缓存。"""
         try:
+            data = {
+                "timestamp": time.time(),
+                "proxy_config": self.proxy,  # 记录代理配置
+                "mappings": self.mappings,
+            }
             with open(self.cache_path, 'w') as f:
                 json.dump(
                     {
@@ -807,4 +820,100 @@ def create_optimized_session(
         session.mount("https://", adapter)
 
     return session, host_optimizer
+
+
+def check_hf_endpoint_xet_support(
+    endpoint: str,
+    test_repo: str = "mykor/granite-embedding-97m-multilingual-r2-GGUF",
+    test_file: str = "granite-embedding-97M-multilingual-r2-Q4_K_M.gguf",
+    test_commit: str = "45ce642d3fab2033d167ec09641a159010f7d9d9",
+    proxy: str = "",
+    timeout: int = 10,
+) -> Dict[str, any]:
+    """检测 HF 端点是否支持 XET 协议。
+
+    测试项目：
+    1. 端点可达性（HEAD 请求）
+    2. XET 特征头存在（x-linked-etag, x-linked-size, x-repo-commit）
+    3. XET Link 头存在（rel="xet-auth", rel="xet-reconstruction-info"）
+
+    Args:
+        endpoint: HF 端点 URL（如 https://hf-mirror.com）
+        test_repo: 测试用仓库
+        test_file: 测试用文件
+        test_commit: 测试用 commit hash
+        proxy: 代理地址（可选）
+        timeout: 超时时间（秒）
+
+    Returns:
+        {
+            "reachable": bool,           # 端点是否可达
+            "supports_xet": bool,        # 是否支持 XET
+            "has_xet_headers": bool,     # 是否有 XET 特征头
+            "has_link_headers": bool,    # 是否有 Link 头
+            "response_time": float,      # 响应时间（秒）
+            "status_code": int,          # HTTP 状态码
+            "error": str,                # 错误信息（如有）
+            "xet_headers": dict,         # XET 相关头（如有）
+        }
+    """
+    result = {
+        "reachable": False,
+        "supports_xet": False,
+        "has_xet_headers": False,
+        "has_link_headers": False,
+        "response_time": 0.0,
+        "status_code": 0,
+        "error": None,
+        "xet_headers": {},
+    }
+
+    # 构造测试 URL
+    test_url = f"{endpoint.rstrip('/')}/{test_repo}/resolve/{test_commit}/{test_file}"
+
+    try:
+        session = create_robust_session(proxy=proxy, trust_env=False, retries=1)
+
+        start = time.time()
+        resp = session.head(test_url, allow_redirects=False, timeout=timeout)
+        elapsed = time.time() - start
+
+        result["response_time"] = elapsed
+        result["status_code"] = resp.status_code
+
+        # 检查可达性（302/301 是正常的 XET 重定向）
+        if resp.status_code in (200, 301, 302, 307, 308):
+            result["reachable"] = True
+
+            # 检查 XET 特征头
+            xet_etag = resp.headers.get("x-linked-etag") or resp.headers.get("X-Linked-ETag")
+            xet_size = resp.headers.get("x-linked-size") or resp.headers.get("X-Linked-Size")
+            xet_commit = resp.headers.get("x-repo-commit") or resp.headers.get("X-Repo-Commit")
+
+            if xet_etag or xet_size:
+                result["has_xet_headers"] = True
+                result["xet_headers"] = {
+                    "x-linked-etag": xet_etag,
+                    "x-linked-size": xet_size,
+                    "x-repo-commit": xet_commit,
+                }
+
+            # 检查 Link 头
+            link_header = resp.headers.get("Link", "")
+            if 'rel="xet-auth"' in link_header or 'rel="xet-reconstruction-info"' in link_header:
+                result["has_link_headers"] = True
+
+            # 判断是否完全支持 XET
+            result["supports_xet"] = result["has_xet_headers"] and result["has_link_headers"]
+        else:
+            result["error"] = f"HTTP {resp.status_code}"
+
+    except requests.exceptions.Timeout:
+        result["error"] = "Connection timeout"
+    except requests.exceptions.ConnectionError as e:
+        result["error"] = f"Connection error: {str(e)[:50]}"
+    except Exception as e:
+        result["error"] = f"Unexpected error: {str(e)[:50]}"
+
+    return result
 

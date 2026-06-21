@@ -750,5 +750,399 @@ xet download user/repo/file.gguf --revision develop
 
 ---
 
+---
+
+---
+
+## ✅ 新功能：HF_ENDPOINT 镜像站支持 [已实现]
+
+**实现日期**: 2026-06-21  
+**状态**: ✅ 已完成
+
+### 功能说明
+
+CLI 现已支持通过 `--hf-endpoint` 参数或 `HF_ENDPOINT` 环境变量替换 HuggingFace 端点，允许使用国内镜像站（如 hf-mirror.com）进行直连下载。
+
+### 使用方式
+
+**方式 1: 命令行参数**
+```bash
+python -m xet.cli.main download mykor/granite-embedding-97m-multilingual-r2-GGUF/granite-embedding-97M-multilingual-r2-Q4_K_M.gguf \
+    --hf-endpoint https://hf-mirror.com \
+    --token YOUR_TOKEN \
+    -o output.gguf
+```
+
+**方式 2: 环境变量**
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+python -m xet.cli.main download mykor/granite-embedding-97m-multilingual-r2-GGUF/granite-embedding-97M-multilingual-r2-Q4_K_M.gguf \
+    --token YOUR_TOKEN \
+    -o output.gguf
+```
+
+**方式 3: 配合 IP 优选**
+```bash
+python -m xet.cli.main download mykor/granite-embedding-97m-multilingual-r2-GGUF/granite-embedding-97M-multilingual-r2-Q4_K_M.gguf \
+    --hf-endpoint https://hf-mirror.com \
+    --optimize-hosts \
+    --token YOUR_TOKEN \
+    -o output.gguf
+```
+
+### 实现细节
+
+**修改的文件**:
+- `xet/cli/commands/download.py`: 添加 `--hf-endpoint` 参数和 URL 替换逻辑
+- `xet/network/host_optimizer.py`: 添加 `check_hf_endpoint_xet_support()` 函数
+
+**修改的函数**:
+- `list_hf_files()`: 添加 `hf_endpoint` 参数
+- `detect_xet_file()`: 添加 `hf_endpoint` 参数
+- `download_file_direct()`: 添加 `hf_endpoint` 参数
+- `download_single_file()`: 添加 `hf_endpoint` 参数
+
+**新增的函数**:
+- `check_hf_endpoint_xet_support()`: 检测端点的 XET 支持和可达性
+  - 测试 XET 特征头（x-linked-etag, x-linked-size, x-repo-commit）
+  - 测试 XET Link 头（rel="xet-auth", rel="xet-reconstruction-info"）
+  - 返回可达性、支持状态、响应时间等信息
+
+### 集成 IP 优选
+
+当启用 `--optimize-hosts` 时，CLI 会自动检测自定义 HF_ENDPOINT 的 XET 支持：
+
+```
+🚀 正在执行 HOST 优选（DoH 查询 + 测速）...
+   检测 https://hf-mirror.com 的 XET 支持...
+   ✅ https://hf-mirror.com 支持 XET 协议（响应时间: 0.23s）
+      x-linked-etag: 355f1f30ac3bdad0...
+```
+
+### 验证结果
+
+✅ **哈希值一致性验证**:
+- huggingface.co 和 hf-mirror.com 返回的 x-linked-etag 完全一致
+- 两个端点的文件大小（x-linked-size）完全一致
+- 两个端点的 commit hash（x-repo-commit）完全一致
+
+✅ **完整流程测试**:
+- ✅ hf-mirror.com 直连下载成功（无需代理）
+- ✅ 认证和元数据获取可完全直连
+- ✅ 仅 segment 数据下载需要代理（us.aws.cdn.hf.co）
+
+### 相关文档
+
+- 完整流程验证: 见上方 "🌐 直连方案：hf-mirror.com 作为 XET 入口"
+- 测试脚本: `test_hf_endpoint.sh`
+
+---
+
+## 🌐 直连方案：hf-mirror.com 作为 XET 入口 [已验证]
+
+**验证日期**: 2026-06-21  
+**状态**: ✅ 完整流程测试通过
+
+### 测试结论
+
+**hf-mirror.com 完全支持 XET 协议**，可作为直连下载的入口点，实现混合架构：
+- **认证/元数据**: 走直连（hf-mirror.com + cas-server.xethub.hf.co）
+- **数据下载**: 走代理（us.aws.cdn.hf.co/xorbs）
+
+### 完整流程（4步）
+
+```
+步骤 1: HEAD hf-mirror.com/<repo>/<file>  [直连 ✅]
+  ↓ 返回 XET Link 头和特征头
+  
+步骤 2: GET xet-auth endpoint  [直连 ✅]
+  ↓ 返回 {"accessToken": "..."}
+  
+步骤 3: GET cas-server.xethub.hf.co/v1/reconstructions/<hash>  [直连 ✅]
+  ↓ 携带 Authorization: Bearer <token>
+  ↓ 返回重建信息: {terms: [...], fetch_info: {...}}
+  
+步骤 4: GET us.aws.cdn.hf.co/xorbs/default/<hash>  [需要代理 ⚠️]
+  ↓ 下载实际 segment 数据（支持 HTTP Range）
+```
+
+### 重建响应结构
+
+```json
+{
+  "offset_into_first_range": 0,
+  "terms": [
+    {
+      "hash": "f52ace46e9559367a345b3c5a6ad6261391dae66197857915fa7d6a1ca27c812",
+      "unpacked_length": 3301792,
+      "range": {"start": 0, "end": 41}
+    }
+  ],
+  "fetch_info": {
+    "f52ace46e9559367a345b3c5a6ad6261391dae66197857915fa7d6a1ca27c812": [
+      {
+        "range": {"start": 0, "end": 41},
+        "url": "https://us.aws.cdn.hf.co/xorbs/default/f52ace46e...",
+        "url_range": {"start": 0, "end": 1668043}
+      }
+    ]
+  }
+}
+```
+
+**字段说明**:
+- `terms`: 文件重建的 term 列表，每个 term 对应一个 xorb（segment）
+  - `hash`: segment 的哈希值（xorb ID）
+  - `unpacked_length`: 解压后的数据长度
+  - `range`: 在目标文件中的字节位置
+- `fetch_info`: 以 segment hash 为 key 的下载信息字典
+  - `range`: 在 term 内的字节范围
+  - `url`: 实际的 segment 下载 URL
+  - `url_range`: 该 URL 返回的字节范围
+
+### XET 特征头（防投毒）
+
+hf-mirror.com 返回的 XET 特征头：
+```
+x-linked-etag: "355f1f30ac3bdad09de420c5d78dd369e2a47d6f4ee3b5da342483f857965daf"
+x-linked-size: 105467232
+x-repo-commit: 45ce642d3fab2033d167ec09641a159010f7d9d9
+```
+
+**用途**: 验证这些头的存在可以防止 DNS 劫持/假网站投毒。
+
+### 域名可达性要求
+
+| 域名 | 用途 | 是否需要代理 | 备注 |
+|------|------|-------------|------|
+| hf-mirror.com | XET 入口 + 认证 | ❌ 直连 | 完全支持 XET 协议 |
+| cas-server.xethub.hf.co | 获取重建信息 | ❌ 直连 | 返回 segment URL 列表 |
+| us.aws.cdn.hf.co | 下载 segment 数据 | ✅ 需要代理 | 大流量操作 |
+
+**验证方式**:
+```python
+# 检查 XET 头是否存在
+resp = requests.head(f"https://hf-mirror.com/{repo}/resolve/{commit}/{file}")
+has_xet = all(k in resp.headers for k in ['x-linked-etag', 'x-linked-size'])
+```
+
+### 实现建议
+
+1. **域名验证逻辑**:
+   - 如果 huggingface.co 不可达 → 尝试 hf-mirror.com
+   - 如果 hf-mirror.com 可达且返回 XET 头 → 使用混合模式
+   - 如果 us.aws.cdn.hf.co 不可达 → 要求配置代理
+
+2. **混合下载模式**:
+   ```python
+   # 认证和元数据（直连）
+   auth_resp = requests.get(auth_url)  # hf-mirror.com，无代理
+   recon_resp = requests.get(recon_url, headers={"Authorization": f"Bearer {token}"})  # cas-server，无代理
+   
+   # 数据下载（代理）
+   segment_resp = requests.get(segment_url, proxies=proxies)  # us.aws.cdn.hf.co，需要代理
+   ```
+
+3. **错误处理**:
+   - 如果 segment 下载失败（403/超时）→ 提示用户配置代理
+   - 如果缺少 XET 头 → 警告可能是假网站/DNS 污染
+
+---
+
+## 🔄 待实现：自动重试机制 [高优先级]
+
+**发现日期**: 2026-06-21  
+**优先级**: P1 - 高优先级  
+**状态**: 📋 设计完成，待实现
+
+### 问题描述
+
+**偶发性文件不完整问题**（96.9% 问题）：
+- **症状**: 文件只写入 96.9% (102,165,440 / 105,467,232 字节，少 3.15 MB)
+- **频率**: 约 10-20% 概率
+- **影响**: 用户需要手动重试或使用 `--resume` 续传
+
+**可能原因**：
+1. 某个 xorb segment 网络下载失败但未被检测
+2. GlobalWriter 在极端情况下未完全 flush
+3. 并发写入时的竞态条件
+
+### 重试策略设计（3层防护）
+
+#### 第 1 层：内部自动重试（推荐优先实现）
+
+**位置**: `xet/pipeline/file_reconstructor.py`
+
+**设计**：
+```python
+def reconstruct_file(self, file_hash, expected_size, resume=True):
+    MAX_RETRIES = 3  # 最多重试 3 次
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 执行下载和组装
+            self._do_reconstruct(file_hash, expected_size, resume)
+            
+            # 验证文件大小
+            actual_size = self.output_path.stat().st_size
+            if expected_size > 0 and actual_size != expected_size:
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        f"[FileReconstructor] 文件大小不匹配 "
+                        f"(期望 {expected_size}, 实际 {actual_size}), "
+                        f"自动重试 ({attempt + 1}/{MAX_RETRIES})..."
+                    )
+                    # 删除不完整的文件
+                    if self.output_path.exists():
+                        self.output_path.unlink()
+                    # 清理 checkpoint，从头重新下载
+                    if self.checkpoint_manager:
+                        self.checkpoint_manager.clear(file_hash)
+                    continue
+                else:
+                    # 最后一次重试也失败，抛出异常
+                    raise ReconstructionError(
+                        f"文件大小不匹配（尝试 {MAX_RETRIES} 次后仍失败）: "
+                        f"期望 {expected_size}, 实际 {actual_size}"
+                    )
+            
+            # 成功
+            return self.output_path
+            
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"[FileReconstructor] 重试 {attempt + 1}/{MAX_RETRIES}: {e}")
+                continue
+            else:
+                raise
+```
+
+**优点**：
+- ✅ 对用户透明，大多数情况下自动解决
+- ✅ 不需要用户手动重试
+- ✅ 保留 checkpoint 供手动续传使用
+
+**实施要点**：
+1. 重试前删除不完整文件
+2. 清理 checkpoint，从头重新下载
+3. 保留最后一次异常供上层处理
+
+#### 第 2 层：CLI 层重试（批量下载）
+
+**位置**: `xet/cli/commands/download.py`
+
+**设计**：
+```python
+def download_multiple_files(files, args):
+    failed_files = []
+    MAX_BATCH_RETRIES = 2
+    
+    for retry_round in range(MAX_BATCH_RETRIES):
+        to_download = failed_files if retry_round > 0 else files
+        failed_files = []
+        
+        for file_info in to_download:
+            try:
+                result = download_single_file(file_info, args)
+                if not result.success:
+                    failed_files.append(file_info)
+            except Exception as e:
+                logger.error(f"下载失败: {file_info.path} - {e}")
+                failed_files.append(file_info)
+        
+        if not failed_files:
+            break
+            
+        if retry_round < MAX_BATCH_RETRIES - 1:
+            logger.info(
+                f"有 {len(failed_files)} 个文件失败，"
+                f"自动重试 ({retry_round + 1}/{MAX_BATCH_RETRIES})..."
+            )
+            time.sleep(2)  # 短暂延迟
+    
+    return failed_files
+```
+
+**优点**：
+- ✅ 批量下载时自动重试失败的文件
+- ✅ 避免一个文件失败导致整批失败
+
+#### 第 3 层：用户手动续传（最后防线）
+
+**现有机制**：保留现有的 checkpoint 机制
+
+```bash
+# 第一次下载（可能失败）
+xet download repo/file.gguf
+
+# 用户手动续传（使用 checkpoint）
+xet download repo/file.gguf --resume
+```
+
+**优点**：
+- ✅ 适用于网络极差的环境
+- ✅ 用户可控制何时重试
+
+### 配置选项设计
+
+**配置文件**: `~/.xet/config.yaml`
+
+```yaml
+download:
+  auto_retry:
+    enabled: true           # 是否启用自动重试
+    max_attempts: 3         # 最大重试次数
+    retry_delay: 2          # 重试间隔（秒）
+    size_mismatch_retry: true  # 文件大小不匹配时是否重试
+```
+
+**命令行参数**：
+
+```bash
+xet download repo/file.gguf --no-auto-retry  # 禁用自动重试
+xet download repo/file.gguf --max-retries 5   # 自定义重试次数
+```
+
+### 实施建议
+
+**短期（立即可做）**：
+1. ✅ 在 `FileReconstructor` 添加文件大小不匹配的自动重试（第 1 层）
+2. ✅ 重试前清理不完整文件和 checkpoint
+3. ✅ 添加详细的重试日志
+
+**中期（1-2周）**：
+4. 在批量下载添加失败重试（第 2 层）
+5. 添加配置选项支持
+6. 添加命令行参数
+
+**长期（未来优化）**：
+7. 增加详细的重试统计和分析
+8. 根据错误类型智能决定是否重试（网络错误重试，文件损坏不重试）
+9. 集成到监控和告警系统
+
+### 关键决策点
+
+- ✅ **默认启用自动重试**：是
+- ✅ **重试次数**：3次
+- ✅ **是否清理不完整文件**：是（重试前删除）
+- ✅ **是否保留 checkpoint**：是（供手动续传）
+- ✅ **重试间隔**：无需等待（立即重试）
+
+### 预期效果
+
+- 🎯 **成功率提升**：从 80-90% 提升到 99%+
+- 🎯 **用户体验**：大多数失败自动恢复，无需手动干预
+- 🎯 **向后兼容**：不影响现有功能和命令行参数
+
+### 相关文件
+
+- `xet/pipeline/file_reconstructor.py`: 第 1 层重试逻辑
+- `xet/cli/commands/download.py`: 第 2 层重试逻辑
+- `~/.xet/config.yaml`: 配置文件（新增）
+
+---
+
 **维护者**: Claude & User  
 **下次审查**: 建议 1 个月后（2026-07-21）或重大功能更新时

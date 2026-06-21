@@ -375,11 +375,46 @@ class XetFileInfo:
             XetFileInfo 实例
 
         Raises:
-            ValueError: 如果缺少必要的 X-Xet-Hash header
+            ValueError: 如果缺少必要的 xet-hash（无法从任何来源提取）
         """
+        # 提取 xet-hash（多级 fallback）
         xet_hash = headers.get('X-Xet-Hash') or headers.get('x-xet-hash')
+
+        # 如果没有 X-Xet-Hash 头，尝试从 Link 头提取
         if not xet_hash:
-            raise ValueError("Missing X-Xet-Hash header")
+            link_header = headers.get('Link', '') or headers.get('link', '')
+            if link_header:
+                # 方法1: 标准 xet:// 协议格式
+                match = re.search(
+                    r'<xet://([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet-hash["\']?',
+                    link_header,
+                    re.IGNORECASE
+                )
+                if match:
+                    xet_hash = match.group(1)
+
+                # 方法2: reconstruction-info URL 中的 hash
+                if not xet_hash:
+                    match = re.search(
+                        r'<https?://[^/]+/[^/]*/reconstructions?/([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet-reconstruction',
+                        link_header,
+                        re.IGNORECASE
+                    )
+                    if match:
+                        xet_hash = match.group(1)
+
+                # 方法3: 任何 URL 中的 64 字符 hex 串
+                if not xet_hash:
+                    match = re.search(
+                        r'<[^>]*?([0-9a-f]{64})[^>]*>(?:;|\s*;)\s*rel=["\']?xet',
+                        link_header,
+                        re.IGNORECASE
+                    )
+                    if match:
+                        xet_hash = match.group(1)
+
+        if not xet_hash:
+            raise ValueError("Missing X-Xet-Hash header and unable to extract from Link header")
 
         # 提取 SHA256（带引号的 ETag）
         linked_etag = headers.get('X-Linked-ETag', '') or headers.get('x-linked-etag', '')
