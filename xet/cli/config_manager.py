@@ -68,6 +68,7 @@ class ConfigManager:
             "XET_TOKEN": ("xet", "token"),
             "XET_CONCURRENCY": ("download", "concurrency"),
             "XET_LOG_LEVEL": ("logging", "level"),
+            "XET_OPTIMIZE_HOSTS": ("network", "optimize_hosts"),
         }
 
         for env_var, path in env_mapping.items():
@@ -83,6 +84,8 @@ class ConfigManager:
                 # 处理类型转换
                 if env_var == "XET_CONCURRENCY":
                     value = int(value)
+                elif env_var == "XET_OPTIMIZE_HOSTS":
+                    value = value.lower() in ("true", "1", "yes", "on")
 
                 current[path[-1]] = value
 
@@ -162,3 +165,7 @@ class ConfigManager:
     def get_log_level(self) -> str:
         """获取日志级别（便捷方法）。"""
         return self.get("logging.level", "INFO")
+
+    def get_optimize_hosts(self) -> bool:
+        """获取是否启用 IP 优选（便捷方法）。"""
+        return self.get("network.optimize_hosts", False)

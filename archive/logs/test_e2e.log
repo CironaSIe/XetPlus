@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/data/data/com.termux/files/home/xetplus/test_e2e.py", line 13, in <module>
+    from xet.cli.commands.download import download_file
+ImportError: cannot import name 'download_file' from 'xet.cli.commands.download' (/data/data/com.termux/files/home/xetplus/xet/cli/commands/download.py)

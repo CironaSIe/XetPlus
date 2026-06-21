@@ -55,6 +55,7 @@ class CASClient:
         url_coordinator: Optional[URLRefreshCoordinator] = None,
         acc: Optional[AdaptiveConcurrencyController] = None,
         retry_max: int = 5,
+        retry_coordinator: Optional['RetryCoordinator'] = None,
     ):
         """初始化 CAS 客户端。
 
@@ -69,6 +70,7 @@ class CASClient:
             url_coordinator: URL 刷新协调器（可选）
             acc: 自适应并发控制器（可选）
             retry_max: 最大重试次数
+            retry_coordinator: 全局重试协调器（可选）
         """
         self.endpoint = endpoint.rstrip('/')
         self.access_token = access_token
@@ -79,6 +81,7 @@ class CASClient:
         self._stop_event = stop_event
         self._url_coordinator = url_coordinator
         self._acc = acc
+        self._retry_coordinator = retry_coordinator
         self.retry_max = retry_max
         self.timeout = 30  # 默认 30 秒超时
         # Session ID 用于 CloudFront 会话跟踪
@@ -183,6 +186,157 @@ class CASClient:
 
         resp.raise_for_status()
         return QueryReconstructionResponse.from_dict(resp.json())
+
+    @with_retry(max_attempts=3, backoff_base=2.0, retry_on=(requests.RequestException,))
+    def get_segment_reconstruction(
+        self,
+        file_hash: str,
+        start: int,
+        end: int,
+    ) -> QueryReconstructionResponse:
+        """获取文件指定分段的 reconstruction 信息。
+
+        调用 CAS API 获取文件某个字节范围的 reconstruction 信息，用于分段下载。
+        这样可以避免一次性加载整个文件的 reconstruction，降低内存占用。
+
+        Args:
+            file_hash: 文件的 MerkleHash
+            start: 起始字节位置（包含）
+            end: 结束字节位置（不包含）
+
+        Returns:
+            QueryReconstructionResponse 包含该分段的 terms 和 fetch_info
+
+        Raises:
+            requests.HTTPError: API 返回错误状态码
+            ValueError: 响应格式无效或参数无效
+        """
+        if start < 0 or end <= start:
+            raise ValueError(f"无效的分段范围: start={start}, end={end}")
+
+        headers = self._get_headers()
+
+        # 尝试 V2 API（如果支持分段查询）
+        if self._v2_available is not False:
+            try:
+                # V2 API 可能支持 ?start=X&end=Y 查询参数
+                url_v2 = f"{self.endpoint}/v2/reconstructions/{file_hash}"
+                params = {"start": start, "end": end}
+                logger.debug(
+                    f"[CAS] 尝试 V2 Segment API: {url_v2[:80]}... "
+                    f"range=[{start}, {end})"
+                )
+                resp = self.session.get(
+                    url_v2, headers=headers, params=params, timeout=self.timeout
+                )
+
+                if resp.status_code == 200:
+                    self._v2_available = True
+                    return QueryReconstructionResponse.from_dict(resp.json())
+                elif resp.status_code == 401:
+                    # Token 过期，刷新后重试
+                    self._refresh_token()
+                    headers = self._get_headers()
+                    resp = self.session.get(
+                        url_v2, headers=headers, params=params, timeout=self.timeout
+                    )
+                    resp.raise_for_status()
+                    self._v2_available = True
+                    return QueryReconstructionResponse.from_dict(resp.json())
+                elif resp.status_code in (404, 501):
+                    # V2 不支持分段，fallback V1
+                    self._v2_available = False
+                    logger.debug("[CAS] V2 不支持分段查询，fallback V1")
+                else:
+                    resp.raise_for_status()
+
+            except requests.HTTPError as e:
+                if e.response and e.response.status_code == 401:
+                    raise
+                # 其他错误，尝试 V1
+                self._v2_available = False
+                logger.debug(f"[CAS] V2 Segment 失败: {e}, fallback V1")
+
+        # 使用 V1 API（可能不支持分段查询）
+        # 如果 V1 不支持，则先获取完整 reconstruction，然后在客户端过滤
+        url_v1 = f"{self.endpoint}/v1/reconstructions/{file_hash}"
+        logger.debug(
+            f"[CAS] 使用 V1 API（可能需要客户端过滤）: {url_v1[:80]}..."
+        )
+
+        resp = self.session.get(url_v1, headers=headers, timeout=self.timeout)
+
+        if resp.status_code == 401:
+            self._refresh_token()
+            headers = self._get_headers()
+            resp = self.session.get(
+                url_v1, headers=headers, timeout=self.timeout
+            )
+
+        resp.raise_for_status()
+        full_recon = QueryReconstructionResponse.from_dict(resp.json())
+
+        # 客户端过滤：只保留 [start, end) 范围内的 terms
+        return self._filter_reconstruction_by_range(full_recon, start, end)
+
+    def _filter_reconstruction_by_range(
+        self,
+        recon: QueryReconstructionResponse,
+        start: int,
+        end: int,
+    ) -> QueryReconstructionResponse:
+        """客户端过滤 reconstruction，只保留指定范围的 terms。
+
+        Args:
+            recon: 完整的 reconstruction
+            start: 起始字节位置
+            end: 结束字节位置
+
+        Returns:
+            过滤后的 reconstruction
+        """
+        filtered_terms = []
+        current_offset = 0
+
+        for term in recon.terms:
+            term_start = current_offset
+            term_end = current_offset + term.unpacked_length
+
+            # 判断 term 是否与 [start, end) 有交集
+            if term_end > start and term_start < end:
+                # 有交集，添加该 term
+                filtered_terms.append(term)
+
+            current_offset = term_end
+
+            # 如果已经超过 end，可以提前退出
+            if current_offset >= end:
+                break
+
+        # 重新计算 offset_into_first_range
+        # 如果 start 落在第一个 term 内部，需要调整 offset
+        new_offset = 0
+        if filtered_terms:
+            first_term_start = sum(t.unpacked_length for t in recon.terms[:recon.terms.index(filtered_terms[0])])
+            if start > first_term_start:
+                new_offset = start - first_term_start
+
+        # 只保留需要的 fetch_info（去重）
+        needed_xorb_hashes = {term.hash for term in filtered_terms}
+        filtered_fetch_info = [
+            fi for fi in recon.fetch_info if fi.hash in needed_xorb_hashes
+        ]
+
+        logger.debug(
+            f"[CAS] 客户端过滤: {len(recon.terms)} terms → {len(filtered_terms)} terms, "
+            f"{len(recon.fetch_info)} xorbs → {len(filtered_fetch_info)} xorbs"
+        )
+
+        return QueryReconstructionResponse(
+            terms=filtered_terms,
+            fetch_info=filtered_fetch_info,
+            offset_into_first_range=new_offset,
+        )
 
     @with_retry(max_attempts=5, backoff_base=1.5, retry_on=(requests.RequestException,))
     def get_xorb_data(self, url: str, url_range: HttpRange) -> bytes:
@@ -329,6 +483,7 @@ class CASClient:
         """带 URL/Token 自动刷新的 xorb 下载（高级重试逻辑）。
 
         集成所有高级特性：
+        - RetryCoordinator 全局重试协调
         - URLRefreshCoordinator 协调 403 刷新
         - AdaptiveConcurrencyController 许可管理
         - 401 自动刷新 token + 重新获取 reconstruction
@@ -350,151 +505,189 @@ class CASClient:
             RuntimeError: 重试耗尽或协调器 exhausted
             requests.HTTPError: HTTP 错误
         """
+        # 注册到 RetryCoordinator（如果存在）
+        if self._retry_coordinator:
+            self._retry_coordinator.register_active(xorb_hash)
+
         acc_acquired = False
         current_url = url
         current_range = url_range
+        is_retrying = False  # 标记当前是否在重试状态
 
-        for attempt in range(self.retry_max):
-            self._check_interrupt()
+        try:
+            for attempt in range(self.retry_max):
+                self._check_interrupt()
 
-            # 1. 获取 ACC 许可
-            if self._acc:
-                acc_acquired = self._acc.acquire(timeout=300.0)
-                if not acc_acquired:
-                    logger.error("[CAS] ACC acquire 超时，放弃")
-                    raise RuntimeError("AdaptiveConcurrencyController acquire 超时")
-
-            try:
-                # 2. 主动检查 token 过期
-                self._ensure_token()
-
-                # 3. 下载 xorb 数据
-                if use_streaming:
-                    data = self.get_xorb_data_streaming(current_url, current_range)
-                else:
-                    data = self.get_xorb_data(current_url, current_range)
-
-                # 4. 成功：释放 ACC 并报告
-                if acc_acquired and self._acc:
-                    self._acc.release()
-                    self._acc.report_success(bytes_transferred=len(data))
-
-                return data
-
-            except requests.HTTPError as e:
-                # 释放 ACC 并报告失败
-                if acc_acquired and self._acc:
-                    self._acc.release()
-                    self._acc.report_failure(status_code=e.response.status_code)
-
-                status_code = e.response.status_code
-
-                # 401: Token 过期 → 强制刷新 + 重新获取 reconstruction
-                if status_code == 401:
-                    logger.warning(
-                        f"[CAS] 401 Token 过期 (尝试 {attempt + 1}/{self.retry_max})"
+                # 检查是否应该停止重试（全局协调）
+                if self._retry_coordinator and self._retry_coordinator.should_stop_retrying():
+                    logger.error(
+                        f"[CAS] RetryCoordinator 触发全局停止，"
+                        f"xorb={xorb_hash[:16]}..."
                     )
-                    try:
-                        self._force_refresh_token()
-                        recon = self.get_reconstruction(file_hash)
-                        current_url, current_range = self._find_xorb_in_recon(
-                            xorb_hash, recon, url_range
+                    raise RuntimeError("全局重试协调器触发停止")
+
+                # 1. 获取 ACC 许可
+                if self._acc:
+                    acc_acquired = self._acc.acquire(timeout=300.0)
+                    if not acc_acquired:
+                        logger.error("[CAS] ACC acquire 超时，放弃")
+                        raise RuntimeError("AdaptiveConcurrencyController acquire 超时")
+
+                try:
+                    # 2. 主动检查 token 过期
+                    self._ensure_token()
+
+                    # 3. 下载 xorb 数据
+                    if use_streaming:
+                        data = self.get_xorb_data_streaming(current_url, current_range)
+                    else:
+                        data = self.get_xorb_data(current_url, current_range)
+
+                    # 4. 成功：释放 ACC 并报告
+                    if acc_acquired and self._acc:
+                        self._acc.release()
+                        self._acc.report_success(bytes_transferred=len(data))
+
+                    # 5. 成功：注销重试状态
+                    if is_retrying and self._retry_coordinator:
+                        self._retry_coordinator.unregister_retry(xorb_hash)
+
+                    return data
+
+                except requests.HTTPError as e:
+                    # 标记进入重试状态
+                    if not is_retrying and self._retry_coordinator:
+                        self._retry_coordinator.register_retry(xorb_hash)
+                        is_retrying = True
+
+                    # 释放 ACC 并报告失败
+                    if acc_acquired and self._acc:
+                        self._acc.release()
+                        self._acc.report_failure(status_code=e.response.status_code)
+
+                    status_code = e.response.status_code
+
+                    # 401: Token 过期 → 强制刷新 + 重新获取 reconstruction
+                    if status_code == 401:
+                        logger.warning(
+                            f"[CAS] 401 Token 过期 (尝试 {attempt + 1}/{self.retry_max})"
                         )
-                        logger.info(
-                            f"[CAS] 401 恢复: 获取新 URL {current_url[:60]}..."
-                        )
-                        continue
-                    except Exception as refresh_err:
-                        logger.error(f"[CAS] 401 恢复失败: {refresh_err}")
-                        if attempt == self.retry_max - 1:
-                            raise
-
-                # 403: URL 过期 → 通过 URLRefreshCoordinator 协调刷新
-                elif status_code == 403:
-                    logger.warning(
-                        f"[CAS] 403 URL 过期 (尝试 {attempt + 1}/{self.retry_max})"
-                    )
-
-                    # 检查协调器是否 exhausted
-                    if self._url_coordinator and self._url_coordinator.is_exhausted:
-                        logger.error("[CAS] URLRefreshCoordinator exhausted，放弃")
-                        raise RuntimeError("URL 刷新失败次数过多")
-
-                    # 尝试获取刷新权限
-                    if self._url_coordinator and self._url_coordinator.acquire_refresh():
-                        # 我获得了刷新权限
-                        logger.info("[CAS] 获得 URL 刷新权限")
                         try:
-                            self._force_refresh_token()  # 先刷新 token
+                            self._force_refresh_token()
                             recon = self.get_reconstruction(file_hash)
                             current_url, current_range = self._find_xorb_in_recon(
                                 xorb_hash, recon, url_range
                             )
-                            self._url_coordinator.release_refresh(success=True)
                             logger.info(
-                                f"[CAS] 403 恢复: 获取新 URL {current_url[:60]}..."
+                                f"[CAS] 401 恢复: 获取新 URL {current_url[:60]}..."
                             )
+                            continue
                         except Exception as refresh_err:
-                            self._url_coordinator.release_refresh(success=False)
-                            logger.error(f"[CAS] 403 恢复失败: {refresh_err}")
+                            logger.error(f"[CAS] 401 恢复失败: {refresh_err}")
                             if attempt == self.retry_max - 1:
                                 raise
-                    else:
-                        # 其他线程在刷新或冷却期，等待后重试
-                        logger.info("[CAS] 其他线程在刷新 URL，等待...")
 
-                    # 403 专用退避（比普通错误更长）
-                    base_403 = 5.0
-                    delay = base_403 * (2.5 ** attempt) * random.uniform(0.7, 1.3)
-                    logger.debug(f"[CAS] 403 退避: {delay:.2f}s")
-                    self._interruptible_sleep(delay)
+                    # 403: URL 过期 → 通过 URLRefreshCoordinator 协调刷新
+                    elif status_code == 403:
+                        logger.warning(
+                            f"[CAS] 403 URL 过期 (尝试 {attempt + 1}/{self.retry_max})"
+                        )
+
+                        # 检查协调器是否 exhausted
+                        if self._url_coordinator and self._url_coordinator.is_exhausted:
+                            logger.error("[CAS] URLRefreshCoordinator exhausted，放弃")
+                            raise RuntimeError("URL 刷新失败次数过多")
+
+                        # 尝试获取刷新权限
+                        if self._url_coordinator and self._url_coordinator.acquire_refresh():
+                            # 我获得了刷新权限
+                            logger.info("[CAS] 获得 URL 刷新权限")
+                            try:
+                                self._force_refresh_token()  # 先刷新 token
+                                recon = self.get_reconstruction(file_hash)
+                                current_url, current_range = self._find_xorb_in_recon(
+                                    xorb_hash, recon, url_range
+                                )
+                                self._url_coordinator.release_refresh(success=True)
+                                logger.info(
+                                    f"[CAS] 403 恢复: 获取新 URL {current_url[:60]}..."
+                                )
+                            except Exception as refresh_err:
+                                self._url_coordinator.release_refresh(success=False)
+                                logger.error(f"[CAS] 403 恢复失败: {refresh_err}")
+                                if attempt == self.retry_max - 1:
+                                    raise
+                        else:
+                            # 其他线程在刷新或冷却期，等待后重试
+                            logger.info("[CAS] 其他线程在刷新 URL，等待...")
+
+                        # 403 专用退避（比普通错误更长）
+                        base_403 = 5.0
+                        delay = base_403 * (2.5 ** attempt) * random.uniform(0.7, 1.3)
+                        logger.debug(f"[CAS] 403 退避: {delay:.2f}s")
+                        self._interruptible_sleep(delay)
+                        continue
+
+                    else:
+                        # 其他 HTTP 错误：标准退避
+                        if attempt == self.retry_max - 1:
+                            raise
+                        delay = 1.5 ** attempt * random.uniform(0.8, 1.2)
+                        logger.warning(
+                            f"[CAS] HTTP {status_code} 错误，{delay:.2f}s 后重试..."
+                        )
+                        self._interruptible_sleep(delay)
+
+                except LowSpeedTimeoutError as e:
+                    # 标记进入重试状态
+                    if not is_retrying and self._retry_coordinator:
+                        self._retry_coordinator.register_retry(xorb_hash)
+                        is_retrying = True
+
+                    # 断点续传
+                    logger.warning(
+                        f"[CAS] 低速超时 (已接收 {e.received} 字节)，断点续传..."
+                    )
+                    if acc_acquired and self._acc:
+                        self._acc.release()
+
+                    # 调整 Range 从已接收位置继续
+                    new_start = current_range.start + e.received
+                    current_range = HttpRange(start=new_start, end=current_range.end)
+                    logger.info(
+                        f"[CAS] 断点续传: 从 {new_start} 继续 "
+                        f"(剩余 {current_range.length()} 字节)"
+                    )
+
+                    # 低速超时不算入重试次数（只调整范围）
                     continue
 
-                else:
-                    # 其他 HTTP 错误：标准退避
+                except Exception as e:
+                    # 标记进入重试状态
+                    if not is_retrying and self._retry_coordinator:
+                        self._retry_coordinator.register_retry(xorb_hash)
+                        is_retrying = True
+
+                    # 其他异常
+                    if acc_acquired and self._acc:
+                        self._acc.release()
+                        self._acc.report_failure()
+
                     if attempt == self.retry_max - 1:
                         raise
-                    delay = 1.5 ** attempt * random.uniform(0.8, 1.2)
-                    logger.warning(
-                        f"[CAS] HTTP {status_code} 错误，{delay:.2f}s 后重试..."
-                    )
+
+                    delay = 1.5 ** attempt
+                    logger.warning(f"[CAS] 下载失败: {e}, {delay:.2f}s 后重试...")
                     self._interruptible_sleep(delay)
 
-            except LowSpeedTimeoutError as e:
-                # 断点续传
-                logger.warning(
-                    f"[CAS] 低速超时 (已接收 {e.received} 字节)，断点续传..."
-                )
-                if acc_acquired and self._acc:
-                    self._acc.release()
+            raise RuntimeError(
+                f"[CAS] 下载失败，已重试 {self.retry_max} 次: {xorb_hash[:16]}..."
+            )
 
-                # 调整 Range 从已接收位置继续
-                new_start = current_range.start + e.received
-                current_range = HttpRange(start=new_start, end=current_range.end)
-                logger.info(
-                    f"[CAS] 断点续传: 从 {new_start} 继续 "
-                    f"(剩余 {current_range.length()} 字节)"
-                )
-
-                # 低速超时不算入重试次数（只调整范围）
-                continue
-
-            except Exception as e:
-                # 其他异常
-                if acc_acquired and self._acc:
-                    self._acc.release()
-                    self._acc.report_failure()
-
-                if attempt == self.retry_max - 1:
-                    raise
-
-                delay = 1.5 ** attempt
-                logger.warning(f"[CAS] 下载失败: {e}, {delay:.2f}s 后重试...")
-                self._interruptible_sleep(delay)
-
-        raise RuntimeError(
-            f"[CAS] 下载失败，已重试 {self.retry_max} 次: {xorb_hash[:16]}..."
-        )
+        finally:
+            # 无论成功或失败，都要注销活跃状态
+            if self._retry_coordinator:
+                self._retry_coordinator.unregister_active(xorb_hash)
 
     @staticmethod
     def get_xet_file_info(

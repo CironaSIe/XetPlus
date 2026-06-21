@@ -45,13 +45,17 @@ class ReconstructionCheckpoint:
     Attributes:
         file_hash: 文件的 MerkleHash（64 字符 hex）
         completed_xorbs: 已成功下载的 xorb hash 集合
+        completed_terms: 已完成的 term 索引集合 (term_idx, xorb_hash)
+        last_term_index: 最后完成的 term 索引（用于快速恢复）
         timestamp: checkpoint 更新时间戳（秒）
         version: checkpoint 格式版本
     """
     file_hash: str
     completed_xorbs: Set[str] = field(default_factory=set)
+    completed_terms: Set[tuple] = field(default_factory=set)  # {(term_idx, xorb_hash)}
+    last_term_index: int = -1
     timestamp: int = 0
-    version: int = 1
+    version: int = 2  # 升级到 v2（支持 term 级）
 
     def __post_init__(self):
         """验证数据。"""
@@ -65,6 +69,27 @@ class ReconstructionCheckpoint:
             xorb_hash: 已下载的 xorb hash
         """
         self.completed_xorbs.add(xorb_hash)
+
+    def mark_term_completed(self, term_idx: int, xorb_hash: str) -> None:
+        """标记一个 term 为已完成。
+
+        Args:
+            term_idx: term 索引
+            xorb_hash: term 所属的 xorb hash
+        """
+        self.completed_terms.add((term_idx, xorb_hash))
+        self.last_term_index = max(self.last_term_index, term_idx)
+
+    def is_term_completed(self, term_idx: int) -> bool:
+        """检查一个 term 是否已完成。
+
+        Args:
+            term_idx: 要检查的 term 索引
+
+        Returns:
+            True 如果已完成
+        """
+        return any(idx == term_idx for idx, _ in self.completed_terms)
 
     def is_completed(self, xorb_hash: str) -> bool:
         """检查一个 xorb 是否已完成。
@@ -86,6 +111,8 @@ class ReconstructionCheckpoint:
         return {
             "file_hash": self.file_hash,
             "completed_xorbs": list(self.completed_xorbs),
+            "completed_terms": [list(t) for t in self.completed_terms],  # [(idx, hash), ...]
+            "last_term_index": self.last_term_index,
             "timestamp": self.timestamp,
             "version": self.version,
         }
@@ -93,9 +120,16 @@ class ReconstructionCheckpoint:
     @staticmethod
     def from_dict(data: dict) -> "ReconstructionCheckpoint":
         """从字典反序列化。"""
+        # 兼容 v1 格式（无 term 信息）
+        completed_terms = set()
+        if "completed_terms" in data:
+            completed_terms = {tuple(t) for t in data["completed_terms"]}
+
         return ReconstructionCheckpoint(
             file_hash=data["file_hash"],
             completed_xorbs=set(data.get("completed_xorbs", [])),
+            completed_terms=completed_terms,
+            last_term_index=data.get("last_term_index", -1),
             timestamp=data.get("timestamp", 0),
             version=data.get("version", 1),
         )

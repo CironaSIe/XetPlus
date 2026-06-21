@@ -1,0 +1,3 @@
+<frozen runpy>:128: RuntimeWarning: 'xet.cli.main' found in sys.modules after import of package 'xet.cli', but prior to execution of 'xet.cli.main'; this may result in unpredictable behaviour
+WARNING: 文件不是 XET 格式: granite-embedding-97M-multilingual-r2-Q4_K_M.gguf
+✗ 文件不是 XET 格式: granite-embedding-97M-multilingual-r2-Q4_K_M.gguf

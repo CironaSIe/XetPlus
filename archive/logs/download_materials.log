@@ -1,0 +1,91 @@
+INFO: ============================================================
+INFO: 📦 下载调试材料
+INFO: ============================================================
+INFO: 仓库: mykor/granite-embedding-97m-multilingual-r2-GGUF
+INFO: 文件: granite-embedding-97M-multilingual-r2-Q4_K_M.gguf
+INFO: 输出: debug_materials
+INFO: 代理: http://127.0.0.1:12334
+INFO: 
+INFO: 🔑 获取 CAS access token...
+INFO:   ✅ Token 获取成功
+INFO:   CAS endpoint: https://cas-server.xethub.hf.co
+INFO: 
+INFO: 🔍 步骤 1: 获取文件信息
+INFO:   文件 hash: e0aacd103e054264f5ede71ce63218c1110363261720d4c50c689ec3245ceb02
+INFO:   文件大小: 105,467,232 bytes
+INFO: 
+INFO: 📥 步骤 2: 下载 reconstruction 信息
+INFO:   ✅ 已保存: debug_materials/reconstruction.json
+INFO:   Terms: 17
+INFO:   Xorbs: 10
+INFO: 
+INFO: 📥 步骤 3: 下载所有 xorbs (10 个)
+INFO: 
+[1/10] edc32dd7fbd51b16...
+INFO:   下载 segment 0: chunk_range 0-69
+INFO:   下载 segment 1: chunk_range 474-484
+INFO:   下载 segment 2: chunk_range 507-540
+INFO:   合并后: 7,379,290 bytes (compressed)
+INFO:   解压成功: 7,378,394 bytes (decompressed)
+INFO:   Chunks: 112
+INFO: 
+[2/10] 42176798d306c8a7...
+INFO:   下载 segment 0: chunk_range 966-1015
+INFO:   合并后: 3,484,007 bytes (compressed)
+INFO:   解压成功: 3,483,615 bytes (decompressed)
+INFO:   Chunks: 49
+INFO: 
+[3/10] 5985905df12a01ee...
+INFO:   下载 segment 0: chunk_range 966-1023
+INFO:   合并后: 3,509,917 bytes (compressed)
+INFO:   解压成功: 3,509,461 bytes (decompressed)
+INFO:   Chunks: 57
+INFO: 
+[4/10] d81566d527460e0f...
+INFO:   下载 segment 0: chunk_range 227-1018
+INFO:   合并后: 51,433,249 bytes (compressed)
+INFO:   解压成功: 51,426,921 bytes (decompressed)
+INFO:   Chunks: 791
+INFO: 
+[5/10] f52ace46e9559367...
+INFO:   下载 segment 0: chunk_range 0-41
+INFO:   下载 segment 1: chunk_range 104-155
+INFO:   合并后: 3,339,320 bytes (compressed)
+INFO:   解压成功: 6,813,872 bytes (decompressed)
+INFO:   Chunks: 92
+INFO: 
+[6/10] 5490b498398bd500...
+INFO:   下载 segment 0: chunk_range 980-1022
+INFO:   合并后: 2,393,410 bytes (compressed)
+INFO:   解压成功: 2,393,074 bytes (decompressed)
+INFO:   Chunks: 42
+INFO: 
+[7/10] e1b463ede45b0c88...
+INFO:   下载 segment 0: chunk_range 836-908
+INFO:   合并后: 4,469,464 bytes (compressed)
+INFO:   解压成功: 4,476,421 bytes (decompressed)
+INFO:   Chunks: 72
+INFO: 
+[8/10] 33d17623391c6d2b...
+INFO:   下载 segment 0: chunk_range 118-409
+INFO:   下载 segment 1: chunk_range 419-436
+INFO:   合并后: 19,865,659 bytes (compressed)
+INFO:   解压成功: 19,882,509 bytes (decompressed)
+INFO:   Chunks: 308
+INFO: 
+[9/10] 59f2d04b6ae28547...
+INFO:   下载 segment 0: chunk_range 999-1017
+INFO:   合并后: 1,427,294 bytes (compressed)
+INFO:   解压成功: 1,427,150 bytes (decompressed)
+INFO:   Chunks: 18
+INFO: 
+[10/10] f1a0f07d98ea2e0f...
+INFO:   下载 segment 0: chunk_range 40-104
+INFO:   合并后: 1,852,006 bytes (compressed)
+INFO:   解压成功: 4,413,671 bytes (decompressed)
+INFO:   Chunks: 64
+INFO: 
+✅ 所有材料已保存到: debug_materials
+INFO:   - reconstruction.json: reconstruction 信息
+INFO:   - xorb_analysis.json: xorb 分析结果
+INFO:   - xorbs/*.bin: 解压后的 xorb 数据

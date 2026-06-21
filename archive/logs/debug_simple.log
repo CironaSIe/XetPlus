@@ -1,0 +1,19 @@
+2026-06-21 16:03:53,752 [INFO] __main__: ============================================================
+2026-06-21 16:03:53,752 [INFO] __main__: 🔍 Chunk 缓存调试工具
+2026-06-21 16:03:53,752 [INFO] __main__: ============================================================
+2026-06-21 16:03:53,752 [INFO] __main__: 仓库: xet-team/Granite
+2026-06-21 16:03:53,752 [INFO] __main__: 路径: granite-embedding/granite-embedding-97M-multilingual-r2-Q4_K_M.gguf
+2026-06-21 16:03:53,753 [INFO] __main__: 输出: debug_download.gguf
+2026-06-21 16:03:53,753 [INFO] __main__: 
+2026-06-21 16:03:53,755 [INFO] __main__: 🗑️  清除现有 chunk 缓存: /data/data/com.termux/files/home/.xet/cache/chunks
+2026-06-21 16:03:53,755 [INFO] __main__: 
+2026-06-21 16:03:53,755 [INFO] __main__: 📥 开始下载...
+2026-06-21 16:03:53,755 [INFO] __main__:   (观察 [CacheAdapter] 日志以分析 chunk 缓存问题)
+2026-06-21 16:03:53,755 [INFO] __main__: 
+Traceback (most recent call last):
+  File "/data/data/com.termux/files/home/xetplus/debug_simple.py", line 128, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/data/data/com.termux/files/home/xetplus/debug_simple.py", line 62, in main
+    from xet.cli.commands.download import handle_download
+ImportError: cannot import name 'handle_download' from 'xet.cli.commands.download' (/data/data/com.termux/files/home/xetplus/xet/cli/commands/download.py)

@@ -41,6 +41,48 @@ class XorbBlockData:
         self.chunk_offsets = chunk_offsets
         self.data = data
 
+    def get_chunk_byte_indices(self) -> List[int]:
+        """提取 chunk → byte 偏移映射，用于 chunk 缓存。
+
+        返回格式: [0, offset1, offset2, ..., len(data)]
+        - 第一个元素始终为 0（第一个 chunk 从 0 开始）
+        - 最后一个元素为 len(data)（数据末尾）
+        - 中间元素为各 chunk 的起始字节偏移（去重并排序）
+
+        Returns:
+            chunk 字节索引列表
+
+        Example:
+            >>> xorb_data = XorbBlockData(
+            ...     chunk_offsets=[(0, 0), (1, 100), (2, 250)],
+            ...     data=b'...'  # 350 bytes
+            ... )
+            >>> xorb_data.get_chunk_byte_indices()
+            [0, 100, 250, 350]
+        """
+        if not self.chunk_offsets:
+            # 空 xorb，返回 [0, len(data)]
+            return [0, len(self.data)]
+
+        # 提取唯一的字节偏移（按 chunk_idx 排序）
+        unique_offsets = []
+        seen_chunks = set()
+
+        for chunk_idx, byte_offset in sorted(self.chunk_offsets, key=lambda x: x[0]):
+            if chunk_idx not in seen_chunks:
+                unique_offsets.append(byte_offset)
+                seen_chunks.add(chunk_idx)
+
+        # 构建完整的索引列表
+        indices = [0] if unique_offsets[0] != 0 else []
+        indices.extend(unique_offsets)
+
+        # 确保最后一个索引是 len(data)
+        if indices[-1] != len(self.data):
+            indices.append(len(self.data))
+
+        return indices
+
 
 def blake3_validate(data: bytes, expected_hex: str) -> bool:
     """校验数据的 Blake3 哈希是否匹配预期值。

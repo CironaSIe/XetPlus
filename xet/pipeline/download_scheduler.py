@@ -12,6 +12,7 @@ from xet.protocol.types import QueryReconstructionResponse
 from xet.pipeline.types import XorbDownloadTask, ReconstructionCheckpoint
 from xet.pipeline.progress_tracker import ProgressTracker
 from xet.pipeline.checkpoint_manager import CheckpointManager
+from xet.pipeline.xorb_disk_cache import XorbDiskCache
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class DownloadScheduler:
         progress_tracker: Optional[ProgressTracker] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         stop_event: Optional[threading.Event] = None,
+        xorb_cache: Optional[XorbDiskCache] = None,
     ):
         """初始化下载调度器。
 
@@ -48,12 +50,14 @@ class DownloadScheduler:
             progress_tracker: 进度跟踪器
             checkpoint_manager: Checkpoint 管理器
             stop_event: 中断信号（用于 Ctrl+C）
+            xorb_cache: Xorb 磁盘缓存（可选）
         """
         self.cas_client = cas_client
         self.max_workers = max_workers
         self.progress_tracker = progress_tracker
         self.checkpoint_manager = checkpoint_manager
         self._stop_event = stop_event or threading.Event()
+        self.xorb_cache = xorb_cache
 
     def download_all_xorbs(
         self,
@@ -160,6 +164,8 @@ class DownloadScheduler:
     ) -> bytes:
         """下载单个 xorb 的所有 segments 并合并。
 
+        支持磁盘缓存：下载前检查缓存，下载后保存到缓存。
+
         参考 ~/xet.py 和 XET.SPEC.md 的实现。
 
         Args:
@@ -176,6 +182,24 @@ class DownloadScheduler:
         if not fetch_infos:
             raise ValueError(f"[DownloadScheduler] Xorb {xorb_hash[:16]}... 没有 fetch_info")
 
+        # 1. 尝试从磁盘缓存加载
+        if self.xorb_cache:
+            # 计算期望的最小大小（所有 segments 的 url_range 总和）
+            expected_size = sum(fi.url_range.length() for fi in fetch_infos)
+
+            cached_data = self.xorb_cache.get(xorb_hash, expected_size)
+            if cached_data is not None:
+                # 缓存命中，直接返回
+                logger.info(
+                    f"[DownloadScheduler] ✅ 缓存命中: {xorb_hash[:16]}... "
+                    f"({len(cached_data)} bytes，跳过下载）"
+                )
+                # 更新进度（即使没有实际下载）
+                if self.progress_tracker:
+                    self.progress_tracker.increment_downloaded(len(cached_data))
+                return cached_data
+
+        # 2. 缓存未命中，从网络下载
         # 按 chunk_range.start 排序 segments
         sorted_infos = sorted(fetch_infos, key=lambda fi: fi.chunk_range.start)
 
@@ -212,12 +236,16 @@ class DownloadScheduler:
             if self.progress_tracker:
                 self.progress_tracker.increment_downloaded(len(segment_data))
 
-        # 合并所有 segments
+        # 3. 合并所有 segments
         merged_data = b''.join(all_segments)
 
         logger.debug(
             f"[DownloadScheduler] Xorb {xorb_hash[:16]}... 下载完成: "
             f"{len(sorted_infos)} segments, {total_bytes} bytes total"
         )
+
+        # 4. 保存到磁盘缓存
+        if self.xorb_cache:
+            self.xorb_cache.put(xorb_hash, merged_data)
 
         return merged_data

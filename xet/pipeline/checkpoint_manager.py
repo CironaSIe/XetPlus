@@ -69,12 +69,16 @@ class CheckpointManager:
                 checkpoint = ReconstructionCheckpoint(
                     file_hash=data['file_hash'],
                     completed_xorbs=set(data.get('completed_xorbs', [])),
+                    completed_terms=set(tuple(t) for t in data.get('completed_terms', [])),
+                    last_term_index=data.get('last_term_index', -1),
                     timestamp=data.get('timestamp', 0),
                     version=data.get('version', 1),
                 )
 
                 logger.info(
-                    f"[Checkpoint] 加载成功: {checkpoint.completion_count()} 个 xorb 已完成"
+                    f"[Checkpoint] 加载成功: {checkpoint.completion_count()} 个 xorb, "
+                    f"{len(checkpoint.completed_terms)} 个 term 已完成 "
+                    f"(last_term={checkpoint.last_term_index})"
                 )
 
                 # 缓存
@@ -105,6 +109,8 @@ class CheckpointManager:
                         {
                             'file_hash': checkpoint.file_hash,
                             'completed_xorbs': list(checkpoint.completed_xorbs),
+                            'completed_terms': [list(t) for t in checkpoint.completed_terms],
+                            'last_term_index': checkpoint.last_term_index,
                             'timestamp': checkpoint.timestamp,
                             'version': checkpoint.version,
                         },
@@ -152,6 +158,47 @@ class CheckpointManager:
             # 保存（无锁）
             self._save_unsafe(checkpoint)
 
+    def mark_term_completed(self, file_hash: str, term_idx: int, xorb_hash: str,
+                            save_interval: int = 10) -> None:
+        """标记一个 term 为已完成并定期保存。
+
+        Args:
+            file_hash: 文件的 MerkleHash
+            term_idx: term 索引
+            xorb_hash: term 所属的 xorb hash
+            save_interval: 保存间隔（每 N 个 term 保存一次，默认 10）
+        """
+        with self._lock:
+            # 尝试从缓存加载
+            checkpoint = self._cache if self._cache and self._cache.file_hash == file_hash else None
+
+            # 如果缓存无效，尝试从文件加载（无锁）
+            if not checkpoint:
+                checkpoint = self._load_unsafe(file_hash)
+
+            # 如果仍然没有，创建新的
+            if not checkpoint:
+                checkpoint = ReconstructionCheckpoint(
+                    file_hash=file_hash,
+                    completed_xorbs=set(),
+                    timestamp=int(time.time()),
+                )
+
+            # 标记 term 完成
+            checkpoint.mark_term_completed(term_idx, xorb_hash)
+            checkpoint.timestamp = int(time.time())
+
+            # 每 N 个 term 保存一次（减少磁盘写入）
+            if term_idx % save_interval == 0 or term_idx == 0:
+                self._save_unsafe(checkpoint)
+                logger.debug(
+                    f"[Checkpoint] Term {term_idx} 已保存 "
+                    f"({len(checkpoint.completed_terms)} terms total)"
+                )
+            else:
+                # 只更新缓存
+                self._cache = checkpoint
+
     def clear(self, file_hash: str) -> None:
         """清除指定文件的 checkpoint。
 
@@ -195,6 +242,8 @@ class CheckpointManager:
             return ReconstructionCheckpoint(
                 file_hash=data['file_hash'],
                 completed_xorbs=set(data.get('completed_xorbs', [])),
+                completed_terms=set(tuple(t) for t in data.get('completed_terms', [])),
+                last_term_index=data.get('last_term_index', -1),
                 timestamp=data.get('timestamp', 0),
                 version=data.get('version', 1),
             )
@@ -219,6 +268,8 @@ class CheckpointManager:
                     {
                         'file_hash': checkpoint.file_hash,
                         'completed_xorbs': list(checkpoint.completed_xorbs),
+                        'completed_terms': [list(t) for t in checkpoint.completed_terms],
+                        'last_term_index': checkpoint.last_term_index,
                         'timestamp': checkpoint.timestamp,
                         'version': checkpoint.version,
                     },
