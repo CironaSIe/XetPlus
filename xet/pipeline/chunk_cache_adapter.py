@@ -76,36 +76,61 @@ class ChunkCacheAdapter:
     ) -> Optional[Tuple[bytes, List[int]]]:
         """获取解压后的 xorb 数据（尝试 chunk 缓存）。
 
+        支持从多个分段缓存中读取并重组。
+
         Args:
             xorb_hash: Xorb 哈希
             fetch_infos: Fetch info 列表（用于确定需要的 chunk 范围）
 
         Returns:
-            (解压数据, chunk_byte_indices) 或 None（未命中）
+            (解压数据, chunk_byte_indices) 或 None（未完全命中）
         """
         if not self.chunk_cache or not self.chunk_cache.enabled:
             return None
 
-        # 计算需要的 chunk 范围
-        chunk_ranges = [fi.chunk_range for fi in fetch_infos]
+        # 获取所有 chunk ranges 并排序
+        chunk_ranges = sorted([fi.chunk_range for fi in fetch_infos], key=lambda cr: cr.start)
         if not chunk_ranges:
             return None
 
-        merged_range = ChunkRange(
-            start=min(cr.start for cr in chunk_ranges),
-            end=max(cr.end for cr in chunk_ranges)
+        # 尝试从缓存中读取每个 chunk range
+        cached_segments = []
+        for chunk_range in chunk_ranges:
+            cache_hit = self.chunk_cache.get(xorb_hash, chunk_range)
+            if not cache_hit:
+                # 任何一个 range 未命中，整体未命中
+                logger.debug(
+                    f"[CacheAdapter] Chunk 缓存部分未命中: {xorb_hash[:16]}... "
+                    f"范围 {chunk_range} 不在缓存中"
+                )
+                return None
+            cached_segments.append(cache_hit)
+
+        # 所有 ranges 都命中，重组数据
+        logger.debug(
+            f"[CacheAdapter] Chunk 缓存完全命中: {xorb_hash[:16]}... "
+            f"{len(chunk_ranges)} 个 ranges"
         )
 
-        # 尝试从 chunk 缓存读取
-        cache_hit = self.chunk_cache.get(xorb_hash, merged_range)
-        if cache_hit:
-            logger.debug(
-                f"[CacheAdapter] Chunk 缓存命中: {xorb_hash[:16]}... "
-                f"范围 {merged_range}"
-            )
-            return (cache_hit.data, cache_hit.offsets)
+        # 合并数据和偏移
+        merged_data = b""
+        merged_indices = [0]  # 起始偏移总是 0
+        current_offset = 0
 
-        return None
+        for segment in cached_segments:
+            # 添加这段数据
+            merged_data += segment.data
+
+            # 添加这段的偏移（除了第一个 0，因为已经有了）
+            # segment.offsets[1:] 是这段内部的相对偏移
+            # 需要加上 current_offset 转换为绝对偏移
+            for offset in segment.offsets[1:]:
+                merged_indices.append(current_offset + offset)
+
+            # 更新当前偏移
+            current_offset += len(segment.data)
+
+        return (merged_data, merged_indices)
 
     def put_xorb_compressed(
         self,
@@ -130,60 +155,73 @@ class ChunkCacheAdapter:
     ) -> None:
         """保存解压后的 xorb 数据（到 chunk 缓存）。
 
+        支持不连续的 chunk ranges：为每个连续的 range 分别缓存。
+
         Args:
             xorb_hash: Xorb 哈希
             fetch_infos: Fetch info 列表（用于确定 chunk 范围）
-            chunk_byte_indices: Chunk → byte 偏移映射（xorb 内部编号）
+            chunk_byte_indices: Chunk → byte 偏移映射（xorb 内部编号，连续）
             decompressed_data: 解压后的数据
         """
         if not self.chunk_cache or not self.chunk_cache.enabled:
             return
 
-        # 计算 chunk 范围
-        chunk_ranges = [fi.chunk_range for fi in fetch_infos]
+        # 获取所有 chunk ranges 并排序
+        chunk_ranges = sorted([fi.chunk_range for fi in fetch_infos], key=lambda cr: cr.start)
         if not chunk_ranges:
             return
 
-        merged_range = ChunkRange(
-            start=min(cr.start for cr in chunk_ranges),
-            end=max(cr.end for cr in chunk_ranges)
-        )
-
-        # 检查长度是否匹配
-        # 修复：不能假设 chunks 连续，应该用所有 ranges 的长度之和
+        # 验证总 chunks 数量
         total_chunks = sum(cr.length() for cr in chunk_ranges)
         expected_len = total_chunks + 1
         if len(chunk_byte_indices) != expected_len:
-            # 这种情况现在应该很罕见（说明 xorb 数据本身有问题）
             logger.warning(
-                f"[CacheAdapter] ⚠️  Chunk 缓存数据异常:\n"
-                f"  xorb_hash: {xorb_hash[:16]}...\n"
-                f"  fetch_infos 数量: {len(fetch_infos)}"
-            )
-            for idx, fi in enumerate(fetch_infos):
-                logger.warning(
-                    f"    [{idx}] chunk_range: {fi.chunk_range.start}-{fi.chunk_range.end} "
-                    f"(长度 {fi.chunk_range.length()})"
-                )
-            logger.warning(
-                f"  总 chunks: {total_chunks}\n"
-                f"  期望 indices: {expected_len}\n"
-                f"  实际 indices: {len(chunk_byte_indices)}\n"
-                f"  差异: {expected_len - len(chunk_byte_indices)}\n"
-                f"  结论: 跳过缓存（xorb 数据可能损坏）"
+                f"[CacheAdapter] ⚠️  Chunk 缓存数据异常: xorb_hash={xorb_hash[:16]}..., "
+                f"期望 {expected_len} 个 indices, 实际 {len(chunk_byte_indices)}"
             )
             return
 
-        try:
-            self.chunk_cache.put(
-                xorb_hash,
-                merged_range,
-                chunk_byte_indices,
-                decompressed_data
-            )
-            logger.debug(
-                f"[CacheAdapter] ✅ 写入 chunk 缓存成功: {xorb_hash[:16]}... "
-                f"范围 {merged_range}, {len(decompressed_data) / 1024 / 1024:.1f}MB"
-            )
-        except Exception as e:
-            logger.warning(f"[CacheAdapter] 写入 chunk 缓存失败: {e}")
+        # 为每个连续的 chunk range 分别缓存
+        # 维护全局 chunk 编号到 xorb 内部索引的映射
+        xorb_internal_idx = 0  # xorb 内部 chunk 索引（从 0 开始连续）
+
+        for chunk_range in chunk_ranges:
+            num_chunks = chunk_range.length()
+
+            # 提取这个 range 对应的 chunk_byte_indices 子集
+            # xorb_internal_idx 是起始 chunk 在 xorb 内部的索引
+            # 需要 num_chunks + 1 个偏移（包括结束偏移）
+            start_idx = xorb_internal_idx
+            end_idx = xorb_internal_idx + num_chunks + 1
+
+            sub_indices = chunk_byte_indices[start_idx:end_idx]
+
+            # 提取对应的数据
+            # sub_indices[0] 是这段数据的起始偏移
+            # sub_indices[-1] 是这段数据的结束偏移
+            data_start = sub_indices[0]
+            data_end = sub_indices[-1]
+            sub_data = decompressed_data[data_start:data_end]
+
+            # 调整 sub_indices 使其从 0 开始
+            adjusted_indices = [offset - data_start for offset in sub_indices]
+
+            try:
+                self.chunk_cache.put(
+                    xorb_hash,
+                    chunk_range,
+                    adjusted_indices,
+                    sub_data
+                )
+                logger.debug(
+                    f"[CacheAdapter] ✅ 写入 chunk 缓存: {xorb_hash[:16]}... "
+                    f"范围 {chunk_range}, {len(sub_data) / 1024 / 1024:.2f}MB"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[CacheAdapter] 写入 chunk 缓存失败: {xorb_hash[:16]}... "
+                    f"范围 {chunk_range}, 错误: {e}"
+                )
+
+            # 更新 xorb 内部索引
+            xorb_internal_idx += num_chunks

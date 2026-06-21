@@ -57,6 +57,20 @@ class ChunkRange:
         """
         return self.end - self.start
 
+    def contains(self, other: "ChunkRange") -> bool:
+        """检查是否包含另一个范围。
+
+        Args:
+            other: 另一个 chunk 范围
+
+        Returns:
+            如果 other 完全在 self 范围内则返回 True
+        """
+        return self.start <= other.start and other.end <= self.end
+
+    def __repr__(self) -> str:
+        return f"ChunkRange(start={self.start}, end={self.end})"
+
 @dataclass
 class CASReconstructionTerm:
     """Reconstruction API 返回的单个 term 描述。
