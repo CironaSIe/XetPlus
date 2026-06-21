@@ -388,6 +388,27 @@ def detect_xet_file(
         # HEAD 请求获取 X-Xet-Hash header
         resp = session.head(file_url, headers=headers, allow_redirects=False, timeout=30)
 
+        # 如果 main 分支不存在（404），尝试自动探测最新 commit
+        if resp.status_code == 404 and revision == "main":
+            logger.info(f"main 分支不存在，尝试获取最新 commit...")
+
+            # 方法 1: 通过 API 获取仓库信息
+            api_url = f"https://huggingface.co/api/models/{repo_id}" if repo_type != "dataset" else f"https://huggingface.co/api/datasets/{repo_id}"
+            try:
+                api_resp = session.get(api_url, headers=headers, timeout=10)
+                if api_resp.status_code == 200:
+                    data = api_resp.json()
+                    latest_sha = data.get("sha")
+                    if latest_sha:
+                        logger.info(f"检测到最新 commit: {latest_sha[:12]}...")
+                        # 递归调用，使用最新 commit
+                        return detect_xet_file(repo_id, repo_type, filename, token, session, revision=latest_sha)
+            except Exception as e:
+                logger.debug(f"API 获取失败: {e}")
+
+            logger.warning(f"无法自动探测最新 commit，文件不存在: {filename}")
+            return None
+
         if resp.status_code not in (301, 302, 307, 308):
             logger.warning(f"文件不是 XET 格式: {filename}")
             return None
