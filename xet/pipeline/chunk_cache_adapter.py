@@ -150,25 +150,27 @@ class ChunkCacheAdapter:
         )
 
         # 检查长度是否匹配
-        expected_len = merged_range.length() + 1
+        # 修复：不能假设 chunks 连续，应该用所有 ranges 的长度之和
+        total_chunks = sum(cr.length() for cr in chunk_ranges)
+        expected_len = total_chunks + 1
         if len(chunk_byte_indices) != expected_len:
-            # 使用 INFO 级别确保输出
-            logger.info(
-                f"[CacheAdapter] 📊 Chunk 缓存长度不匹配分析:\n"
+            # 这种情况现在应该很罕见（说明 xorb 数据本身有问题）
+            logger.warning(
+                f"[CacheAdapter] ⚠️  Chunk 缓存数据异常:\n"
                 f"  xorb_hash: {xorb_hash[:16]}...\n"
                 f"  fetch_infos 数量: {len(fetch_infos)}"
             )
             for idx, fi in enumerate(fetch_infos):
-                logger.info(
+                logger.warning(
                     f"    [{idx}] chunk_range: {fi.chunk_range.start}-{fi.chunk_range.end} "
                     f"(长度 {fi.chunk_range.length()})"
                 )
-            logger.info(
-                f"  merged_range: {merged_range.start}-{merged_range.end} (长度 {merged_range.length()})\n"
+            logger.warning(
+                f"  总 chunks: {total_chunks}\n"
                 f"  期望 indices: {expected_len}\n"
                 f"  实际 indices: {len(chunk_byte_indices)}\n"
                 f"  差异: {expected_len - len(chunk_byte_indices)}\n"
-                f"  结论: 跳过缓存（xorb 只包含部分 chunks）"
+                f"  结论: 跳过缓存（xorb 数据可能损坏）"
             )
             return
 
