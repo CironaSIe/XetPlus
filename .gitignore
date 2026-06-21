@@ -31,6 +31,16 @@ ENV/
 .coverage
 htmlcov/
 .tox/
+test_output*/
+test_glm_json/
+debug_test.gguf/
+test_cache_fix.gguf/
+test_debug.gguf/
+
+# Debug materials
+debug_materials/
+debug*.log
+test_*.log
 
 # IDEs
 .vscode/
@@ -48,8 +58,13 @@ Thumbs.db
 *.xet_meta.json
 *.segments.json
 .xet_download_*.log
+*.gguf
+!archive/**/*.gguf
 
 # Temp
 tmp/
 temp/
 *.tmp
+*.7z
+cleanup_*.sh
+.gitignore_cleanup
