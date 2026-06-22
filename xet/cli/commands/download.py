@@ -816,6 +816,8 @@ def download_single_file(
                     retry_max=getattr(args, 'retry_max', 5),
                     parallel_write=getattr(args, 'parallel_write', False),
                     buffer_mb=getattr(args, 'buffer_mb', 32),
+                    ip_pool_manager=ip_pool_manager,  # ← 传递
+                    host_optimizer=host_optimizer if optimize_hosts else None,  # ← 传递
                 )
 
                 result_path = reconstructor.reconstruct_file(
@@ -954,17 +956,85 @@ def download_command(args):
             mappings = host_optimizer.mappings
             if mappings:
                 print(f"✅ HOST 优选完成: {len(mappings)} 个域名")
+
+                # 检查是否有详细结果可以显示
+                detailed_results = getattr(host_optimizer, 'detailed_results', {})
+
                 for domain, info in mappings.items():
+                    from xet.network.host_optimizer import get_domain_category
+                    category = get_domain_category(domain)
+                    category_label = {
+                        "api": "API域名",
+                        "data": "DATA域名",
+                        "cas": "CAS域名",
+                    }.get(category, "")
+
                     mode = "代理" if info["use_proxy"] else "直连"
                     rtt_ms = info["rtt"] * 1000
+
+                    # 显示选中的 IP
                     if info.get("speed", 0) > 0:
                         from xet.network.host_optimizer import _format_speed
                         speed_str = _format_speed(info["speed"])
-                        print(f"   {domain} → {info['ip']} ({mode}, {rtt_ms:.0f}ms, {speed_str})")
+                        domain_title = f"{domain} ({category_label})" if category_label else domain
+                        print(f"   {domain_title}")
+                        print(f"     ✅ {info['ip']}  {mode}  RTT={rtt_ms:.0f}ms  带宽={speed_str}")
                     else:
-                        print(f"   {domain} → {info['ip']} ({mode}, {rtt_ms:.0f}ms)")
+                        domain_title = f"{domain} ({category_label})" if category_label else domain
+                        print(f"   {domain_title}")
+                        print(f"     ✅ {info['ip']}  {mode}  RTT={rtt_ms:.0f}ms")
+
+                    # 如果有详细结果，显示其他候选 IP（最多3个）
+                    if domain in detailed_results:
+                        other_ips = [
+                            ip for ip in detailed_results[domain]
+                            if ip["ip"] != info["ip"]
+                        ][:3]  # 最多显示3个其他候选
+
+                        for ip_info in other_ips:
+                            ip = ip_info["ip"]
+                            use_proxy = ip_info.get("use_proxy", False)
+                            mode = "代理" if use_proxy else "直连"
+                            rtt = ip_info.get("rtt", 0)
+                            speed = ip_info.get("speed", 0)
+                            status = ip_info.get("status", "unknown")
+                            cert_valid = ip_info.get("cert_valid", False)
+                            cert_issuer = ip_info.get("cert_issuer", "")
+
+                            if status == "ok" and cert_valid:
+                                # 证书有效但未选中
+                                from xet.network.host_optimizer import _format_speed
+                                speed_str = _format_speed(speed) if speed > 0 else "0"
+                                cert_info = f"  证书={cert_issuer}" if cert_issuer else ""
+                                print(f"       {ip}  {mode}  RTT={rtt*1000:.0f}ms  带宽={speed_str}{cert_info}")
+                            elif status == "cert_invalid":
+                                # 证书无效
+                                cert_error = ip_info.get("cert_error", "未知")
+                                print(f"     ❌ {ip}  {mode}  证书验证失败: {cert_error}")
+                            elif status == "transfer_failed":
+                                # Transfer 失败
+                                print(f"     ❌ {ip}  {mode}  RTT={rtt*1000:.0f}ms  Transfer失败")
             else:
                 print("⚠ HOST 优选未生效，将使用系统 DNS")
+
+        # 3.5. 初始化 IP 池管理器（如果启用了优选）
+        ip_pool_manager = None
+        if optimize_hosts and host_optimizer:
+            from pathlib import Path
+            from xet.network.ip_pool_manager import IPPoolManager
+
+            cache_file = Path.home() / ".xet" / "cache" / "host_optimize.json"
+            if cache_file.exists():
+                try:
+                    ip_pool_manager = IPPoolManager(cache_file)
+                    logger.info(
+                        f"[IPPoolManager] 已初始化，"
+                        f"加载 {len(ip_pool_manager.pools)} 个域名的 IP 池"
+                    )
+                except Exception as e:
+                    logger.warning(f"[IPPoolManager] 初始化失败: {e}")
+            else:
+                logger.debug("[IPPoolManager] 缓存文件不存在，跳过初始化")
 
         # 4. 解析文件路径
         repo_id, filename, file_hash, repo_type = parse_file_spec(args.path)

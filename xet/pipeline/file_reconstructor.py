@@ -66,6 +66,8 @@ class FileReconstructor:
         retry_max: int = 5,
         parallel_write: bool = False,
         buffer_mb: int = 32,
+        ip_pool_manager=None,  # Optional[IPPoolManager]
+        host_optimizer=None,  # Optional[HostOptimizer]
     ):
         """初始化文件重建协调器。
 
@@ -87,6 +89,8 @@ class FileReconstructor:
             retry_max: 最大重试次数（默认 5）
             parallel_write: 启用并行批量写入（默认 False）
             buffer_mb: 写入缓冲区大小（MB，默认 32）
+            ip_pool_manager: IP 池管理器（可选，用于故障转移）
+            host_optimizer: HOST 优选器（可选，用于重新优选）
         """
         self.cas_client = cas_client
         self.output_path = output_path
@@ -111,6 +115,8 @@ class FileReconstructor:
             checkpoint_manager=self.checkpoint_manager,
             stop_event=self._stop_event,
             xorb_cache=xorb_cache,
+            ip_pool_manager=ip_pool_manager,  # ← 传递
+            host_optimizer=host_optimizer,  # ← 传递
         )
         self.assembler = ChunkAssembler(
             temp_dir=self.temp_dir,
@@ -133,6 +139,9 @@ class FileReconstructor:
             cache_status_parts.append("disabled")
         cache_status = ", ".join(cache_status_parts)
 
+        # 故障转移状态
+        failover_status = "enabled" if ip_pool_manager else "disabled"
+
         logger.info(
             f"[FileReconstructor] 初始化完成: "
             f"output={output_path}, max_workers={max_workers}, "
@@ -141,7 +150,8 @@ class FileReconstructor:
             f"max_memory={max_memory_mb}MB, "
             f"prefetch={prefetch_low_mb}-{prefetch_high_mb}MB, "
             f"buffer={buffer_mb}MB, "
-            f"parallel_write={'enabled' if self.parallel_write else 'disabled'}"
+            f"parallel_write={'enabled' if self.parallel_write else 'disabled'}, "
+            f"failover={failover_status}"
         )
 
     def reconstruct_file(

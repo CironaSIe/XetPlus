@@ -6,19 +6,22 @@
 1. DoH 查询各域名 IP（多家 DNS 并行，取并集）
 2. TCP 双向测速：直连 vs 通过代理
 3. HTTP Transfer 测速：真实下载速度
-4. 按域名选择最优 IP + 是否走代理
-5. monkey-patch socket.getaddrinfo 返回优选 IP
+4. 证书指纹验证：防止中间人攻击
+5. 按域名选择最优 IP + 是否走代理
+6. monkey-patch socket.getaddrinfo 返回优选 IP
 
 缓存（两层）:
 - DoH 缓存 (~/.xet/cache/host_doh.json, TTL 24h): 域名→IP列表
-- 优选缓存 (~/.xet/cache/host_optimize.json, TTL 1h): 最优IP+速度
+- 优选缓存 (~/.xet/cache/host_optimize.json, TTL 1h): 最优IP+速度+完整IP池
 """
 import socket
 import time
 import json
 import logging
 import ssl
+import hashlib
 import concurrent.futures
+import threading
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Set
 from urllib.parse import urlparse
@@ -28,6 +31,22 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# 全局动态 IP 映射（线程安全）
+# 用于运行时更新 IP 映射，支持故障转移
+_DYNAMIC_IP_MAPPING: Dict[str, str] = {}
+_MAPPING_LOCK = threading.Lock()
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+# 可信证书颁发机构白名单
+TRUSTED_ISSUERS = {
+    "Amazon",              # AWS Certificate Manager
+    "Let's Encrypt",       # 免费证书
+    "DigiCert Inc",        # 商业 CA
+    "Google Trust Services",
+    "Cloudflare, Inc.",
+}
 
 
 # HuggingFace 相关域名分组
@@ -45,6 +64,48 @@ HOST_GROUPS: Dict[str, List[str]] = {
         "transfer.xethub.hf.co",  # xorb 数据下载（流量最大）
     ],
 }
+
+
+def get_domain_category(domain: str) -> str:
+    """获取域名类别。
+
+    Returns:
+        "api": API 域名，国内通常被墙
+        "data": CDN 数据域名，国内通常可直连
+        "cas": CAS 域名，部分可直连
+        "unknown": 未知域名
+    """
+    for category, domains in HOST_GROUPS.items():
+        if domain in domains:
+            return category
+    return "unknown"
+
+
+def update_ip_mapping(domain: str, new_ip: str) -> None:
+    """动态更新 IP 映射（线程安全）。
+
+    用于故障转移时实时切换 IP，无需重新 patch socket.getaddrinfo。
+
+    Args:
+        domain: 域名
+        new_ip: 新的 IP 地址
+    """
+    with _MAPPING_LOCK:
+        _DYNAMIC_IP_MAPPING[domain] = new_ip
+    logger.info(f"[HostOpt] 动态更新映射: {domain} → {new_ip}")
+
+
+def get_current_ip_mapping(domain: str) -> Optional[str]:
+    """获取当前域名的 IP 映射（线程安全）。
+
+    Args:
+        domain: 域名
+
+    Returns:
+        当前映射的 IP，如果未映射则返回 None
+    """
+    with _MAPPING_LOCK:
+        return _DYNAMIC_IP_MAPPING.get(domain)
 
 # DoH 服务器（国内优先 + 海外备选）
 DOH_SERVERS: List[str] = [
@@ -200,7 +261,28 @@ class HostOptimizer:
         # 4. HTTP Transfer 测速（对 Top 候选）
         transfer_results = self._transfer_test_top(results)
 
-        # 5. 按域名选最优 + 保存详细结果
+        # 5. 证书验证（对所有成功的 Transfer 结果）
+        cert_results = {}
+        if transfer_results:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {}
+                for domain, transfers in transfer_results.items():
+                    for ip, use_proxy, rtt, speed in transfers:
+                        future = executor.submit(
+                            self._validate_ip_with_certificate, ip, domain
+                        )
+                        futures[future] = (domain, ip)
+
+                for future in concurrent.futures.as_completed(futures, timeout=30):
+                    domain, ip = futures[future]
+                    try:
+                        valid, issuer, error = future.result()
+                        cert_results[(domain, ip)] = (valid, issuer, error)
+                    except Exception as e:
+                        logger.debug(f"[HostOpt] 证书验证异常 {ip}: {e}")
+                        cert_results[(domain, ip)] = (False, None, str(e))
+
+        # 6. 按域名选最优 + 保存详细结果
         for domain, candidates in results.items():
             transfers = transfer_results.get(domain, [])
 
@@ -210,23 +292,95 @@ class HostOptimizer:
             if transfers:
                 # 有 Transfer 结果
                 for ip, use_proxy, rtt, speed in transfers:
+                    cert_valid, cert_issuer, cert_error = cert_results.get(
+                        (domain, ip), (False, None, "未验证")
+                    )
+
                     detailed.append({
                         "ip": ip,
                         "use_proxy": use_proxy,
                         "rtt": rtt,
                         "speed": speed,
-                        "status": "ok",
+                        "status": "ok" if cert_valid else "cert_invalid",
+                        "cert_valid": cert_valid,
+                        "cert_issuer": cert_issuer,
+                        "cert_error": cert_error,
                     })
 
-                # 智能选择策略
-                # 当用户指定代理时，优先考虑速度而非"直连优先"
-                if self.proxy:
-                    # 有代理：纯速度优先（用户明确需要代理环境）
-                    transfers.sort(key=lambda x: (-x[3], x[2]))
+                # 智能选择策略：根据域名类型 + 证书有效性选择最优 IP
+                category = get_domain_category(domain)
+
+                # 过滤出证书有效的 IP
+                valid_transfers = [
+                    t for t in transfers
+                    if cert_results.get((domain, t[0]), (False, None, None))[0]
+                ]
+
+                if valid_transfers:
+                    # 有证书有效的 IP：根据域名类型选择
+                    if category == "api":
+                        # API 域名：强制代理（国内被墙）
+                        proxy_transfers = [t for t in valid_transfers if t[1]]  # use_proxy=True
+                        if proxy_transfers:
+                            # 代理速度优先 → RTT
+                            proxy_transfers.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = proxy_transfers[0]
+                        else:
+                            # 无代理测速结果，fallback 到速度优先（虽然可能不可用）
+                            valid_transfers.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = valid_transfers[0]
+                            logger.warning(
+                                f"[HostOpt] ⚠️ {domain} (API域名): 无代理测速结果，"
+                                f"使用直连可能被阻断"
+                            )
+
+                    elif category == "data":
+                        # DATA 域名：优先直连高带宽（CDN 通常可达）
+                        direct_transfers = [t for t in valid_transfers if not t[1]]  # use_proxy=False
+                        if direct_transfers and direct_transfers[0][3] > 100_000:  # 带宽 > 100KB/s
+                            # 直连速度优先 → RTT
+                            direct_transfers.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = direct_transfers[0]
+                        else:
+                            # 直连速度不够或无直连，使用代理
+                            valid_transfers.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = valid_transfers[0]
+
+                    elif category == "cas":
+                        # CAS 域名：混合策略 - 优先直连但要求高带宽（>1MB/s）
+                        direct_high_speed = [
+                            t for t in valid_transfers
+                            if not t[1] and t[3] > 1_000_000  # 直连 且 带宽 > 1MB/s
+                        ]
+                        if direct_high_speed:
+                            # 直连高速优先
+                            direct_high_speed.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = direct_high_speed[0]
+                        else:
+                            # 无高速直连，速度优先（不区分直连/代理）
+                            valid_transfers.sort(key=lambda x: (-x[3], x[2]))
+                            best_ip, best_proxy, best_rtt, best_speed = valid_transfers[0]
+
+                    else:
+                        # 未知域名：通用策略
+                        if self.proxy:
+                            # 有代理：纯速度优先
+                            valid_transfers.sort(key=lambda x: (-x[3], x[2]))
+                        else:
+                            # 无代理：速度优先 → 直连优先 → RTT
+                            valid_transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
+                        best_ip, best_proxy, best_rtt, best_speed = valid_transfers[0]
                 else:
-                    # 无代理：速度优先 → 直连优先 → RTT
-                    transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
-                best_ip, best_proxy, best_rtt, best_speed = transfers[0]
+                    # 没有证书有效的 IP：fallback 到原策略（可能是代理连接）
+                    logger.warning(
+                        f"[HostOpt] ⚠️ {domain}: 所有 IP 证书验证失败，"
+                        f"fallback 到未验证的 IP"
+                    )
+                    if self.proxy:
+                        transfers.sort(key=lambda x: (-x[3], x[2]))
+                    else:
+                        transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
+                    best_ip, best_proxy, best_rtt, best_speed = transfers[0]
 
                 # 标记失败的候选（TCP 通但 Transfer 失败）
                 transfer_ips = {t[0] for t in transfers}
@@ -247,9 +401,20 @@ class HostOptimizer:
                     "speed": best_speed,
                 }
                 mode = "代理" if best_proxy else "直连"
+                cert_valid, cert_issuer, _ = cert_results.get(
+                    (domain, best_ip), (False, None, None)
+                )
+                cert_info = f", 证书={cert_issuer}" if cert_valid and cert_issuer else ""
+                category_label = {
+                    "api": "API",
+                    "data": "DATA",
+                    "cas": "CAS",
+                    "unknown": ""
+                }.get(category, "")
+                domain_info = f" [{category_label}]" if category_label else ""
                 logger.info(
-                    f"[HostOpt] ✅ {domain} → {best_ip} "
-                    f"({mode}, RTT={best_rtt*1000:.0f}ms, {_format_speed(best_speed)})"
+                    f"[HostOpt] ✅ {domain}{domain_info} → {best_ip} "
+                    f"({mode}, RTT={best_rtt*1000:.0f}ms, {_format_speed(best_speed)}{cert_info})"
                 )
             else:
                 # 无 Transfer，fallback TCP RTT
@@ -328,7 +493,11 @@ class HostOptimizer:
         return list(ips)
 
     def _query_doh_single(self, doh_url: str, domain: str) -> List[str]:
-        """单个 DoH 查询。"""
+        """单个 DoH 查询。
+
+        重要：当配置了代理时，DoH 查询必须通过代理进行，避免 DNS 污染。
+        """
+        # 强制通过代理进行 DoH 查询（如果配置了代理）
         session = create_robust_session(
             proxy=self.proxy if self.proxy else "",
             trust_env=not bool(self.proxy),
@@ -342,11 +511,14 @@ class HostOptimizer:
                 timeout=(3, 5),
             )
             data = resp.json()
-            return [
+            ips = [
                 a["data"]
                 for a in data.get("Answer", [])
                 if a.get("type") == 1  # A 记录
             ]
+            if ips and self.proxy:
+                logger.debug(f"[HostOpt] DoH via proxy: {domain} -> {len(ips)} IPs")
+            return ips
         finally:
             session.close()
 
@@ -556,8 +728,163 @@ class HostOptimizer:
             if needs_close and session is not None:
                 session.close()
 
+    def _get_certificate_fingerprint(
+        self, ip: str, domain: str, use_proxy: bool
+    ) -> Optional[Tuple[str, str, bool]]:
+        """获取证书指纹和颁发者信息。
+
+        Args:
+            ip: IP 地址
+            domain: 域名（用于 SNI）
+            use_proxy: 是否通过代理连接
+
+        Returns:
+            (fingerprint, issuer, cert_valid) 或 None
+            - fingerprint: SHA256 指纹（十六进制）
+            - issuer: 证书颁发机构
+            - cert_valid: 证书是否匹配域名
+        """
+        try:
+            if use_proxy and self.proxy:
+                # 通过代理连接
+                parsed = urlparse(self.proxy)
+                proxy_host = parsed.hostname
+                proxy_port = parsed.port or 8080
+
+                # 连接到代理
+                sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
+
+                # 发送 CONNECT 请求
+                connect_req = f"CONNECT {ip}:443 HTTP/1.1\r\nHost: {ip}:443\r\n\r\n"
+                sock.sendall(connect_req.encode())
+
+                # 读取代理响应
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                if b"200" not in response:
+                    sock.close()
+                    return None
+
+                # TLS 握手
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ssl_sock = ctx.wrap_socket(sock, server_hostname=domain)
+            else:
+                # 直连
+                sock = socket.create_connection((ip, 443), timeout=3)
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ssl_sock = ctx.wrap_socket(sock, server_hostname=domain)
+
+            # 获取证书
+            cert_der = ssl_sock.getpeercert(binary_form=True)
+            cert = ssl_sock.getpeercert()
+
+            # 计算指纹
+            fingerprint = hashlib.sha256(cert_der).hexdigest()
+
+            # 获取颁发者
+            issuer = dict(x[0] for x in cert['issuer'])
+            issuer_org = issuer.get('organizationName', 'Unknown')
+
+            # 验证证书是否匹配域名
+            cert_valid = False
+            subject = dict(x[0] for x in cert['subject'])
+            cn = subject.get('commonName', '')
+
+            if cn == domain or cn == f"*.{'.'.join(domain.split('.')[1:])}":
+                cert_valid = True
+            elif 'subjectAltName' in cert:
+                sans = [x[1] for x in cert['subjectAltName'] if x[0] == 'DNS']
+                if domain in sans or any(san.startswith('*.') and domain.endswith(san[1:]) for san in sans):
+                    cert_valid = True
+
+            ssl_sock.close()
+
+            return (fingerprint, issuer_org, cert_valid)
+
+        except Exception as e:
+            logger.debug(f"[HostOpt] 获取证书失败 {ip}: {e}")
+            return None
+
+    def _validate_ip_with_certificate(
+        self, ip: str, domain: str
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """验证 IP 的证书（使用代理连接作为基准）。
+
+        Args:
+            ip: 要验证的 IP
+            domain: 域名
+
+        Returns:
+            (valid, issuer, error_msg)
+            - valid: 是否通过验证
+            - issuer: 证书颁发者
+            - error_msg: 错误信息（如果有）
+        """
+        if not self.proxy:
+            # 没有代理时，无法验证（无基准）
+            # 只检查直连证书的有效性
+            result = self._get_certificate_fingerprint(ip, domain, False)
+            if result:
+                fingerprint, issuer, cert_valid = result
+                if cert_valid and issuer in TRUSTED_ISSUERS:
+                    return (True, issuer, None)
+                elif not cert_valid:
+                    return (False, issuer, "证书不匹配域名")
+                else:
+                    return (False, issuer, f"颁发者 {issuer} 不在白名单")
+            else:
+                return (False, None, "无法获取证书")
+
+        # 有代理：获取代理连接的证书指纹作为基准
+        proxy_result = self._get_certificate_fingerprint(ip, domain, True)
+        if not proxy_result:
+            return (False, None, "代理连接失败")
+
+        proxy_fingerprint, proxy_issuer, proxy_cert_valid = proxy_result
+
+        if not proxy_cert_valid:
+            return (False, proxy_issuer, "代理连接证书不匹配域名")
+
+        if proxy_issuer not in TRUSTED_ISSUERS:
+            logger.warning(f"[HostOpt] 代理连接的证书颁发者 {proxy_issuer} 不在白名单")
+
+        # 获取直连证书指纹
+        direct_result = self._get_certificate_fingerprint(ip, domain, False)
+        if not direct_result:
+            # 直连失败，但代理可用
+            return (False, proxy_issuer, "直连证书获取失败")
+
+        direct_fingerprint, direct_issuer, direct_cert_valid = direct_result
+
+        # 比较指纹
+        if proxy_fingerprint != direct_fingerprint:
+            return (False, direct_issuer, f"证书指纹不匹配（代理: {proxy_issuer}, 直连: {direct_issuer}）")
+
+        if not direct_cert_valid:
+            return (False, direct_issuer, "直连证书不匹配域名")
+
+        if direct_issuer not in TRUSTED_ISSUERS:
+            return (False, direct_issuer, f"颁发者不在白名单")
+
+        return (True, direct_issuer, None)
+
     def _install_patch(self) -> None:
-        """monkey-patch socket.getaddrinfo。"""
+        """monkey-patch socket.getaddrinfo（支持动态更新）。
+
+        动态映射优先级：
+        1. _DYNAMIC_IP_MAPPING（运行时更新，用于故障转移）
+        2. self.mappings（优选结果，静态缓存）
+        3. 原始 DNS（未优选域名）
+        """
         if self._patched or not self.mappings:
             return
 
@@ -565,10 +892,25 @@ class HostOptimizer:
         original = self._original_getaddrinfo
 
         def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-            # 命中优选域名
+            # 1. 优先检查动态映射（故障转移时的实时更新）
+            with _MAPPING_LOCK:
+                if host in _DYNAMIC_IP_MAPPING:
+                    ip = _DYNAMIC_IP_MAPPING[host]
+                    logger.debug(f"[HostOpt] DNS 命中（动态）: {host} → {ip}")
+                    return [
+                        (
+                            socket.AF_INET,
+                            socket.SOCK_STREAM,
+                            6,
+                            "",
+                            (ip, port if isinstance(port, int) else 0),
+                        )
+                    ]
+
+            # 2. 检查静态优选结果
             if host in mappings:
                 ip = mappings[host]["ip"]
-                logger.debug(f"[HostOpt] DNS 命中: {host} → {ip}")
+                logger.debug(f"[HostOpt] DNS 命中（静态）: {host} → {ip}")
                 return [
                     (
                         socket.AF_INET,
@@ -578,19 +920,32 @@ class HostOptimizer:
                         (ip, port if isinstance(port, int) else 0),
                     )
                 ]
-            # 未优选域名，使用原始 DNS
+
+            # 3. 未优选域名，使用原始 DNS
             return original(host, port, family, type, proto, flags)
 
         socket.getaddrinfo = patched_getaddrinfo
         self._patched = True
-        logger.info("[HostOpt] socket.getaddrinfo 已 patch")
+
+        # 初始化动态映射（从静态映射复制）
+        with _MAPPING_LOCK:
+            for domain, info in mappings.items():
+                if domain not in _DYNAMIC_IP_MAPPING:
+                    _DYNAMIC_IP_MAPPING[domain] = info["ip"]
+
+        logger.info("[HostOpt] socket.getaddrinfo 已 patch（支持动态更新）")
 
     def uninstall_patch(self) -> None:
-        """恢复原始 getaddrinfo。"""
+        """恢复原始 getaddrinfo，清理动态映射。"""
         if self._patched:
             socket.getaddrinfo = self._original_getaddrinfo
             self._patched = False
-            logger.info("[HostOpt] socket.getaddrinfo 已恢复")
+
+            # 清理动态映射
+            with _MAPPING_LOCK:
+                _DYNAMIC_IP_MAPPING.clear()
+
+            logger.info("[HostOpt] socket.getaddrinfo 已恢复，动态映射已清理")
 
     def get_proxy_for_domain(self, domain: str) -> Optional[str]:
         """按域名决定是否走代理。
@@ -628,7 +983,7 @@ class HostOptimizer:
             return None
 
     def _load_cache(self) -> bool:
-        """加载优选缓存。"""
+        """加载优选缓存（支持新旧格式）。"""
         if not self.cache_path.exists():
             return False
 
@@ -649,7 +1004,24 @@ class HostOptimizer:
                 )
                 return False
 
-            self.mappings = data.get("mappings", {})
+            # 支持新旧格式
+            version = data.get("version", "1.0")
+            if version == "2.0" and "domains" in data:
+                # 新格式：提取最佳 IP 和完整池
+                self.mappings = {}
+                self.detailed_results = {}
+                for domain, domain_data in data["domains"].items():
+                    self.mappings[domain] = {
+                        "ip": domain_data["best_ip"],
+                        "use_proxy": domain_data["best_use_proxy"],
+                        "rtt": domain_data["best_rtt"],
+                        "speed": domain_data["best_speed"],
+                    }
+                    self.detailed_results[domain] = domain_data.get("ips", [])
+            else:
+                # 旧格式：仅有最佳 IP
+                self.mappings = data.get("mappings", {})
+                self.detailed_results = {}
 
             # 检查代理依赖：如果某些域名需要代理但当前没有代理配置
             if not self.proxy:
@@ -673,23 +1045,35 @@ class HostOptimizer:
             return False
 
     def _save_cache(self) -> None:
-        """保存优选缓存。"""
+        """保存优选缓存（包含完整 IP 池）。"""
         try:
+            # 构建完整数据结构
+            domains_data = {}
+            for domain, mapping in self.mappings.items():
+                category = get_domain_category(domain)
+                detailed = self.detailed_results.get(domain, [])
+
+                domains_data[domain] = {
+                    "category": category,
+                    "best_ip": mapping["ip"],
+                    "best_use_proxy": mapping.get("use_proxy", False),
+                    "best_rtt": mapping.get("rtt", 0),
+                    "best_speed": mapping.get("speed", 0),
+                    "ips": detailed,  # 完整 IP 池
+                }
+
             data = {
-                "timestamp": time.time(),
-                "proxy_config": self.proxy,  # 记录代理配置
-                "mappings": self.mappings,
+                "version": "2.0",
+                "timestamp": int(time.time()),
+                "proxy_config": self.proxy,
+                "domains": domains_data,
             }
+
             with open(self.cache_path, 'w') as f:
-                json.dump(
-                    {
-                        "timestamp": int(time.time()),
-                        "mappings": self.mappings,
-                    },
-                    f,
-                    indent=2,
-                )
-            logger.debug(f"[HostOpt] 优选缓存已保存: {self.cache_path}")
+                json.dump(data, f, indent=2)
+
+            total_ips = sum(len(d["ips"]) for d in domains_data.values())
+            logger.debug(f"[HostOpt] 优选缓存已保存: {len(domains_data)} 个域名, {total_ips} 个 IP")
         except Exception as e:
             logger.warning(f"[HostOpt] 保存优选缓存失败: {e}")
 
