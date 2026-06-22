@@ -10,6 +10,7 @@ from xet.cli.commands import (
     register_download_command,
     register_info_command,
     register_config_command,
+    register_optimize_command,
 )
 
 
@@ -102,7 +103,7 @@ def main():
     """CLI 主入口。"""
     parser = argparse.ArgumentParser(
         prog="xet",
-        description="XetHub 文件管理工具",
+        description="XET+ 文件下载工具 - 支持 HuggingFace XET 协议高速下载",
         epilog="使用 'xet <command> --help' 查看命令帮助",
     )
 
@@ -148,6 +149,7 @@ def main():
     register_download_command(subparsers)
     register_info_command(subparsers)
     register_config_command(subparsers)
+    register_optimize_command(subparsers)
 
     # 解析参数
     args = parser.parse_args()
