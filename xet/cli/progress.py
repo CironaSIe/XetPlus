@@ -91,11 +91,11 @@ class RichProgress(ProgressDisplay):
 
             if total_xorbs > 0:
                 # 显示 Xorb 进度
-                desc_parts.append(f"📦 Xorb: {completed_xorbs}/{total_xorbs}")
+                desc_parts.append(f"📦 {completed_xorbs}/{total_xorbs}")
 
             if total_segments > 0 and total_segments > total_xorbs:
                 # 有多段下载，显示段进度
-                desc_parts.append(f"🔗 Seg: {completed_segments}/{total_segments}")
+                desc_parts.append(f"🔗 段 {completed_segments}/{total_segments}")
 
             # 如果没有任何信息，使用默认图标
             if not desc_parts:

@@ -4,6 +4,7 @@
 """
 import logging
 import threading
+import hashlib
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
@@ -16,6 +17,26 @@ from xet.pipeline.xorb_disk_cache import XorbDiskCache
 from xet.pipeline.chunk_disk_cache import ChunkDiskCache
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_sha256(file_path: Path, chunk_size: int = 8192 * 1024) -> str:
+    """计算文件的 SHA256 哈希值。
+
+    Args:
+        file_path: 文件路径
+        chunk_size: 每次读取的块大小（默认 8MB）
+
+    Returns:
+        SHA256 哈希值（小写十六进制）
+    """
+    sha256_hash = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while True:
+            data = f.read(chunk_size)
+            if not data:
+                break
+            sha256_hash.update(data)
+    return sha256_hash.hexdigest()
 
 
 class ReconstructionError(Exception):
@@ -158,6 +179,7 @@ class FileReconstructor:
         self,
         file_hash: str,
         expected_size: int = 0,
+        expected_sha256: str = "",
         resume: bool = True,
     ) -> Path:
         """重建文件（端到端流程）。
@@ -168,10 +190,12 @@ class FileReconstructor:
         3. 并行下载所有 xorb
         4. 解压和组装文件
         5. 清理 checkpoint
+        6. 验证文件完整性（大小 + SHA256）
 
         Args:
             file_hash: 文件的 MerkleHash
             expected_size: 预期文件大小（用于进度计算，0 表示未知）
+            expected_sha256: 预期的 SHA256 哈希值（用于完整性校验，空字符串表示跳过）
             resume: 是否尝试从 checkpoint 恢复
 
         Returns:
@@ -258,6 +282,25 @@ class FileReconstructor:
                 raise ReconstructionError(
                     f"文件大小不匹配: 期望 {expected_size}, 实际 {actual_size}"
                 )
+
+            # 7. 验证 SHA256（如果提供）
+            if expected_sha256:
+                logger.info("[FileReconstructor] 计算文件 SHA256 校验和...")
+                actual_sha256 = calculate_sha256(self.output_path)
+                if actual_sha256.lower() != expected_sha256.lower():
+                    # 校验失败，删除损坏的文件
+                    logger.error(
+                        f"[FileReconstructor] SHA256 校验失败!\n"
+                        f"  期望: {expected_sha256}\n"
+                        f"  实际: {actual_sha256}"
+                    )
+                    # 删除损坏的文件
+                    self.output_path.unlink(missing_ok=True)
+                    raise ReconstructionError(
+                        f"SHA256 校验失败: 期望 {expected_sha256[:16]}..., "
+                        f"实际 {actual_sha256[:16]}... (文件已删除)"
+                    )
+                logger.info(f"[FileReconstructor] ✅ SHA256 校验通过: {actual_sha256[:16]}...")
 
             logger.info(
                 f"[FileReconstructor] ✅ 文件重建成功: {self.output_path} "

@@ -829,6 +829,7 @@ def download_single_file(
                 result_path = reconstructor.reconstruct_file(
                     file_hash=file_hash,
                     expected_size=expected_size,
+                    expected_sha256=xet_info.get("sha256", ""),
                     resume=args.resume,
                 )
 
