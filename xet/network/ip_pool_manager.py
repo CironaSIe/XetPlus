@@ -137,11 +137,12 @@ class IPPoolManager:
 
         failed = self.failed_ips[domain]
 
-        # 过滤已失败的 IP 和证书无效的 IP
+        # 过滤已失败的 IP 和明确标记为证书无效的 IP
+        # 注意：cert_valid=False 不一定表示无法使用（可能通过代理工作）
+        # 只排除 status="cert_invalid" 的 IP
         available = [
             ip_info for ip_info in pool
             if ip_info["ip"] not in failed
-            and ip_info.get("cert_valid", False)
             and ip_info.get("status") != "cert_invalid"
         ]
 
