@@ -13,6 +13,13 @@ from xet.cli.commands import (
     register_optimize_command,
 )
 
+try:
+    from xet.__version__ import __version__, __build_date__, __features__
+except ImportError:
+    __version__ = "unknown"
+    __build_date__ = "unknown"
+    __features__ = []
+
 
 def setup_logging(verbose: int = 0, log_file: str = None):
     """配置日志系统。
@@ -131,11 +138,47 @@ def main():
         action="store_true",
     )
 
+    # 构建版本信息字符串
+    module_path = Path(__file__).parent.parent
+
+    # 尝试获取 git commit 信息
+    git_commit = "unknown"
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=module_path.parent,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode == 0:
+            git_commit = result.stdout.strip()
+    except Exception:
+        pass
+
+    version_lines = [
+        f"xet {__version__}+{git_commit}" if git_commit != "unknown" else f"xet {__version__}",
+    ]
+    if __build_date__ != "unknown":
+        version_lines[0] += f" (build {__build_date__})"
+
+    version_lines.append(f"Python: {sys.version.split()[0]}")
+    version_lines.append(f"Module: {module_path}")
+
+    if __features__:
+        version_lines.append("")
+        version_lines.append("Features:")
+        for feature in __features__:
+            version_lines.append(f"  • {feature}")
+
+    version_info = "\n".join(version_lines)
+
     parser.add_argument(
         "--version",
         help="显示版本信息",
         action="version",
-        version="xet 0.2.0 (Phase 5 + CLI Improvements)",
+        version=version_info,
     )
 
     # 子命令
