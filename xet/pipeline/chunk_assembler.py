@@ -186,7 +186,15 @@ class ChunkAssembler(PrefetchHelpers):
         output_path: Path,
         progress_tracker: Optional[ProgressTracker] = None,
     ) -> None:
-        """分批模式：按批次解压 xorb，控制内存占用。"""
+        """分批模式：按批次解压 xorb，控制内存占用——已弃用。
+
+        此方法接收全量 xorb_data_map，大文件时可能导致 OOM。
+        推荐使用 assemble_file_with_prefetch() 流式方案。
+        """
+        logger.warning(
+            "[ChunkAssembler] _assemble_file_batched 已弃用，"
+            "大文件可能 OOM。请使用 assemble_file_with_prefetch()。"
+        )
         # 1. 确保输出目录存在
         output_path.parent.mkdir(parents=True, exist_ok=True)
 

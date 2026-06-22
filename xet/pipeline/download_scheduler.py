@@ -83,10 +83,13 @@ class DownloadScheduler:
         file_hash: str,
         checkpoint: Optional[ReconstructionCheckpoint] = None,
     ) -> Dict[str, bytes]:
-        """并行下载所有 xorb（支持 multipart segments）。
+        """并行下载所有 xorb（支持 multipart segments）——已弃用。
+
+        此方法将所有 xorb 同时加载到内存，大文件时会导致 OOM。
+        已被 SegmentedReconstructor 的 ChunkAssembler 流式方案替代，
+        仅在外部遗留调用中保留。
 
         一个 xorb 可能有多个不连续的 segments，需要分别下载并合并。
-        参考 ~/xet.py 和 XET.SPEC.md 的 multipart 处理逻辑。
 
         Args:
             recon: Reconstruction 响应
@@ -101,6 +104,10 @@ class DownloadScheduler:
             KeyboardInterrupt: 用户中断
             RuntimeError: 下载失败
         """
+        logger.warning(
+            "[DownloadScheduler] download_all_xorbs 已弃用，"
+            "大文件可能 OOM。请使用 ChunkAssembler 流式方案。"
+        )
         # 1. 提取所有唯一 xorb
         unique_xorbs = list(recon.fetch_info.keys())
         logger.info(f"[DownloadScheduler] 发现 {len(unique_xorbs)} 个唯一 xorb")

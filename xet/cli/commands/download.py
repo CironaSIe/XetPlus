@@ -796,6 +796,9 @@ def download_single_file(
                     segment_size=segment_size,
                     max_workers=args.concurrency or 4,
                     parallel_segments=parallel_segments,
+                    parallel_write=getattr(args, 'parallel_write', False),
+                    chunk_cache=chunk_cache,
+                    xorb_cache=xorb_cache,
                     progress_callback=progress_callback,
                 )
 

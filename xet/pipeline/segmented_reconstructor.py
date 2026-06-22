@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 import queue
+import shutil
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List, Tuple, Set
 from dataclasses import dataclass
@@ -27,6 +28,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from xet.network.cas_client import CASClient
 from xet.pipeline.file_reconstructor import FileReconstructor
 from xet.pipeline.types import ReconstructionCheckpoint
+from xet.pipeline.chunk_assembler import ChunkAssembler
+from xet.pipeline.chunk_cache_adapter import ChunkCacheAdapter
+from xet.pipeline.progress_tracker import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +192,9 @@ class SegmentedReconstructor:
         temp_dir: Optional[Path] = None,
         max_workers: int = 4,
         parallel_segments: int = 1,
+        parallel_write: bool = False,
+        chunk_cache=None,
+        xorb_cache=None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         stop_event: Optional[threading.Event] = None,
     ):
@@ -202,6 +209,9 @@ class SegmentedReconstructor:
             temp_dir: 临时目录
             max_workers: 每段的最大并发下载数
             parallel_segments: 并行段数（默认1表示顺序下载）
+            parallel_write: 是否启用并行写入（需要预分配文件）
+            chunk_cache: Chunk 级磁盘缓存（可选）
+            xorb_cache: Xorb 级磁盘缓存（可选）
             progress_callback: 进度更新回调
             stop_event: 中断信号
         """
@@ -212,6 +222,9 @@ class SegmentedReconstructor:
         self.temp_dir = temp_dir or Path.cwd() / ".xet_temp"
         self.max_workers = max_workers
         self.parallel_segments = max(1, parallel_segments)
+        self.parallel_write = parallel_write
+        self.chunk_cache = chunk_cache
+        self.xorb_cache = xorb_cache
         self.progress_callback = progress_callback
         self._stop_event = stop_event or threading.Event()
 
@@ -351,12 +364,19 @@ class SegmentedReconstructor:
                     )
 
             # 2. 预分配文件空间
-            if not self.output_path.exists() or self.output_path.stat().st_size != self.file_size:
-                logger.info(f"[SegmentedReconstructor] 预分配文件空间: {self.file_size} bytes")
-                self.output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.output_path, 'wb') as f:
-                    f.seek(self.file_size - 1)
-                    f.write(b'\0')
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.parallel_write:
+                # 并行写入模式：预分配以支持随机偏移写入
+                if not self.output_path.exists() or self.output_path.stat().st_size != self.file_size:
+                    logger.info(f"[SegmentedReconstructor] 预分配文件空间: {self.file_size} bytes")
+                    with open(self.output_path, 'wb') as f:
+                        f.seek(self.file_size - 1)
+                        f.write(b'\0')
+            else:
+                # 顺序写入模式：只需创建空文件，随写入自然增长
+                if not self.output_path.exists():
+                    logger.info(f"[SegmentedReconstructor] 创建空文件: {self.file_size} bytes")
+                    self.output_path.touch()
 
             # 3. 选择下载模式
             if self.parallel_segments > 1:
@@ -550,8 +570,41 @@ class SegmentedReconstructor:
 
         logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 完成: {len(segment_data)} bytes")
 
+    def _stream_assembly_to_temp(self, seg: SegmentInfo, recon, seg_temp: Path) -> None:
+        """用 ChunkAssembler 流式组装段数据到临时文件。
+
+        Args:
+            seg: 分段信息
+            recon: segment 的 reconstruction 响应
+            seg_temp: 临时文件路径
+        """
+        progress_tracker = ProgressTracker(callback=self.progress_callback)
+        progress_tracker.set_total_bytes(seg.size)
+
+        assembler = ChunkAssembler(
+            temp_dir=self.temp_dir,
+            max_memory_mb=200,
+            prefetch_low_mb=48,
+            prefetch_high_mb=192,
+            max_concurrent_downloads=self.max_workers,
+        )
+        cache_adapter = ChunkCacheAdapter(
+            chunk_cache=self.chunk_cache,
+            xorb_cache=self.xorb_cache,
+        )
+
+        assembler.assemble_file_with_prefetch(
+            recon=recon,
+            cas_client=self.cas_client,
+            output_path=seg_temp,
+            file_hash=self.file_hash,
+            progress_tracker=progress_tracker,
+            cache_adapter=cache_adapter,
+            stop_event=self._stop_event,
+        )
+
     def _process_segment(self, seg: SegmentInfo) -> None:
-        """处理单个分段（顺序模式）。
+        """处理单个分段（顺序模式，流式写入，无全量内存中转）。
 
         Args:
             seg: 分段信息
@@ -561,7 +614,6 @@ class SegmentedReconstructor:
             f"offset={seg.start}, size={seg.size}"
         )
 
-        # 1. 请求 segment reconstruction
         recon = self.cas_client.get_segment_reconstruction(
             file_hash=self.file_hash,
             start=seg.start,
@@ -573,18 +625,28 @@ class SegmentedReconstructor:
             f"{len(recon.terms)} terms, {len(recon.fetch_info)} xorbs"
         )
 
-        # 2. 下载和重建数据到内存
-        segment_data = self._download_and_assemble_segment(seg, recon)
+        # 流式组装到临时文件（水位线控制内存，不加载全量 xorb）
+        seg_temp = self.temp_dir / f"seg_{seg.index}.tmp"
+        try:
+            self._stream_assembly_to_temp(seg, recon, seg_temp)
 
-        # 3. 写入文件的指定位置
-        with open(self.output_path, 'r+b') as f:
-            f.seek(seg.start)
-            f.write(segment_data)
+            # 流式复制到最终文件（不加载整个 segment 到内存）
+            with open(self.output_path, 'r+b') as f:
+                f.seek(seg.start)
+                with open(seg_temp, 'rb') as src:
+                    shutil.copyfileobj(src, f)
 
-        logger.info(f"[SegmentedReconstructor] 段 {seg.index} 完成: {len(segment_data)} bytes")
+        finally:
+            if seg_temp.exists():
+                seg_temp.unlink()
+
+        logger.info(f"[SegmentedReconstructor] 段 {seg.index} 完成: {seg.size} bytes")
 
     def _download_and_assemble_segment(self, seg: SegmentInfo, recon) -> bytes:
-        """下载并组装segment数据。
+        """下载并组装segment数据（并行模式用，返回 bytes 用于 write queue）。
+
+        使用 ChunkAssembler 的预取水位线机制流式处理，
+        避免将所有 xorb 同时加载到内存。
 
         Args:
             seg: 分段信息
@@ -593,62 +655,16 @@ class SegmentedReconstructor:
         Returns:
             组装后的segment数据（bytes）
         """
-        # 使用FileReconstructor的scheduler下载所有xorb
-        from xet.pipeline.download_scheduler import DownloadScheduler
-        from xet.pipeline.progress_tracker import ProgressTracker
+        seg_temp = self.temp_dir / f"seg_{seg.index}.tmp"
 
-        # 创建segment专用的progress tracker
-        progress_tracker = ProgressTracker(callback=self.progress_callback)
-        progress_tracker.set_total_bytes(seg.size)
+        try:
+            self._stream_assembly_to_temp(seg, recon, seg_temp)
+            return seg_temp.read_bytes()
 
-        # 创建下载调度器
-        scheduler = DownloadScheduler(
-            cas_client=self.cas_client,
-            max_workers=self.max_workers,
-            progress_tracker=progress_tracker,
-            checkpoint_manager=None,  # segment不使用xorb级checkpoint
-            stop_event=self._stop_event,
-        )
-
-        # 下载所有xorb
-        xorb_data_map = scheduler.download_all_xorbs(
-            recon=recon,
-            file_hash=self.file_hash,
-            checkpoint=None,
-        )
-
-        # 组装数据到内存
-        segment_data = bytearray()
-
-        for i, term in enumerate(recon.terms):
-            if term.hash not in xorb_data_map:
-                raise ValueError(f"Xorb {term.hash} 不在数据映射中")
-
-            xorb_data = xorb_data_map[term.hash]
-
-            # 提取term对应的数据
-            chunk_offset_dict = {idx: off for idx, off in xorb_data.chunk_offsets}
-            start_byte = chunk_offset_dict.get(term.range.start)
-
-            if start_byte is None:
-                raise ValueError(f"Chunk {term.range.start} 未找到")
-
-            end_byte = start_byte + term.unpacked_length
-            chunk_data = xorb_data.data[start_byte:end_byte]
-
-            # 处理第一个term的offset补偿
-            if i == 0 and recon.offset_into_first_range > 0:
-                offset = recon.offset_into_first_range
-                if offset > len(chunk_data):
-                    raise ValueError(
-                        f"offset_into_first_range ({offset}) "
-                        f"超出第一个term的数据长度 ({len(chunk_data)})"
-                    )
-                chunk_data = chunk_data[offset:]
-
-            segment_data.extend(chunk_data)
-
-        return bytes(segment_data)
+        finally:
+            if seg_temp.exists():
+                seg_temp.unlink()
+                logger.debug(f"[SegmentedReconstructor] 清理临时文件: {seg_temp}")
 
     def _mark_segment_completed(self, seg: SegmentInfo) -> None:
         """标记段为已完成并保存 checkpoint。

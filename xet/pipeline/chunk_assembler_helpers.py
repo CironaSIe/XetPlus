@@ -18,16 +18,31 @@ class PrefetchHelpers:
         recon: QueryReconstructionResponse,
         cache_adapter: ChunkCacheAdapter,
     ) -> None:
-        """从磁盘缓存加载所有可用的 xorb。
+        """从磁盘缓存加载 xorb（受水位线限制）。
+
+        只加载到 prefetch_high_mb 水位线为止，避免断点续传时
+        将所有缓存数据一次性加载到内存导致 OOM。
 
         Args:
             recon: Reconstruction 响应
             cache_adapter: 缓存适配器
         """
+        max_load_bytes = self.prefetch_high_mb * 1024 * 1024
         loaded_count = 0
         for xorb_hash in recon.fetch_info.keys():
             if xorb_hash in self._xorb_cache:
                 continue
+
+            # 检查水位线
+            current_bytes = sum(
+                len(x.data) for x in self._xorb_cache.values()
+            )
+            if current_bytes >= max_load_bytes:
+                logger.debug(
+                    f"[Cache] 达到水位线 ({self.prefetch_high_mb}MB)，"
+                    f"停止加载磁盘缓存"
+                )
+                break
 
             fetch_infos = recon.fetch_info[xorb_hash]
 

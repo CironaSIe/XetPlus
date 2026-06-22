@@ -470,7 +470,7 @@ class CASClient:
                 last_check_time = now
                 last_check_received = total_received
 
-        return bytes(buffer)
+        return buffer  # bytearray，避免 bytes() 的额外复制
 
     def get_xorb_data_with_retry(
         self,
