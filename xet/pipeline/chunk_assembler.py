@@ -522,8 +522,46 @@ class ChunkAssembler(PrefetchHelpers):
         high_watermark = self.prefetch_high_mb * 1024 * 1024
         total_written = 0
 
+        # 计算从 checkpoint 恢复时已写入的字节数
+        bytes_already_written = 0
+        if start_term_idx > 0:
+            for i in range(start_term_idx):
+                term = recon.terms[i]
+                if i == 0:
+                    bytes_already_written += max(0, term.unpacked_length - recon.offset_into_first_range)
+                else:
+                    bytes_already_written += term.unpacked_length
+            logger.debug(
+                f"[ChunkAssembler] Checkpoint 恢复: 已写入 {bytes_already_written} bytes, "
+                f"将从 term {start_term_idx} 继续"
+            )
+
         try:
-            with open(part_path, 'wb') as f:
+            # 根据是否有 checkpoint 选择文件打开模式
+            if start_term_idx > 0 and part_path.exists():
+                # 从 checkpoint 恢复：使用 r+b 模式追加，并验证现有文件大小
+                file_mode = 'r+b'
+                existing_size = part_path.stat().st_size
+                if existing_size != bytes_already_written:
+                    logger.warning(
+                        f"[ChunkAssembler] Checkpoint 文件大小不匹配: "
+                        f"期望 {bytes_already_written}, 实际 {existing_size}. "
+                        f"将截断到正确大小"
+                    )
+                    # 截断到正确大小
+                    with open(part_path, 'r+b') as f_trunc:
+                        f_trunc.truncate(bytes_already_written)
+            else:
+                # 全新下载：使用 wb 模式
+                file_mode = 'wb'
+
+            with open(part_path, file_mode) as f:
+                # 如果是追加模式，seek 到文件末尾
+                if file_mode == 'r+b':
+                    f.seek(0, 2)  # SEEK_END
+                    current_pos = f.tell()
+                    logger.debug(f"[ChunkAssembler] 文件指针位置: {current_pos}")
+
                 for term_idx, term in enumerate(recon.terms):
                     # 跳过已完成的 terms（checkpoint 恢复）
                     if term_idx < start_term_idx:
