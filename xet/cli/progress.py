@@ -46,10 +46,11 @@ class RichProgress(ProgressDisplay):
         self.console = Console()
 
     def __enter__(self):
+        # 简化的进度条：文件名 | 进度条 | 百分比 | 已下载/总大小 | 速度 | ETA
         self.progress = Progress(
-            TextColumn("[bold cyan]{task.description}", justify="left"),
-            BarColumn(bar_width=40, style="cyan", complete_style="green"),
-            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=None, style="cyan", complete_style="green"),
+            "[progress.percentage]{task.percentage:>3.0f}%",
             "•",
             DownloadColumn(),
             "•",
@@ -58,6 +59,7 @@ class RichProgress(ProgressDisplay):
             TimeRemainingColumn(),
             console=self.console,
             transient=False,  # 完成后保留进度条
+            expand=True,  # 自动适应终端宽度
         )
         self.progress.__enter__()
         self.task = self.progress.add_task(self.description, total=100)
@@ -77,19 +79,17 @@ class RichProgress(ProgressDisplay):
             total_segments = stats.get("total_segments", 0)
             completed_segments = stats.get("completed_segments", 0)
 
-            # 构建描述字符串
-            desc_parts = [self.description]
+            # 简化描述：只显示文件名
+            # Xorb/Segment 信息移到控制台日志，不显示在进度条中
+            description = self.description
 
-            if total_xorbs > 0:
-                xorb_info = f"Xorb: {completed_xorbs}/{total_xorbs}"
-                if active_xorbs > 0:
-                    xorb_info += f"(+{active_xorbs})"
-                desc_parts.append(xorb_info)
-
+            # 如果有分段信息，添加到描述中（简洁格式）
             if total_segments > 0 and total_segments > total_xorbs:
-                desc_parts.append(f"Seg: {completed_segments}/{total_segments}")
-
-            description = " | ".join(desc_parts)
+                # 多段下载模式
+                description = f"{self.description} | Xorb: {completed_xorbs}/{total_xorbs} | Seg: {completed_segments}/{total_segments}"
+            elif total_xorbs > 1:
+                # 单段但多个 xorb
+                description = f"{self.description} | Xorb: {completed_xorbs}/{total_xorbs}"
 
             self.progress.update(
                 self.task,

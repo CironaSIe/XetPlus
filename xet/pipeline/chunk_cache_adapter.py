@@ -218,8 +218,10 @@ class ChunkCacheAdapter:
                     f"范围 {chunk_range}, {len(sub_data) / 1024 / 1024:.2f}MB"
                 )
             except Exception as e:
-                logger.warning(
-                    f"[CacheAdapter] 写入 chunk 缓存失败: {xorb_hash[:16]}... "
+                # 缓存写入失败不是致命错误，降级为 DEBUG
+                # 常见原因：磁盘满、只读文件系统、权限问题
+                logger.debug(
+                    f"[CacheAdapter] 写入 chunk 缓存失败（忽略）: {xorb_hash[:16]}... "
                     f"范围 {chunk_range}, 错误: {e}"
                 )
 

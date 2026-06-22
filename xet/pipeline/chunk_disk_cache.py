@@ -167,8 +167,16 @@ class ChunkDiskCache:
         self._lock = threading.Lock()
 
         if self.enabled:
-            self.cache_root.mkdir(parents=True, exist_ok=True)
-            self._scan_cache()
+            try:
+                self.cache_root.mkdir(parents=True, exist_ok=True)
+                self._scan_cache()
+            except (OSError, PermissionError) as e:
+                # 缓存目录无法创建（只读文件系统、权限问题等）
+                logger.warning(
+                    f"[ChunkCache] 无法创建缓存目录 {cache_root}: {e}. "
+                    f"缓存已禁用"
+                )
+                self.enabled = False
 
     def get(self, xorb_hash: str, chunk_range: ChunkRange) -> Optional[CacheRange]:
         """查询缓存（支持部分范围命中）。
