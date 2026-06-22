@@ -675,6 +675,9 @@ def download_single_file(
     xorb_cache: Optional[XorbDiskCache] = None,
     chunk_cache = None,
     hf_endpoint: str = "https://huggingface.co",
+    ip_pool_manager = None,
+    optimize_hosts: bool = False,
+    host_optimizer = None,
 ) -> bool:
     """下载单个文件。
 
@@ -689,6 +692,9 @@ def download_single_file(
         xorb_cache: Xorb 缓存实例
         chunk_cache: Chunk 缓存实例
         hf_endpoint: HF 端点 URL
+        ip_pool_manager: IP 池管理器
+        optimize_hosts: 是否启用优选
+        host_optimizer: HOST 优选器
 
     Returns:
         成功返回 True，失败返回 False
@@ -1020,7 +1026,6 @@ def download_command(args):
         # 3.5. 初始化 IP 池管理器（如果启用了优选）
         ip_pool_manager = None
         if optimize_hosts and host_optimizer:
-            from pathlib import Path
             from xet.network.ip_pool_manager import IPPoolManager
 
             cache_file = Path.home() / ".xet" / "cache" / "host_optimize.json"
@@ -1100,6 +1105,11 @@ def download_command(args):
             matched_files = match_files(all_files, args.include)
             if not matched_files:
                 print(f"✗ 没有匹配的文件", file=sys.stderr)
+                print(f"\n📋 仓库中的所有文件 ({len(all_files)} 个):", file=sys.stderr)
+                for fname in sorted(all_files)[:50]:  # 最多显示 50 个
+                    print(f"   {fname}", file=sys.stderr)
+                if len(all_files) > 50:
+                    print(f"   ... 还有 {len(all_files) - 50} 个文件", file=sys.stderr)
                 return 1
 
             print(f"   找到 {len(matched_files)} 个匹配文件")
@@ -1241,7 +1251,10 @@ def download_command(args):
 
             # 下载
             try:
-                if download_single_file(repo_id, filename, xet_info, output_path, cas_client, args, repo_type, xorb_cache, chunk_cache, hf_endpoint):
+                if download_single_file(
+                    repo_id, filename, xet_info, output_path, cas_client, args, repo_type,
+                    xorb_cache, chunk_cache, hf_endpoint, ip_pool_manager, optimize_hosts, host_optimizer
+                ):
                     success_count += 1
             except KeyboardInterrupt:
                 interrupted = True
