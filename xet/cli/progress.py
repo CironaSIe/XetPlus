@@ -39,16 +39,23 @@ class ProgressDisplay:
 class RichProgress(ProgressDisplay):
     """Rich 样式进度条。"""
 
-    def __init__(self, description: str = "Downloading"):
+    def __init__(self, description: str = "Downloading", show_filename: bool = True):
         self.description = description
+        self.show_filename = show_filename
         self.progress = None
         self.task = None
         self.console = Console()
+        self._filename_shown = False
 
     def __enter__(self):
-        # 简化的进度条：文件名 | 进度条 | 百分比 | 已下载/总大小 | 速度 | ETA
+        # 如果需要显示文件名，先单独打印一行
+        if self.show_filename and not self._filename_shown:
+            self.console.print(f"[bold blue]📥 {self.description}[/bold blue]")
+            self._filename_shown = True
+
+        # 进度条：图标 + Xorb/Segment 信息 | 进度条 | 百分比 | 已下载/总大小 | 速度 | ETA
         self.progress = Progress(
-            TextColumn("[bold blue]{task.description}"),
+            TextColumn("[cyan]{task.description}"),  # Xorb/Segment 信息
             BarColumn(bar_width=None, style="cyan", complete_style="green"),
             "[progress.percentage]{task.percentage:>3.0f}%",
             "•",
@@ -62,7 +69,8 @@ class RichProgress(ProgressDisplay):
             expand=True,  # 自动适应终端宽度
         )
         self.progress.__enter__()
-        self.task = self.progress.add_task(self.description, total=100)
+        # 初始描述为空，等待第一次 update
+        self.task = self.progress.add_task("", total=100)
         return self
 
     def __exit__(self, *args):
@@ -75,21 +83,25 @@ class RichProgress(ProgressDisplay):
             # 获取进度信息
             total_xorbs = stats.get("total_xorbs", 0)
             completed_xorbs = stats.get("completed_xorbs", 0)
-            active_xorbs = stats.get("active_xorbs", 0)
             total_segments = stats.get("total_segments", 0)
             completed_segments = stats.get("completed_segments", 0)
 
-            # 简化描述：只显示文件名
-            # Xorb/Segment 信息移到控制台日志，不显示在进度条中
-            description = self.description
+            # 构建简洁的描述：图标 + 位置信息
+            desc_parts = []
 
-            # 如果有分段信息，添加到描述中（简洁格式）
+            if total_xorbs > 0:
+                # 显示 Xorb 进度
+                desc_parts.append(f"📦 Xorb: {completed_xorbs}/{total_xorbs}")
+
             if total_segments > 0 and total_segments > total_xorbs:
-                # 多段下载模式
-                description = f"{self.description} | Xorb: {completed_xorbs}/{total_xorbs} | Seg: {completed_segments}/{total_segments}"
-            elif total_xorbs > 1:
-                # 单段但多个 xorb
-                description = f"{self.description} | Xorb: {completed_xorbs}/{total_xorbs}"
+                # 有多段下载，显示段进度
+                desc_parts.append(f"🔗 Seg: {completed_segments}/{total_segments}")
+
+            # 如果没有任何信息，使用默认图标
+            if not desc_parts:
+                description = "⬇️  下载中"
+            else:
+                description = " | ".join(desc_parts)
 
             self.progress.update(
                 self.task,
