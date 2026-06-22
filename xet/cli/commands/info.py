@@ -39,6 +39,12 @@ def register_info_command(subparsers):
     )
 
     parser.add_argument(
+        "--hf-endpoint",
+        help="HuggingFace 端点（默认: https://huggingface.co）。"
+             "示例: https://hf-mirror.com",
+    )
+
+    parser.add_argument(
         "--endpoint",
         help="CAS 服务器地址（覆盖配置）",
     )
@@ -93,13 +99,24 @@ def parse_file_spec(path: str):
         raise ValueError(f"无效的文件路径格式: {path}")
 
 
-def list_hf_files(repo_id: str, repo_type: str, token: str, session: requests.Session) -> List[str]:
-    """列出 HuggingFace 仓库文件。"""
+def list_hf_files(repo_id: str, repo_type: str, token: str, session: requests.Session, hf_endpoint: str = "https://huggingface.co"):
+    """列出 HuggingFace 仓库文件（返回完整元数据）。
+
+    Args:
+        repo_id: 仓库 ID
+        repo_type: 仓库类型
+        token: HF token
+        session: requests session
+        hf_endpoint: HF 端点 URL
+
+    Returns:
+        (files, repo_metadata) 其中 files 是文件列表，repo_metadata 是仓库元数据
+    """
     # 根据 repo_type 构造 API URL
     if repo_type == "dataset":
-        url = f"https://huggingface.co/api/datasets/{repo_id}"
+        url = f"{hf_endpoint}/api/datasets/{repo_id}"
     else:
-        url = f"https://huggingface.co/api/models/{repo_id}"
+        url = f"{hf_endpoint}/api/models/{repo_id}"
 
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -108,35 +125,89 @@ def list_hf_files(repo_id: str, repo_type: str, token: str, session: requests.Se
         resp.raise_for_status()
         data = resp.json()
 
+        # 提取文件信息（包含大小）
         files = []
         for sibling in data.get("siblings", []):
             rpath = sibling.get("rfilename", "")
             if rpath:
-                files.append(rpath)
+                files.append({
+                    "filename": rpath,
+                    "size": sibling.get("size", 0),  # 文件大小（字节）
+                })
 
-        return files
+        # 提取仓库元数据
+        repo_metadata = {
+            "id": data.get("id", repo_id),
+            "author": data.get("author"),
+            "pipeline_tag": data.get("pipeline_tag"),  # 任务类型
+            "tags": data.get("tags", []),
+            "downloads": data.get("downloads", 0),
+            "likes": data.get("likes", 0),
+            "created_at": data.get("createdAt"),
+            "last_modified": data.get("lastModified"),
+            # 衍生关系
+            "base_model": None,
+            "derived_from": [],
+        }
+
+        # 从 cardData 提取更多信息
+        card_data = data.get("cardData", {})
+        if card_data:
+            # base_model 字段（单个或列表）
+            base_model = card_data.get("base_model")
+            if isinstance(base_model, list) and base_model:
+                repo_metadata["base_model"] = base_model[0]
+            elif isinstance(base_model, str):
+                repo_metadata["base_model"] = base_model
+
+        # 从 tags 中提取衍生关系
+        # 例如: "base_model:meta-llama/Llama-2-7b-hf"
+        for tag in repo_metadata["tags"]:
+            if tag.startswith("base_model:"):
+                parent = tag.split(":", 1)[1]
+                if parent not in repo_metadata["derived_from"]:
+                    repo_metadata["derived_from"].append(parent)
+
+        return files, repo_metadata
 
     except requests.RequestException as e:
         logger.error(f"列出文件失败: {e}")
-        return []
+        return [], {}
 
 
-def match_files(files: List[str], pattern: str) -> List[str]:
-    """使用 glob pattern 匹配文件。"""
+def match_files(files: List[dict], pattern: str) -> List[dict]:
+    """使用 glob pattern 匹配文件。
+
+    Args:
+        files: 文件列表（dict 格式，包含 filename 和 size）
+        pattern: glob pattern
+
+    Returns:
+        匹配的文件列表
+    """
     matched = []
     for f in files:
-        if fnmatch.fnmatch(f, pattern):
+        if fnmatch.fnmatch(f["filename"], pattern):
             matched.append(f)
     return matched
 
 
-def detect_xet_file(repo_id: str, repo_type: str, filename: str, token: str, session: requests.Session):
-    """检测文件是否为 XET 文件并获取元数据。"""
+def detect_xet_file(repo_id: str, repo_type: str, filename: str, token: str, session: requests.Session, hf_endpoint: str = "https://huggingface.co"):
+    """检测文件是否为 XET 文件并获取元数据。
+
+    Args:
+        repo_id: 仓库 ID
+        repo_type: 仓库类型
+        filename: 文件名
+        token: HF token
+        session: requests session
+        hf_endpoint: HF 端点 URL
+    """
     # 根据 repo_type 构造文件 URL
     if repo_type == "dataset":
-        file_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+        file_url = f"{hf_endpoint}/datasets/{repo_id}/resolve/main/{filename}"
     else:
-        file_url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+        file_url = f"{hf_endpoint}/{repo_id}/resolve/main/{filename}"
 
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -156,7 +227,7 @@ def detect_xet_file(repo_id: str, repo_type: str, filename: str, token: str, ses
         if match:
             auth_url = match.group(1)
             if not auth_url.startswith("http"):
-                auth_url = f"https://huggingface.co{auth_url}"
+                auth_url = f"{hf_endpoint}{auth_url}"
 
         # 提取 xet-hash（多级 fallback，支持未来协议变化）
         xet_hash = None
@@ -290,6 +361,8 @@ def info_command(args):
         config = ConfigManager()
         endpoint = args.endpoint or config.get_endpoint()
         hf_token = args.token or config.get_token()
+        hf_endpoint = getattr(args, 'hf_endpoint', None) or config.get_hf_endpoint()
+        proxy = getattr(args, 'proxy', None) or config.get_proxy()
 
         if not hf_token:
             print("✗ 缺少 HF Token，请设置：xet config xet.token YOUR_TOKEN", file=sys.stderr)
@@ -297,10 +370,6 @@ def info_command(args):
 
         # 2. 创建 session 并配置代理
         session = requests.Session()
-
-        proxy = args.proxy if hasattr(args, 'proxy') and args.proxy else None
-        if not proxy:
-            proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
 
         if proxy:
             session.proxies = {
@@ -321,7 +390,7 @@ def info_command(args):
 
         elif filename:
             # 单个文件: user/repo/file
-            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session)
+            xet_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session, hf_endpoint)
 
             if not xet_info:
                 print(f"✗ 文件不是 XET 格式: {filename}", file=sys.stderr)
@@ -348,23 +417,83 @@ def info_command(args):
             print_file_info(filename, xet_info, cas_client)
 
         else:
-            # 批量查询: user/repo + --include
-            if not args.include:
-                print(f"✗ 批量查询需要 --include 参数指定文件匹配模式", file=sys.stderr)
-                repo_label = f"datasets/{repo_id}" if repo_type == "dataset" else repo_id
-                print(f"  示例: xet info {repo_label} --include '*.gguf'")
-                return 1
-
+            # 批量查询: user/repo (可选 --include)
             repo_label = f"datasets/{repo_id}" if repo_type == "dataset" else repo_id
-            print(f"\n📦 仓库: {repo_label}")
-            print(f"   匹配: {args.include}")
-            print()
 
             # 列出文件
-            all_files = list_hf_files(repo_id, repo_type, hf_token, session)
+            all_files, repo_meta = list_hf_files(repo_id, repo_type, hf_token, session, hf_endpoint)
             if not all_files:
                 print(f"✗ 无法列出仓库文件", file=sys.stderr)
                 return 1
+
+            # 显示仓库信息
+            from rich.console import Console
+            from rich.table import Table
+            from rich.panel import Panel
+
+            console = Console()
+
+            print(f"\n📦 仓库: [bold cyan]{repo_label}[/bold cyan]")
+
+            # 仓库元数据
+            if repo_meta:
+                meta_parts = []
+                if repo_meta.get("pipeline_tag"):
+                    meta_parts.append(f"🏷️  任务: {repo_meta['pipeline_tag']}")
+                if repo_meta.get("downloads"):
+                    meta_parts.append(f"⬇️  下载: {repo_meta['downloads']:,}")
+                if repo_meta.get("likes"):
+                    meta_parts.append(f"❤️  点赞: {repo_meta['likes']:,}")
+
+                if meta_parts:
+                    print("   " + " | ".join(meta_parts))
+
+                # 衍生关系
+                if repo_meta.get("base_model"):
+                    print(f"   🔗 基于: [yellow]{repo_meta['base_model']}[/yellow]")
+                elif repo_meta.get("derived_from"):
+                    derived = ", ".join(repo_meta["derived_from"])
+                    print(f"   🔗 衍生自: [yellow]{derived}[/yellow]")
+
+            # 如果没有 --include，列出所有文件的简要信息
+            if not args.include:
+                print(f"   找到 {len(all_files)} 个文件\n")
+
+                # 创建文件列表表格
+                table = Table(show_header=True, box=None)
+                table.add_column("文件名", style="cyan", no_wrap=False)
+                table.add_column("大小", justify="right", style="yellow")
+                table.add_column("类型", justify="center", style="dim")
+
+                xet_count = 0
+                for file_info in all_files:
+                    fname = file_info["filename"]
+                    file_size = file_info["size"]
+
+                    # 快速检测是否为 XET 文件
+                    xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, hf_endpoint)
+
+                    if xet_info:
+                        # XET 文件：显示解压后大小
+                        size_str = format_bytes(xet_info['size'])
+                        table.add_row(fname, size_str, "XET")
+                        xet_count += 1
+                    else:
+                        # 非 XET 文件：显示原始大小
+                        if file_size > 0:
+                            size_str = format_bytes(file_size)
+                            table.add_row(fname, size_str, "")
+                        else:
+                            table.add_row(fname, "-", "")
+
+                console.print(table)
+                print(f"\n   💡 {xet_count} 个 XET 文件 / {len(all_files)} 总文件")
+                print(f"   💡 使用 --include 'pattern' 查看详细信息")
+                return 0
+
+            # 有 --include，显示匹配文件的详细信息
+            print(f"   匹配: {args.include}")
+            print()
 
             matched = match_files(all_files, args.include)
             if not matched:
@@ -377,8 +506,9 @@ def info_command(args):
             first_xet = None
             cas_client = None
 
-            for fname in matched[:20]:  # 最多显示 20 个
-                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session)
+            for file_info in matched[:20]:  # 最多显示 20 个
+                fname = file_info["filename"]
+                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, hf_endpoint)
 
                 if not xet_info:
                     print(f"  ⊘ {fname}: 非 XET 文件")

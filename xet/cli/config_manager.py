@@ -69,6 +69,10 @@ class ConfigManager:
             "XET_CONCURRENCY": ("download", "concurrency"),
             "XET_LOG_LEVEL": ("logging", "level"),
             "XET_OPTIMIZE_HOSTS": ("network", "optimize_hosts"),
+            "XET_CACHE_DIR": ("cache", "dir"),
+            "HF_ENDPOINT": ("network", "hf_endpoint"),
+            "HTTPS_PROXY": ("network", "proxy"),
+            "https_proxy": ("network", "proxy"),
         }
 
         for env_var, path in env_mapping.items():
@@ -222,3 +226,15 @@ class ConfigManager:
     def get_optimize_hosts(self) -> bool:
         """获取是否启用 IP 优选（便捷方法）。"""
         return self.get("network.optimize_hosts", False)
+
+    def get_hf_endpoint(self) -> str:
+        """获取 HuggingFace 端点（便捷方法）。"""
+        return self.get("network.hf_endpoint", "https://huggingface.co")
+
+    def get_proxy(self) -> Optional[str]:
+        """获取代理地址（便捷方法）。"""
+        return self.get("network.proxy")
+
+    def get_cache_dir(self) -> Optional[str]:
+        """获取缓存目录（便捷方法）。"""
+        return self.get("cache.dir")

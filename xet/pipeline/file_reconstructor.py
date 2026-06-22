@@ -181,7 +181,7 @@ class FileReconstructor:
         expected_size: int = 0,
         expected_sha256: str = "",
         resume: bool = True,
-    ) -> Path:
+    ) -> tuple[Path, list[str]]:
         """重建文件（端到端流程）。
 
         完整流程：
@@ -199,7 +199,7 @@ class FileReconstructor:
             resume: 是否尝试从 checkpoint 恢复
 
         Returns:
-            输出文件路径
+            (输出文件路径, 本次下载的 xorb_hash 列表)
 
         Raises:
             ReconstructionError: 重建失败
@@ -219,6 +219,9 @@ class FileReconstructor:
                 f"{len(recon.terms)} terms, "
                 f"{len(recon.fetch_info)} 唯一 xorb"
             )
+
+            # 记录本次使用的 xorb_hash 列表（用于清理缓存）
+            xorb_hashes = list(recon.fetch_info.keys())
 
             # 2. 设置进度跟踪器总大小和总数
             if expected_size > 0:
@@ -307,7 +310,7 @@ class FileReconstructor:
                 f"({actual_size} bytes)"
             )
 
-            return self.output_path
+            return self.output_path, xorb_hashes
 
         except KeyboardInterrupt:
             logger.warning("[FileReconstructor] 用户中断")

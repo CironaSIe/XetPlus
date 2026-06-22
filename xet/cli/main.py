@@ -214,6 +214,13 @@ def main():
     # 设置日志
     setup_logging(verbose=verbose, log_file=log_file)
 
+    # 向用户显示日志文件路径（在非静默模式下）
+    if log_file and verbose == 0:
+        # 默认日志级别（WARNING），提示用户日志文件位置
+        from rich.console import Console
+        console = Console()
+        console.print(f"[dim]💾 详细日志: {log_file}[/dim]")
+
     # 记录启动信息
     logging.debug(f"XET CLI 启动: {' '.join(sys.argv)}")
     logging.debug(f"控制台日志级别: {['WARNING', 'INFO', 'DEBUG'][min(verbose, 2)]}")

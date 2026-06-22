@@ -513,7 +513,7 @@ class ChunkDiskCache:
         )
 
     def clear(self) -> None:
-        """清空缓存。"""
+        """清空所有缓存。"""
         with self._lock:
             # 删除所有文件
             for xorb_hash, items in self._state.items():
@@ -527,3 +527,48 @@ class ChunkDiskCache:
             self._total_bytes = 0
 
             logger.info("[ChunkCache] 缓存已清空")
+
+    def clear_xorbs(self, xorb_hashes: list) -> int:
+        """清理指定 xorb 的缓存。
+
+        Args:
+            xorb_hashes: 要清理的 xorb hash 列表
+
+        Returns:
+            清理的文件数量
+        """
+        if not self.enabled:
+            return 0
+
+        count = 0
+        with self._lock:
+            for xorb_hash in xorb_hashes:
+                items = self._state.get(xorb_hash, [])
+                for item in items[:]:  # 复制列表以避免修改时迭代
+                    cache_file = self._get_cache_file_path(xorb_hash, item)
+                    if cache_file.exists():
+                        try:
+                            cache_file.unlink()
+                            self._total_bytes -= item.length
+                            count += 1
+                        except Exception as e:
+                            logger.debug(f"[ChunkCache] 删除失败: {cache_file}, {e}")
+
+                    # 从索引移除
+                    if item in items:
+                        items.remove(item)
+
+                # 如果该 xorb 没有缓存项了，删除目录
+                if xorb_hash in self._state and not self._state[xorb_hash]:
+                    del self._state[xorb_hash]
+                    xorb_dir = self._get_xorb_dir(xorb_hash)
+                    if xorb_dir.exists() and not any(xorb_dir.iterdir()):
+                        try:
+                            xorb_dir.rmdir()
+                        except Exception:
+                            pass
+
+        if count > 0:
+            logger.debug(f"[ChunkCache] 清理 {len(xorb_hashes)} 个 xorb: 删除 {count} 个文件")
+
+        return count

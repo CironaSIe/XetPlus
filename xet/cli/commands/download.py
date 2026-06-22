@@ -826,7 +826,7 @@ def download_single_file(
                     host_optimizer=host_optimizer if optimize_hosts else None,  # ← 传递
                 )
 
-                result_path = reconstructor.reconstruct_file(
+                result_path, xorb_hashes = reconstructor.reconstruct_file(
                     file_hash=file_hash,
                     expected_size=expected_size,
                     expected_sha256=xet_info.get("sha256", ""),
@@ -844,7 +844,28 @@ def download_single_file(
             f"[green]✓[/green] 文件大小: [yellow]{format_bytes(file_size)}[/yellow] ({file_size:,} bytes)"
         )
 
+        # 添加 SHA256 校验状态
+        if xet_info.get("sha256"):
+            success_msg += f"\n[green]✓[/green] SHA256 校验: [green]通过[/green]"
+
         console.print(Panel(success_msg, title="[bold green]下载完成[/bold green]", border_style="green"))
+
+        # 下载成功后清理本次下载相关的缓存
+        cleaned_count = 0
+
+        if xorb_cache and xorb_cache.enabled:
+            xorb_cache.cleanup()  # 清理本次写入的 xorb 缓存
+            cleaned_count += 1
+
+        if chunk_cache and chunk_cache.enabled and xorb_hashes:
+            # 清理本次下载的 xorb 对应的 chunk 缓存
+            chunk_count = chunk_cache.clear_xorbs(xorb_hashes)
+            if chunk_count > 0:
+                cleaned_count += 1
+
+        if cleaned_count > 0:
+            logger.info(f"[Cache] ✅ 清理完成")
+
         return True
 
     except KeyboardInterrupt:
@@ -1196,6 +1217,12 @@ def download_command(args):
         chunk_cache = None
         if cache_enabled:
             cache_dir = getattr(args, 'cache_dir', None)
+            if not cache_dir:
+                # 从 config 读取
+                cache_dir_str = config.get_cache_dir()
+                if cache_dir_str:
+                    cache_dir = Path(cache_dir_str)
+
             keep_cache = getattr(args, 'keep_cache', False)
 
             # 使用 chunk-level 缓存（新实现）
@@ -1281,8 +1308,8 @@ def download_command(args):
             table.add_row("✗ 失败", f"[red]{failed_count}[/red]")
             table.add_row("", "")
             table.add_row("💡 提示", "[yellow]已保存断点，重新运行相同命令即可续传[/yellow]")
+            table.add_row("", "")
 
-        table.add_row("", "")
         table.add_row("📦 总计", f"[cyan]{len(files_to_download)}[/cyan]")
 
         console.print(Panel(table, title="[bold cyan]批量下载汇总[/bold cyan]", border_style="cyan"))

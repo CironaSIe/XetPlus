@@ -57,7 +57,7 @@ class RichProgress(ProgressDisplay):
         self.progress = Progress(
             TextColumn("[cyan]{task.description}"),  # Xorb/Segment 信息
             BarColumn(bar_width=None, style="cyan", complete_style="green"),
-            "[progress.percentage]{task.percentage:>3.0f}%",
+            "[progress.percentage]{task.percentage:>6.2f}%",  # 两位小数
             "•",
             DownloadColumn(),
             "•",
@@ -89,13 +89,13 @@ class RichProgress(ProgressDisplay):
             # 构建简洁的描述：图标 + 位置信息
             desc_parts = []
 
+            # 始终显示 Xorb 进度
             if total_xorbs > 0:
-                # 显示 Xorb 进度
                 desc_parts.append(f"📦 {completed_xorbs}/{total_xorbs}")
 
-            if total_segments > 0 and total_segments > total_xorbs:
-                # 有多段下载，显示段进度
-                desc_parts.append(f"🔗 段 {completed_segments}/{total_segments}")
+            # 只要 segment 总数大于 0，就显示段进度（不带"段"字）
+            if total_segments > 0:
+                desc_parts.append(f"🔗 {completed_segments}/{total_segments}")
 
             # 如果没有任何信息，使用默认图标
             if not desc_parts:
@@ -103,11 +103,18 @@ class RichProgress(ProgressDisplay):
             else:
                 description = " | ".join(desc_parts)
 
+            # Rich 需要字节数来正确格式化速度和已下载量
+            assembled_bytes = stats.get("assembled_bytes", 0)
+            total_bytes = stats.get("total_bytes", 0)
+
+            # 如果 total_bytes 为 0（未知），传递 None 给 Rich
+            total = total_bytes if total_bytes > 0 else None
+
             self.progress.update(
                 self.task,
                 description=description,
-                completed=stats.get("progress_pct", 0),
-                total=100,
+                completed=assembled_bytes,
+                total=total,
             )
 
 
