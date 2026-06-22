@@ -133,8 +133,11 @@ class HostOptimizer:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.doh_servers = dns_servers if dns_servers else DOH_SERVERS
 
-        # 优选结果
+        # 优选结果（最优 IP）
         self.mappings: Dict[str, Dict] = {}
+
+        # 详细测试结果（所有候选 IP）
+        self.detailed_results: Dict[str, List[Dict]] = {}
 
         # 原始 getaddrinfo（用于 fallback）
         self._original_getaddrinfo = socket.getaddrinfo
@@ -197,11 +200,25 @@ class HostOptimizer:
         # 4. HTTP Transfer 测速（对 Top 候选）
         transfer_results = self._transfer_test_top(results)
 
-        # 5. 按域名选最优
+        # 5. 按域名选最优 + 保存详细结果
         for domain, candidates in results.items():
             transfers = transfer_results.get(domain, [])
+
+            # 构建详细结果列表
+            detailed = []
+
             if transfers:
-                # 有 Transfer 结果：智能选择策略
+                # 有 Transfer 结果
+                for ip, use_proxy, rtt, speed in transfers:
+                    detailed.append({
+                        "ip": ip,
+                        "use_proxy": use_proxy,
+                        "rtt": rtt,
+                        "speed": speed,
+                        "status": "ok",
+                    })
+
+                # 智能选择策略
                 # 当用户指定代理时，优先考虑速度而非"直连优先"
                 if self.proxy:
                     # 有代理：纯速度优先（用户明确需要代理环境）
@@ -210,6 +227,19 @@ class HostOptimizer:
                     # 无代理：速度优先 → 直连优先 → RTT
                     transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
                 best_ip, best_proxy, best_rtt, best_speed = transfers[0]
+
+                # 标记失败的候选（TCP 通但 Transfer 失败）
+                transfer_ips = {t[0] for t in transfers}
+                for ip, use_proxy, rtt in candidates:
+                    if ip not in transfer_ips:
+                        detailed.append({
+                            "ip": ip,
+                            "use_proxy": use_proxy,
+                            "rtt": rtt,
+                            "speed": 0,
+                            "status": "transfer_failed",  # TCP 通但 HTTPS 失败
+                        })
+
                 self.mappings[domain] = {
                     "ip": best_ip,
                     "use_proxy": best_proxy,
@@ -223,6 +253,16 @@ class HostOptimizer:
                 )
             else:
                 # 无 Transfer，fallback TCP RTT
+                # 所有候选都是 Transfer 失败的
+                for ip, use_proxy, rtt in candidates:
+                    detailed.append({
+                        "ip": ip,
+                        "use_proxy": use_proxy,
+                        "rtt": rtt,
+                        "speed": 0,
+                        "status": "transfer_failed",
+                    })
+
                 # 当用户指定代理时，Transfer 测速失败意味着直连不可用（TLS 阻断）
                 # 此时应强制使用代理
                 if self.proxy:
@@ -251,6 +291,9 @@ class HostOptimizer:
                     f"[HostOpt] ⚠️ {domain} → {best_ip} "
                     f"({mode}, RTT={best_rtt*1000:.0f}ms, Transfer=N/A)"
                 )
+
+            # 保存详细结果
+            self.detailed_results[domain] = detailed
 
         # 6. 保存缓存 + 安装 patch
         if self.mappings:
@@ -488,8 +531,21 @@ class HostOptimizer:
 
             return speed
 
+        except ssl.SSLError as e:
+            # TLS/证书错误（最常见的墙拦截）
+            logger.debug(f"[HostOpt] Transfer 测速 TLS 失败 {ip}: {e}")
+            return None
+        except (socket.timeout, TimeoutError) as e:
+            # 超时
+            logger.debug(f"[HostOpt] Transfer 测速超时 {ip}: {e}")
+            return None
+        except (ConnectionError, OSError) as e:
+            # 连接错误（拒绝、重置等）
+            logger.debug(f"[HostOpt] Transfer 测速连接失败 {ip}: {e}")
+            return None
         except Exception as e:
-            logger.debug(f"[HostOpt] Transfer 测速失败 {ip}: {e}")
+            # 其他错误
+            logger.debug(f"[HostOpt] Transfer 测速未知错误 {ip}: {type(e).__name__}: {e}")
             return None
         finally:
             if conn is not None:

@@ -51,6 +51,12 @@ def register_optimize_command(subparsers):
         action="store_true",
     )
 
+    parser.add_argument(
+        "--verbose",
+        help="详细模式（显示所有测试的 IP 及其状态）",
+        action="store_true",
+    )
+
     parser.set_defaults(func=optimize_command)
 
 
@@ -92,7 +98,14 @@ def optimize_command(args) -> int:
         _print_hosts_format(mappings)
     else:
         # 人类可读格式
-        _print_human_readable(mappings, used_opt_cache, used_doh_cache, args.quiet)
+        _print_human_readable(
+            mappings,
+            optimizer.detailed_results,
+            used_opt_cache,
+            used_doh_cache,
+            args.quiet,
+            args.verbose,
+        )
 
     return 0
 
@@ -112,9 +125,11 @@ def _print_hosts_format(mappings: dict) -> None:
 
 def _print_human_readable(
     mappings: dict,
+    detailed_results: dict,
     used_opt_cache: bool,
     used_doh_cache: bool,
     quiet: bool,
+    verbose: bool,
 ) -> None:
     """输出人类可读格式。"""
     if not quiet:
@@ -156,13 +171,46 @@ def _print_human_readable(
 
             mode = "🔒 代理" if use_proxy else "🚀 直连"
 
-            if speed > 0:
-                speed_str = _format_speed(speed)
-                if not quiet:
-                    print(f"  {domain:<30} → {ip:<15} {mode}  RTT={rtt*1000:>5.0f}ms  {speed_str:>10}")
-            else:
-                if not quiet:
-                    print(f"  {domain:<30} → {ip:<15} {mode}  RTT={rtt*1000:>5.0f}ms")
+            if not quiet:
+                if speed > 0:
+                    speed_str = _format_speed(speed)
+                    print(f"  ✅ {domain:<30} → {ip:<15} {mode}  RTT={rtt*1000:>5.0f}ms  {speed_str:>10}")
+                else:
+                    print(f"  ✅ {domain:<30} → {ip:<15} {mode}  RTT={rtt*1000:>5.0f}ms")
+
+                # 详细模式：显示所有候选 IP
+                if verbose and domain in detailed_results:
+                    candidates = detailed_results[domain]
+                    if len(candidates) > 1:  # 有多个候选才显示
+                        print(f"     所有候选 IP ({len(candidates)} 个):")
+                        for candidate in candidates:
+                            cand_ip = candidate["ip"]
+                            cand_proxy = candidate["use_proxy"]
+                            cand_rtt = candidate["rtt"]
+                            cand_speed = candidate.get("speed", 0)
+                            cand_status = candidate.get("status", "unknown")
+
+                            # 状态图标
+                            if cand_status == "ok":
+                                status_icon = "✅"
+                                status_text = "可用"
+                            elif cand_status == "transfer_failed":
+                                status_icon = "❌"
+                                status_text = "TLS失败"
+                            else:
+                                status_icon = "❓"
+                                status_text = cand_status
+
+                            cand_mode = "代理" if cand_proxy else "直连"
+
+                            # 标记当前选中的 IP
+                            selected = "★" if cand_ip == ip else " "
+
+                            if cand_speed > 0:
+                                speed_str = _format_speed(cand_speed)
+                                print(f"       {selected} {status_icon} {cand_ip:<15} {cand_mode:<4} RTT={cand_rtt*1000:>5.0f}ms {speed_str:>10} [{status_text}]")
+                            else:
+                                print(f"       {selected} {status_icon} {cand_ip:<15} {cand_mode:<4} RTT={cand_rtt*1000:>5.0f}ms             [{status_text}]")
 
         if not quiet:
             print()
@@ -174,6 +222,8 @@ def _print_human_readable(
         print("  1. 使用 --hosts 输出 hosts 格式（适合写入 /etc/hosts）")
         print("  2. 使用 --refresh 强制重新测速（忽略缓存）")
         print("  3. 使用 --proxy 指定代理进行测速对比")
+        if not verbose:
+            print("  4. 使用 --verbose 查看所有候选 IP 的详细状态")
         print()
 
 
