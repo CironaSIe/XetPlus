@@ -201,8 +201,14 @@ class HostOptimizer:
         for domain, candidates in results.items():
             transfers = transfer_results.get(domain, [])
             if transfers:
-                # 有 Transfer 结果：按速度降序 → 直连优先 → RTT 升序
-                transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
+                # 有 Transfer 结果：智能选择策略
+                # 当用户指定代理时，优先考虑速度而非"直连优先"
+                if self.proxy:
+                    # 有代理：纯速度优先（用户明确需要代理环境）
+                    transfers.sort(key=lambda x: (-x[3], x[2]))
+                else:
+                    # 无代理：速度优先 → 直连优先 → RTT
+                    transfers.sort(key=lambda x: (-x[3], x[1], x[2]))
                 best_ip, best_proxy, best_rtt, best_speed = transfers[0]
                 self.mappings[domain] = {
                     "ip": best_ip,
@@ -217,8 +223,23 @@ class HostOptimizer:
                 )
             else:
                 # 无 Transfer，fallback TCP RTT
-                candidates.sort(key=lambda x: (x[1], x[2]))
-                best_ip, best_proxy, best_rtt = candidates[0]
+                # 当用户指定代理时，Transfer 测速失败意味着直连不可用（TLS 阻断）
+                # 此时应强制使用代理
+                if self.proxy:
+                    # 有代理且 Transfer 失败：优先选择代理测速结果
+                    # 按 use_proxy=True 优先 → RTT 升序
+                    candidates.sort(key=lambda x: (not x[1], x[2]))
+                    best_ip, best_proxy, best_rtt = candidates[0]
+                    if not best_proxy:
+                        logger.warning(
+                            f"[HostOpt] ⚠️ {domain}: Transfer 测速失败，"
+                            f"但无代理测速结果，fallback 直连（可能不可用）"
+                        )
+                else:
+                    # 无代理：直连优先 → RTT 升序
+                    candidates.sort(key=lambda x: (x[1], x[2]))
+                    best_ip, best_proxy, best_rtt = candidates[0]
+
                 self.mappings[domain] = {
                     "ip": best_ip,
                     "use_proxy": best_proxy,
