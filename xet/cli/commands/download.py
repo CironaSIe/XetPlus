@@ -579,6 +579,7 @@ def download_file_direct(
     xet_info: dict,
     output_path: Path,
     args,
+    session: requests.Session,
     repo_type: str = "model",
     hf_endpoint: str = "https://huggingface.co",
 ) -> bool:
@@ -592,6 +593,7 @@ def download_file_direct(
         xet_info: XET 文件元数据
         output_path: 输出路径
         args: 命令行参数
+        session: 复用的 Session（支持 HOST 优选）
         repo_type: 仓库类型（model 或 dataset）
 
     Returns:
@@ -609,12 +611,8 @@ def download_file_direct(
     else:
         file_url = f"{hf_endpoint}/{repo_id}/resolve/main/{filename}"
 
-    # 2. 创建 session（复用全局 session 更好，但这里简化处理）
-    import requests
-    session = requests.Session()
-
     try:
-        # 3. 下载文件
+        # 2. 下载文件（使用传入的 session，支持 HOST 优选）
         print(f"   正在获取下载链接...")
         headers = {}
         if hasattr(args, 'token') and args.token:
@@ -629,7 +627,7 @@ def download_file_direct(
         )
         response.raise_for_status()
 
-        # 4. 流式写入文件
+        # 3. 流式写入文件
         total_size = int(response.headers.get('content-length', expected_size))
 
         with open(output_path, 'wb') as f:
@@ -645,7 +643,7 @@ def download_file_direct(
                         f.write(chunk)
                         pbar.update(len(chunk))
 
-        # 5. 验证文件大小
+        # 4. 验证文件大小
         actual_size = output_path.stat().st_size
         if expected_size > 0 and actual_size != expected_size:
             print(f"⚠ 警告: 文件大小不匹配 ({actual_size} != {expected_size})")
@@ -735,6 +733,7 @@ def download_single_file(
                 xet_info=xet_info,
                 output_path=output_path,
                 args=args,
+                session=session,
                 repo_type=repo_type,
                 hf_endpoint=hf_endpoint,
             )
