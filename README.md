@@ -64,7 +64,8 @@ xet download user/repo --include "*Q4*.gguf"
 xet config xet.token YOUR_HF_TOKEN
 xet config network.hf_endpoint https://hf-mirror.com
 xet config network.proxy http://127.0.0.1:7890
-xet config --list
+xet config --list                # 查看当前配置
+xet config --list-all            # 查看所有可用配置项（含说明）
 ```
 
 ### 国内网络优化
@@ -138,7 +139,8 @@ xet info user/repo --proxy http://127.0.0.1:7890
 ```bash
 xet config KEY VALUE       # 设置配置
 xet config --get KEY       # 获取配置
-xet config --list          # 列出所有配置
+xet config --list          # 列出当前配置
+xet config --list-all      # 列出所有可用配置项（含说明、默认值）
 xet config --unset KEY     # 删除配置
 ```
 

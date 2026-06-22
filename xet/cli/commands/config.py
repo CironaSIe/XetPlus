@@ -1,6 +1,6 @@
 """Config 命令实现。"""
 import sys
-from xet.cli.config_manager import ConfigManager
+from xet.cli.config_manager import ConfigManager, CONFIG_SCHEMA, CONFIG_SCHEMA
 
 
 def register_config_command(subparsers):
@@ -30,6 +30,12 @@ def register_config_command(subparsers):
     )
 
     parser.add_argument(
+        "--list-all",
+        help="列出所有可用配置项（包括未设置的）",
+        action="store_true",
+    )
+
+    parser.add_argument(
         "--get",
         help="获取配置值",
         metavar="KEY",
@@ -49,15 +55,23 @@ def config_command(args):
     try:
         config = ConfigManager()
 
+        # 列出所有可用配置项（包括未设置的）
+        if args.list_all:
+            print("所有可用配置项：\n")
+            print_config_schema(CONFIG_SCHEMA, config)
+            return 0
+
         # 列出所有配置
         if args.list:
             all_config = config.list_all()
             if not all_config:
                 print("无配置")
+                print("\n💡 提示：使用 'xet config --list-all' 查看所有可用配置项")
                 return 0
 
             print("当前配置：")
             print_config(all_config)
+            print("\n💡 提示：使用 'xet config --list-all' 查看所有可用配置项")
             return 0
 
         # 获取配置
@@ -116,3 +130,49 @@ def print_config(config: dict, indent: int = 0):
             print_config(value, indent + 1)
         else:
             print("  " * indent + f"{key} = {value}")
+
+
+def print_config_schema(schema: dict, config: ConfigManager):
+    """打印配置项定义（带当前值）。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    table = Table(show_header=True, header_style="bold cyan")
+
+    table.add_column("配置项", style="cyan", no_wrap=True)
+    table.add_column("说明", style="white")
+    table.add_column("默认值", style="yellow")
+    table.add_column("当前值", style="green")
+    table.add_column("环境变量", style="dim")
+
+    for key, info in sorted(schema.items()):
+        description = info.get("description", "")
+        default = info.get("default")
+        env_var = info.get("env_var", "")
+
+        # 获取当前值
+        current = config.get(key)
+
+        # 格式化显示
+        default_str = str(default) if default is not None else "-"
+        current_str = str(current) if current is not None else "-"
+
+        # 如果当前值与默认值不同，高亮显示
+        if current is not None and current != default:
+            current_str = f"[bold green]{current_str}[/bold green]"
+
+        table.add_row(
+            key,
+            description,
+            default_str,
+            current_str,
+            env_var,
+        )
+
+    console.print(table)
+    print("\n💡 用法：xet config <key> <value>")
+    print("   示例：xet config xet.token hf_xxxxx")
+    print("   查看：xet config --get <key>")
+    print("   删除：xet config --unset <key>")
+

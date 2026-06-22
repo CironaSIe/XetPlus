@@ -6,6 +6,51 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# 所有可用的配置项定义
+CONFIG_SCHEMA = {
+    "xet.endpoint": {
+        "description": "CAS 服务器地址",
+        "default": "https://cas.xethub.com",
+        "env_var": "XET_ENDPOINT",
+    },
+    "xet.token": {
+        "description": "HuggingFace 认证 Token（必需）",
+        "default": None,
+        "env_var": "XET_TOKEN",
+    },
+    "network.hf_endpoint": {
+        "description": "HuggingFace API 端点",
+        "default": "https://huggingface.co",
+        "env_var": "HF_ENDPOINT",
+    },
+    "network.proxy": {
+        "description": "HTTP/HTTPS 代理地址",
+        "default": None,
+        "env_var": "HTTPS_PROXY, https_proxy",
+    },
+    "network.optimize_hosts": {
+        "description": "是否启用 HOST IP 优选",
+        "default": False,
+        "env_var": "XET_OPTIMIZE_HOSTS",
+    },
+    "cache.dir": {
+        "description": "Xorb 磁盘缓存目录",
+        "default": "~/.xet/cache",
+        "env_var": "XET_CACHE_DIR",
+    },
+    "download.concurrency": {
+        "description": "并行下载的默认并发数",
+        "default": 4,
+        "env_var": "XET_CONCURRENCY",
+    },
+    "logging.level": {
+        "description": "日志输出级别 (DEBUG|INFO|WARNING|ERROR)",
+        "default": "INFO",
+        "env_var": "XET_LOG_LEVEL",
+    },
+}
+
+
 class ConfigManager:
     """统一配置管理器，按优先级加载配置。
 
@@ -206,6 +251,11 @@ class ConfigManager:
     def list_all(self) -> dict:
         """列出所有配置。"""
         return self.config.copy()
+
+    @staticmethod
+    def get_schema() -> dict:
+        """获取配置项定义（schema）。"""
+        return CONFIG_SCHEMA.copy()
 
     def get_endpoint(self) -> str:
         """获取 CAS endpoint（便捷方法）。"""
