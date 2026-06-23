@@ -370,8 +370,9 @@ class HostOptimizer:
         # 5. 证书验证（对所有成功的 Transfer 结果）
         cert_results = {}
         if transfer_results:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {}
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            futures = {}
+            try:
                 for domain, transfers in transfer_results.items():
                     for ip, use_proxy, rtt, speed in transfers:
                         future = executor.submit(
@@ -390,9 +391,8 @@ class HostOptimizer:
                             cert_results[(domain, ip)] = (False, None, str(e))
                 except concurrent.futures.TimeoutError:
                     logger.debug("[HostOpt] 证书验证部分超时，使用已完成结果")
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
+            finally:
+                executor.shutdown(wait=False)
 
         # 6. 按域名选最优 + 保存详细结果
         for domain, candidates in results.items():
@@ -592,7 +592,8 @@ class HostOptimizer:
     def _query_doh_multi(self, domain: str) -> List[str]:
         """从多家 DoH 查询域名 IP，取并集。"""
         ips: Set[str] = set()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        try:
             futures = {
                 executor.submit(self._query_doh_single, url, domain): url
                 for url in self.doh_servers
@@ -605,12 +606,9 @@ class HostOptimizer:
                     except Exception as e:
                         logger.debug(f"[HostOpt] DoH 查询失败: {e}")
             except concurrent.futures.TimeoutError:
-                # 部分 DoH 服务器超时，但可能已经有结果
                 logger.debug(f"[HostOpt] DoH 查询部分超时，已获得 {len(ips)} 个 IP")
-                # 取消未完成的 futures
-                for future in futures:
-                    if not future.done():
-                        future.cancel()
+        finally:
+            executor.shutdown(wait=False)
         return list(ips)
 
     def _query_doh_single(self, doh_url: str, domain: str) -> List[str]:
@@ -652,7 +650,8 @@ class HostOptimizer:
             {domain: [(ip, use_proxy, rtt), ...]}
         """
         results: Dict[str, List] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        try:
             futures: Dict = {}
             for domain, ips in all_ips.items():
                 for ip in ips:
@@ -666,16 +665,21 @@ class HostOptimizer:
                             executor.submit(self._tcp_rtt, ip, 443, True)
                         ] = (domain, ip, True)
 
-            for future in concurrent.futures.as_completed(futures, timeout=10):
-                domain, ip, use_proxy = futures[future]
-                try:
-                    rtt = future.result()
-                    if rtt is not None:
-                        results.setdefault(domain, []).append(
-                            (ip, use_proxy, rtt)
-                        )
-                except Exception as e:
-                    logger.debug(f"[HostOpt] 测速异常 {ip}: {e}")
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=10):
+                    domain, ip, use_proxy = futures[future]
+                    try:
+                        rtt = future.result()
+                        if rtt is not None:
+                            results.setdefault(domain, []).append(
+                                (ip, use_proxy, rtt)
+                            )
+                    except Exception as e:
+                        logger.debug(f"[HostOpt] 测速异常 {ip}: {e}")
+            except concurrent.futures.TimeoutError:
+                logger.debug("[HostOpt] TCP 测速部分超时，使用已完成结果")
+        finally:
+            executor.shutdown(wait=False)
         return results
 
     def _tcp_rtt(self, ip: str, port: int, use_proxy: bool) -> Optional[float]:
@@ -767,8 +771,9 @@ class HostOptimizer:
 
         # ---- 第一阶段：CAS 域名测速（仅主域名）----
         if primary_cas:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                cas_futures: Dict = {}
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            cas_futures: Dict = {}
+            try:
                 for domain, candidates in primary_cas.items():
                     if self.proxy:
                         candidates.sort(key=lambda x: (x[1], x[2]))
@@ -799,14 +804,12 @@ class HostOptimizer:
                                 )
                                 if data_url and not sample_data_url:
                                     sample_data_url = data_url
-                                # 实时输出：CAS 延迟成功
                                 _print(
                                     f"   [{_done_count}/{_total_tests}] "
                                     f"CAS {ip} ({mode_str}) 延迟={latency_ms:.0f}ms",
                                     flush=True,
                                 )
                             else:
-                                # 实时输出：CAS 失败（404 等）
                                 _print(
                                     f"   [{_done_count}/{_total_tests}] "
                                     f"CAS {ip} ({mode_str}) 无响应",
@@ -819,20 +822,15 @@ class HostOptimizer:
                                 flush=True,
                             )
 
-                        # 全局超时检查
                         if time.time() > _overall_deadline:
                             logger.debug("[HostOpt] 达到全局超时，停止等待")
-                            # 取消所有未完成的 future
-                            for f in cas_futures:
-                                if not f.done():
-                                    f.cancel()
                             break
                 except concurrent.futures.TimeoutError:
                     logger.debug("[HostOpt] CAS 测速超时，使用已完成结果")
-                    # 取消所有未完成的 future，避免 executor.shutdown(wait=True) 阻塞
-                    for f in cas_futures:
-                        if not f.done():
-                            f.cancel()
+            finally:
+                # shutdown(wait=False): 不等待阻塞在 socket I/O 的线程
+                # cancel() 对已运行线程无效，必须用 wait=False 直接放弃
+                executor.shutdown(wait=False)
 
             if not transfer_results.get(_primary_cas_domain):
                 if _can_do_cas_api:
@@ -852,8 +850,9 @@ class HostOptimizer:
 
         # ---- 第二阶段：DATA + API 域名测速 ----
         if non_cas_domains and time.time() < _overall_deadline:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                transfer_futures: Dict = {}
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            transfer_futures: Dict = {}
+            try:
                 for domain, candidates in non_cas_domains.items():
                     category = get_domain_category(domain)
                     if self.proxy:
@@ -899,7 +898,6 @@ class HostOptimizer:
                                 transfer_results.setdefault(domain, []).append(
                                     (ip, use_proxy, rtt, speed)
                                 )
-                                # 实时输出：成功
                                 if category == "data":
                                     _print(
                                         f"   [{_done_count}/{_total_tests}] "
@@ -919,7 +917,6 @@ class HostOptimizer:
                                         flush=True,
                                     )
                             else:
-                                # 失败
                                 short_name = domain.split(".")[0]
                                 cat_label = {"api": "API", "data": "DATA"}.get(category, short_name)
                                 _print(
@@ -936,17 +933,11 @@ class HostOptimizer:
 
                         if time.time() > _overall_deadline:
                             logger.debug("[HostOpt] 达到全局超时，停止等待")
-                            # 取消所有未完成的 future
-                            for f in transfer_futures:
-                                if not f.done():
-                                    f.cancel()
                             break
                 except concurrent.futures.TimeoutError:
                     logger.debug("[HostOpt] Transfer 测速超时，使用已完成结果")
-                    # 取消所有未完成的 future
-                    for f in transfer_futures:
-                        if not f.done():
-                            f.cancel()
+            finally:
+                executor.shutdown(wait=False)
 
         return transfer_results
 
