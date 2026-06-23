@@ -595,7 +595,7 @@ class SegmentedReconstructor:
         # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
         progress_tracker.set_total_bytes(self.file_size)
         # 已完成段的偏移量作为初始已组装字节数
-        progress_tracker.increment_assembled(seg.offset)
+        progress_tracker.increment_assembled(seg.start)
 
         assembler = ChunkAssembler(
             temp_dir=self.temp_dir,

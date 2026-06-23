@@ -1030,9 +1030,17 @@ def download_command(args):
                 logger.warning(f"提前获取 CAS token 失败（将在下载前重试）: {e}")
 
         # =====================================================================
-        # 6. HOST 优选（现在有 token 了，可以进行真实带宽测速！）
+        # 6. HOST 优选（现在有 token + file_hash，可以测 CAS 延迟和 DATA 带宽！）
         # =====================================================================
         _early_access_token = token_info.access_token if token_info else None
+
+        # 提取 file_hash 和 cas_endpoint 用于真实测速
+        _early_file_hash = None
+        _early_cas_endpoint = token_info.endpoint if token_info else None
+        if _cached_first_xet_info:
+            _early_file_hash = _cached_first_xet_info.get("xet_hash")
+        elif 'early_info' in dir() and early_info:
+            _early_file_hash = early_info.get("xet_hash")
 
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")
@@ -1042,7 +1050,9 @@ def download_command(args):
             optimize_hosts=optimize_hosts,
             refresh_hosts=refresh_hosts,
             dns_servers=dns_servers,
-            access_token=_early_access_token,  # ← 关键：传入 token 用于真实测速
+            access_token=_early_access_token,
+            file_hash=_early_file_hash,
+            cas_endpoint=_early_cas_endpoint,
         )
 
         if optimize_hosts and host_optimizer:
@@ -1069,10 +1079,15 @@ def download_command(args):
                     if info.get("speed", 0) > 0:
                         from xet.network.host_optimizer import _format_speed
                         speed_val = info.get("speed", 0)
-                        # speed=1.0 是连通性哨兵值（非真实测速），显示为"连通"
-                        if speed_val == 1.0:
+                        # 根据域名类型区分显示
+                        if category == "cas":
+                            # CAS：speed 是 TTFB 延迟（毫秒）
+                            speed_str = f"延迟={speed_val:.0f}ms"
+                        elif speed_val == 1.0:
+                            # 连通性哨兵值（非真实测速）
                             speed_str = "连通"
                         else:
+                            # DATA/API：真实带宽
                             speed_str = _format_speed(speed_val)
                         domain_title = f"{domain} ({category_label})" if category_label else domain
                         print(f"   {domain_title}")
@@ -1102,8 +1117,9 @@ def download_command(args):
                             if status == "ok" and cert_valid:
                                 # 证书有效但未选中
                                 from xet.network.host_optimizer import _format_speed
-                                # speed=1.0 是连通性哨兵值，显示为"连通"
-                                if speed == 1.0:
+                                if category == "cas":
+                                    speed_str = f"延迟={speed:.0f}ms"
+                                elif speed == 1.0:
                                     speed_str = "连通"
                                 else:
                                     speed_str = _format_speed(speed) if speed > 0 else "0"
