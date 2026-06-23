@@ -377,9 +377,13 @@ class PrefetchHelpers:
         segments = []
         total_size = 0
         for seg_idx, fi in enumerate(sorted_infos):
-            segment_data = cas_client.get_xorb_data(
+            # 使用 get_xorb_data_with_retry：支持 403 URL 过期自动刷新 token + 重建签名 URL
+            # （旧的 get_xorb_data 只会傻重试 5 次后崩溃）
+            segment_data = cas_client.get_xorb_data_with_retry(
                 url=fi.url,
                 url_range=fi.url_range,
+                xorb_hash=xorb_hash,
+                file_hash=file_hash,
             )
             segments.append(segment_data)
             total_size += len(segment_data)

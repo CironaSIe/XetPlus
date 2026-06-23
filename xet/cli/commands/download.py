@@ -13,9 +13,10 @@ import fnmatch
 import logging
 import requests
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 from xet.network.cas_client import CASClient
+from xet.network.url_refresh_coordinator import URLRefreshCoordinator
 from xet.pipeline.file_reconstructor import FileReconstructor
 from xet.pipeline.xorb_disk_cache import XorbDiskCache
 from xet.pipeline.chunk_disk_cache import ChunkDiskCache
@@ -702,33 +703,29 @@ def download_single_file(
     file_hash = xet_info["xet_hash"]
     expected_size = xet_info.get("size", 0)
 
-    print(f"\n{'='*60}")
-    print(f"📥 下载: {filename}")
-    print(f"   Hash: {file_hash}")
-    print(f"   大小: {format_bytes(expected_size)}")
-    print(f"   输出: {output_path}")
+    # 紧凑的单行文件信息（替代原来的多行输出）
+    _mode = getattr(args, 'mode', 'auto')
+
+    # 截断过长的文件名和路径用于显示
+    _display_name = filename if len(filename) <= 45 else f"...{filename[-42:]}"
+    _display_out = str(output_path)
+    if len(_display_out) > 55:
+        _display_out = f"...{_display_out[-52:]}"
+
+    print(f"\n{'─' * 60}")
+    print(f"  📥 {_display_name}  ({format_bytes(expected_size)}) → {_mode.upper()}")
+    print(f"     ↳ {_display_out}")
 
     # 1. 决定下载模式
     mode = getattr(args, 'mode', 'auto')
     use_direct = False
 
     if mode == 'direct':
-        # 强制使用 direct 模式
         use_direct = True
-        print(f"   模式: direct（直接下载）")
-    elif mode == 'xet':
-        # 强制使用 xet 重建模式
-        use_direct = False
-        print(f"   模式: xet（XET 重建）")
-    else:
-        # auto 模式：根据文件大小自动选择
-        DIRECT_THRESHOLD = 256 * 1024 * 1024  # 256 MB
+    elif mode == 'auto':
+        DIRECT_THRESHOLD = 256 * 1024 * 1024
         if expected_size > 0 and expected_size < DIRECT_THRESHOLD:
             use_direct = True
-            print(f"   模式: direct（文件 < 256MB，自动选择）")
-        else:
-            use_direct = False
-            print(f"   模式: xet（文件 >= 256MB 或大小未知，自动选择）")
 
     # 2. 如果使用 direct 模式，执行直接下载
     if use_direct:
@@ -744,33 +741,33 @@ def download_single_file(
                 hf_endpoint=hf_endpoint,
             )
         except Exception as e:
-            print(f"⚠ Direct 模式失败 ({e})，回退到 XET 重建模式")
-            # 回退到 XET 模式
+            print(f"     ⚠ Direct 失败 ({e})，回退到 XET 模式")
             use_direct = False
 
-    # 3. 使用 XET 重建模式
-    # 决定是否使用分段下载
-    use_segmented = False
+    # 3. XET 重建模式 — 收集参数信息为一行显示
     segment_size = None
     parallel_segments = getattr(args, 'parallel_segments', 1)
+    use_segmented = False
 
-    # 解析segment_size参数
     if hasattr(args, 'segment_size') and args.segment_size:
         try:
             segment_size = parse_size(args.segment_size)
             use_segmented = True
-            print(f"   分段大小: {format_bytes(segment_size)}")
-        except ValueError as e:
-            print(f"⚠ 警告: {e}，将自动选择分段大小")
+        except ValueError:
             use_segmented = True
 
-    # 如果文件很大（>1GB），自动启用分段下载
     if not use_segmented and expected_size > 1 * 1024 ** 3:
         use_segmented = True
-        print(f"   自动启用分段下载（文件 > 1GB）")
 
+    # 紧凑的单行参数信息
+    _info_parts = []
     if use_segmented:
-        print(f"   并行段数: {parallel_segments}")
+        seg_str = format_bytes(segment_size) if segment_size else "64MB"
+        _info_parts.append(f"段={seg_str}")
+    if parallel_segments > 1:
+        _info_parts.append(f"并行={parallel_segments}")
+    if _info_parts:
+        print(f"     ⚙ {' | '.join(_info_parts)}")
 
     # 创建进度条
     progress = create_progress(
@@ -778,7 +775,11 @@ def download_single_file(
         description=f"{filename[:40]}",
     )
 
+    # 捕获最新进度（供中断时显示）
+    _latest_stats: Dict[str, Any] = {}
+
     def progress_callback(stats):
+        _latest_stats.update(stats)
         progress.update(stats)
 
     # 执行下载
@@ -836,22 +837,12 @@ def download_single_file(
                     resume=args.resume,
                 )
 
-        # 下载完成，显示美化的成功消息
+        # 下载完成，显示紧凑的成功消息
         file_size = result_path.stat().st_size
-        from rich.console import Console
-        from rich.panel import Panel
-        console = Console()
-
-        success_msg = (
-            f"[green]✓[/green] 文件已保存: [cyan]{result_path}[/cyan]\n"
-            f"[green]✓[/green] 文件大小: [yellow]{format_bytes(file_size)}[/yellow] ({file_size:,} bytes)"
-        )
-
-        # 添加 SHA256 校验状态
+        _result_name = result_path.name if len(result_path.name) <= 50 else f"...{result_path.name[-47:]}"
+        print(f"\n  ✅ 下载完成: {_result_name} ({format_bytes(file_size)})")
         if xet_info.get("sha256"):
-            success_msg += f"\n[green]✓[/green] SHA256 校验: [green]通过[/green]"
-
-        console.print(Panel(success_msg, title="[bold green]下载完成[/bold green]", border_style="green"))
+            print(f"     ✓ SHA256 校验通过")
 
         # 下载成功后清理本次下载相关的缓存
         cleaned_count = 0
@@ -872,7 +863,17 @@ def download_single_file(
         return True
 
     except KeyboardInterrupt:
-        print(f"\n⚠ 用户中断，进度已保存")
+        assembled = _latest_stats.get('assembled_bytes', 0)
+        total = _latest_stats.get('total_bytes', 0)
+        completed_seg = _latest_stats.get('completed_segments', 0)
+        total_seg = _latest_stats.get('total_segments', 0)
+        if total > 0:
+            pct = assembled / total * 100
+            progress_str = f"{format_bytes(assembled)}/{format_bytes(total)} ({pct:.1f}%)"
+        else:
+            progress_str = format_bytes(assembled)
+        seg_str = f", {completed_seg}/{total_seg}段" if total_seg > 0 else ""
+        print(f"\n  ↩ 用户中断，断点已保存: {progress_str}{seg_str}")
         raise
 
     except Exception as e:
@@ -924,18 +925,15 @@ def download_command(args):
         if hf_endpoint != "https://huggingface.co":
             logger.info(f"[Download] 使用自定义 HF 端点: {hf_endpoint}")
 
-        # 3. 创建 Session（集成 IP 优选）
+        # 3. 优化配置解析
         from xet.network.host_optimizer import create_optimized_session
 
         # 优先级：命令行参数 > 配置文件 > 默认值 False
         if getattr(args, 'optimize_hosts_flag', False):
-            # 用户明确指定 --optimize-hosts
             optimize_hosts = True
         elif getattr(args, 'no_optimize_hosts_flag', False):
-            # 用户明确指定 --no-optimize-hosts
             optimize_hosts = False
         else:
-            # 命令行未指定，使用配置文件
             optimize_hosts = config.get_optimize_hosts()
 
         refresh_hosts = getattr(args, 'refresh_hosts', False)
@@ -947,40 +945,104 @@ def download_command(args):
             if dns_servers:
                 logger.info(f"[Download] 使用自定义 DNS 服务器: {len(dns_servers)} 个")
 
+        # =====================================================================
+        # 3.5 创建基础 Session（用于早期 API 调用，HOST 优选稍后进行）
+        # =====================================================================
+        from xet.network.host_optimizer import create_robust_session
+        session = create_robust_session(proxy=proxy or "")
+
+        # 如果使用自定义 HF_ENDPOINT，先检测其 XET 支持
+        if optimize_hosts and hf_endpoint != "https://huggingface.co":
+            from xet.network.host_optimizer import check_hf_endpoint_xet_support
+
+            print(f"   检测 {hf_endpoint} 的 XET 支持...")
+            check_result = check_hf_endpoint_xet_support(
+                endpoint=hf_endpoint,
+                proxy=proxy or "",
+                timeout=10,
+            )
+
+            if check_result["reachable"]:
+                if check_result["supports_xet"]:
+                    print(f"   ✅ {hf_endpoint} 支持 XET 协议（响应时间: {check_result['response_time']:.2f}s）")
+                    if check_result["xet_headers"].get("x-linked-etag"):
+                        etag = check_result["xet_headers"]["x-linked-etag"][:16]
+                        print(f"      x-linked-etag: {etag}...")
+                else:
+                    if check_result["has_xet_headers"]:
+                        print(f"   ⚠️  {hf_endpoint} 有 XET 头但缺少 Link 头")
+                    else:
+                        print(f"   ⚠️  {hf_endpoint} 不支持 XET 协议，可能无法下载")
+            else:
+                print(f"   ❌ {hf_endpoint} 不可达: {check_result.get('error', 'Unknown')}")
+                print(f"      建议检查网络连接或尝试添加 --proxy 参数")
+
+        # =====================================================================
+        # 4. 解析文件路径 + 提前检测第一个文件（获取 auth_url）
+        # =====================================================================
+        repo_id, filename, file_hash, repo_type = parse_file_spec(args.path)
+
+        # 提前检测第一个文件，仅为了获取 auth_url（用于提前获取 CAS token）
+        _first_auth_url = None
+        _first_repo_id = repo_id
+        _first_repo_type = repo_type
+        # 缓存：批量模式提前解析的结果（避免后续重复调用）
+        _cached_all_files = None
+        _cached_matched_files = None
+        _cached_first_xet_info = None  # 第一个匹配文件的完整 xet_info
+
+        if file_hash:
+            # hash 模式：使用 dummy repo 获取 auth_url
+            dummy_repo = "mykor/granite-embedding-97m-multilingual-r2-GGUF"
+            dummy_file = "granite-embedding-97M-multilingual-r2-Q4_K_M.gguf"
+            dummy_xet = detect_xet_file(dummy_repo, "model", dummy_file, hf_token, session, revision="main", hf_endpoint=hf_endpoint)
+            if dummy_xet:
+                _first_auth_url = dummy_xet["auth_url"]
+                _first_repo_id = dummy_repo
+        elif filename:
+            # 单文件模式：直接检测目标文件
+            early_info = detect_xet_file(repo_id, repo_type, filename, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
+            if early_info:
+                _first_auth_url = early_info["auth_url"]
+        # 批量模式：先列出文件，检测第一个匹配项（结果缓存供后续复用）
+        elif args.include:
+            _cached_all_files = list_hf_files(repo_id, repo_type, hf_token, session, hf_endpoint=hf_endpoint)
+            if _cached_all_files:
+                _cached_matched_files = match_files(_cached_all_files, args.include)
+                if _cached_matched_files:
+                    first_match = _cached_matched_files[0]
+                    early_info = detect_xet_file(repo_id, repo_type, first_match, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
+                    if early_info:
+                        _first_auth_url = early_info["auth_url"]
+                        _cached_first_xet_info = early_info  # 缓存完整信息
+
+        # =====================================================================
+        # 5. 提前获取 CAS Token（在 HOST 优选之前！）
+        # =====================================================================
+        token_info = None
+        if _first_auth_url:
+            from xet.network.auth import XetAuth
+            auth = XetAuth(hf_token=hf_token, session=session)
+            try:
+                token_info = auth.get_token(repo_id=_first_repo_id, repo_type=_first_repo_type, auth_url=_first_auth_url)
+                logger.info(f"提前获取到 CAS token, endpoint={token_info.endpoint}")
+            except Exception as e:
+                logger.warning(f"提前获取 CAS token 失败（将在下载前重试）: {e}")
+
+        # =====================================================================
+        # 6. HOST 优选（现在有 token 了，可以进行真实带宽测速！）
+        # =====================================================================
+        _early_access_token = token_info.access_token if token_info else None
+
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")
-
-            # 如果使用自定义 HF_ENDPOINT，先检测其 XET 支持
-            if hf_endpoint != "https://huggingface.co":
-                from xet.network.host_optimizer import check_hf_endpoint_xet_support
-
-                print(f"   检测 {hf_endpoint} 的 XET 支持...")
-                check_result = check_hf_endpoint_xet_support(
-                    endpoint=hf_endpoint,
-                    proxy=proxy or "",
-                    timeout=10,
-                )
-
-                if check_result["reachable"]:
-                    if check_result["supports_xet"]:
-                        print(f"   ✅ {hf_endpoint} 支持 XET 协议（响应时间: {check_result['response_time']:.2f}s）")
-                        if check_result["xet_headers"].get("x-linked-etag"):
-                            etag = check_result["xet_headers"]["x-linked-etag"][:16]
-                            print(f"      x-linked-etag: {etag}...")
-                    else:
-                        if check_result["has_xet_headers"]:
-                            print(f"   ⚠️  {hf_endpoint} 有 XET 头但缺少 Link 头")
-                        else:
-                            print(f"   ⚠️  {hf_endpoint} 不支持 XET 协议，可能无法下载")
-                else:
-                    print(f"   ❌ {hf_endpoint} 不可达: {check_result.get('error', 'Unknown')}")
-                    print(f"      建议检查网络连接或尝试添加 --proxy 参数")
 
         session, host_optimizer = create_optimized_session(
             proxy=proxy or "",
             optimize_hosts=optimize_hosts,
             refresh_hosts=refresh_hosts,
             dns_servers=dns_servers,
+            access_token=_early_access_token,  # ← 关键：传入 token 用于真实测速
         )
 
         if optimize_hosts and host_optimizer:
@@ -1006,10 +1068,15 @@ def download_command(args):
                     # 显示选中的 IP
                     if info.get("speed", 0) > 0:
                         from xet.network.host_optimizer import _format_speed
-                        speed_str = _format_speed(info["speed"])
+                        speed_val = info.get("speed", 0)
+                        # speed=1.0 是连通性哨兵值（非真实测速），显示为"连通"
+                        if speed_val == 1.0:
+                            speed_str = "连通"
+                        else:
+                            speed_str = _format_speed(speed_val)
                         domain_title = f"{domain} ({category_label})" if category_label else domain
                         print(f"   {domain_title}")
-                        print(f"     ✅ {info['ip']}  {mode}  RTT={rtt_ms:.0f}ms  带宽={speed_str}")
+                        print(f"     ✅ {info['ip']}  {mode}  RTT={rtt_ms:.0f}ms  {speed_str}")
                     else:
                         domain_title = f"{domain} ({category_label})" if category_label else domain
                         print(f"   {domain_title}")
@@ -1035,9 +1102,13 @@ def download_command(args):
                             if status == "ok" and cert_valid:
                                 # 证书有效但未选中
                                 from xet.network.host_optimizer import _format_speed
-                                speed_str = _format_speed(speed) if speed > 0 else "0"
+                                # speed=1.0 是连通性哨兵值，显示为"连通"
+                                if speed == 1.0:
+                                    speed_str = "连通"
+                                else:
+                                    speed_str = _format_speed(speed) if speed > 0 else "0"
                                 cert_info = f"  证书={cert_issuer}" if cert_issuer else ""
-                                print(f"       {ip}  {mode}  RTT={rtt*1000:.0f}ms  带宽={speed_str}{cert_info}")
+                                print(f"       {ip}  {mode}  RTT={rtt*1000:.0f}ms  {speed_str}{cert_info}")
                             elif status == "cert_invalid":
                                 # 证书无效
                                 cert_error = ip_info.get("cert_error", "未知")
@@ -1120,14 +1191,21 @@ def download_command(args):
             print(f"📦 仓库: {repo_label}")
             print(f"   匹配: {args.include}")
 
-            # 列出所有文件
-            all_files = list_hf_files(repo_id, repo_type, hf_token, session, hf_endpoint=hf_endpoint)
+            # 复用提前解析的文件列表（避免重复 API 调用）
+            if _cached_all_files is not None:
+                all_files = _cached_all_files
+                matched_files = _cached_matched_files
+            else:
+                all_files = list_hf_files(repo_id, repo_type, hf_token, session, hf_endpoint=hf_endpoint)
+                if all_files:
+                    matched_files = match_files(all_files, args.include)
+                else:
+                    matched_files = []
+
             if not all_files:
                 print(f"✗ 无法列出仓库文件", file=sys.stderr)
                 return 1
 
-            # 匹配文件
-            matched_files = match_files(all_files, args.include)
             if not matched_files:
                 print(f"✗ 没有匹配的文件", file=sys.stderr)
                 print(f"\n📋 仓库中的所有文件 ({len(all_files)} 个):", file=sys.stderr)
@@ -1139,9 +1217,13 @@ def download_command(args):
 
             print(f"   找到 {len(matched_files)} 个匹配文件")
 
-            # 检测每个文件是否为 XET
-            for fname in matched_files:
-                xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
+            # 检测每个文件是否为 XET（第一个文件复用缓存结果）
+            for idx, fname in enumerate(matched_files):
+                if idx == 0 and _cached_first_xet_info:
+                    # 复用提前检测的完整结果
+                    xet_info = _cached_first_xet_info
+                else:
+                    xet_info = detect_xet_file(repo_id, repo_type, fname, hf_token, session, revision=args.revision, hf_endpoint=hf_endpoint)
                 if xet_info:
                     files_to_download.append((repo_id, fname, xet_info, repo_type))
                 else:
@@ -1153,15 +1235,20 @@ def download_command(args):
 
         print(f"\n准备下载 {len(files_to_download)} 个文件")
 
-        # 6. 获取第一个文件的 auth_url 来获取 CAS token
+        # 7. 确保 CAS Token 可用（提前获取失败时回退到这里）
         first_repo, first_file, first_info, first_repo_type = files_to_download[0]
         auth_url = first_info["auth_url"]
 
-        from xet.network.auth import XetAuth
-        auth = XetAuth(hf_token=hf_token, session=session)
-        token_info = auth.get_token(repo_id=first_repo, repo_type=first_repo_type, auth_url=auth_url)
-
-        logger.info(f"获取到 CAS token, endpoint={token_info.endpoint}")
+        if not token_info:
+            # 提前获取失败或未触发，在此处重试
+            from xet.network.auth import XetAuth
+            auth = XetAuth(hf_token=hf_token, session=session)
+            token_info = auth.get_token(repo_id=first_repo, repo_type=first_repo_type, auth_url=auth_url)
+            logger.info(f"获取到 CAS token, endpoint={token_info.endpoint}")
+        else:
+            logger.info(f"复用提前获取的 CAS token, endpoint={token_info.endpoint}")
+            # 确保 auth 对象可用（CASClient 需要它）
+            auth = XetAuth(hf_token=hf_token, session=session)
 
         # 7. 初始化自适应并发控制器（如果启用）
         acc = None
@@ -1196,6 +1283,10 @@ def download_command(args):
         retry_coordinator = RetryCoordinator(all_retry_grace=120.0)
         logger.info("[RetryCoordinator] 全局重试协调器已启用，宽限期 120 秒")
 
+        # 7.6. 初始化 URL 刷新协调器（403 URL 过期时自动刷新签名）
+        url_coordinator = URLRefreshCoordinator(max_failures=3, cooldown=10.0)
+        logger.info("[URLRefreshCoordinator] URL 刷新协调器已启用")
+
         # 8. 初始化 CAS 客户端
         cas_client = CASClient(
             endpoint=token_info.endpoint,
@@ -1205,6 +1296,7 @@ def download_command(args):
             repo_id=first_repo,
             acc=acc,
             retry_coordinator=retry_coordinator,
+            url_coordinator=url_coordinator,
         )
 
         # 8.5. 初始化 Xorb 磁盘缓存
@@ -1289,33 +1381,18 @@ def download_command(args):
                     success_count += 1
             except KeyboardInterrupt:
                 interrupted = True
-                print(f"\n⚠ 用户中断")
+                print(f"\n  ↩ 用户中断")
                 break
 
-        # 10. 汇总 - 使用美化输出
-        from rich.console import Console
-        from rich.panel import Panel
-        from rich.table import Table
-
-        console = Console()
-
-        # 创建汇总表格
-        table = Table(show_header=False, box=None)
-        table.add_column("状态", style="bold")
-        table.add_column("数量", justify="right")
-
-        table.add_row("✓ 成功", f"[green]{success_count}[/green]")
-
-        if success_count < len(files_to_download):
-            failed_count = len(files_to_download) - success_count
-            table.add_row("✗ 失败", f"[red]{failed_count}[/red]")
-            table.add_row("", "")
-            table.add_row("💡 提示", "[yellow]已保存断点，重新运行相同命令即可续传[/yellow]")
-            table.add_row("", "")
-
-        table.add_row("📦 总计", f"[cyan]{len(files_to_download)}[/cyan]")
-
-        console.print(Panel(table, title="[bold cyan]批量下载汇总[/bold cyan]", border_style="cyan"))
+        # 10. 汇总 — 紧凑单行输出
+        total = len(files_to_download)
+        if success_count == total:
+            print(f"\n  ✅ 全部完成: {success_count}/{total} 个文件")
+        elif interrupted:
+            print(f"\n  ⚠ 已中断: {success_count}/{total} 个文件（断点已保存）")
+        else:
+            failed = total - success_count
+            print(f"\n  ⚠ 部分完成: {success_count}/{total} (失败 {failed}，可续传)")
 
         # 11. 清理缓存（如果不保留）
         if xorb_cache:
@@ -1324,7 +1401,7 @@ def download_command(args):
         return 0 if success_count == len(files_to_download) else 1
 
     except KeyboardInterrupt:
-        print("\n⚠ 用户中断，进度已保存")
+        print("\n  ↩ 用户中断，进度已保存")
         return 130
 
     except ValueError as e:

@@ -30,6 +30,7 @@ from xet.pipeline.file_reconstructor import FileReconstructor
 from xet.pipeline.types import ReconstructionCheckpoint
 from xet.pipeline.chunk_assembler import ChunkAssembler
 from xet.pipeline.chunk_cache_adapter import ChunkCacheAdapter
+from xet.pipeline.checkpoint_manager import CheckpointManager
 from xet.pipeline.progress_tracker import ProgressTracker
 
 logger = logging.getLogger(__name__)
@@ -394,7 +395,13 @@ class SegmentedReconstructor:
             return self.output_path
 
         except KeyboardInterrupt:
-            logger.warning("[SegmentedReconstructor] 用户中断")
+            completed = len(self.completed_segments)
+            done_bytes = sum(s.get('size', 0) for s in self.completed_segments)
+            total_seg = len(self.segments)
+            logger.info(
+                f"[SegmentedReconstructor] 用户中断，断点已保存: "
+                f"{completed}/{total_seg}段, {done_bytes}/{self.file_size}字节"
+            )
             raise
 
         except Exception as e:
@@ -406,7 +413,13 @@ class SegmentedReconstructor:
         for seg in self.segments:
             # 检查中断信号
             if self._stop_event.is_set():
-                logger.warning("[SegmentedReconstructor] 用户中断")
+                completed = len(self.completed_segments)
+                done_bytes = sum(s.get('size', 0) for s in self.completed_segments)
+                total_seg = len(self.segments)
+                logger.info(
+                    f"[SegmentedReconstructor] 用户中断，断点已保存: "
+                    f"{completed}/{total_seg}段, {done_bytes}/{self.file_size}字节"
+                )
                 raise KeyboardInterrupt()
 
             # 跳过已完成的段
@@ -579,7 +592,10 @@ class SegmentedReconstructor:
             seg_temp: 临时文件路径
         """
         progress_tracker = ProgressTracker(callback=self.progress_callback)
-        progress_tracker.set_total_bytes(seg.size)
+        # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
+        progress_tracker.set_total_bytes(self.file_size)
+        # 已完成段的偏移量作为初始已组装字节数
+        progress_tracker.increment_assembled(seg.offset)
 
         assembler = ChunkAssembler(
             temp_dir=self.temp_dir,
@@ -593,6 +609,10 @@ class SegmentedReconstructor:
             xorb_cache=self.xorb_cache,
         )
 
+        # 创建 term 级 checkpoint manager（支持段内断点续传）
+        ckpt_path = self.temp_dir / f"seg_{seg.index}.term_ckpt.json"
+        checkpoint_manager = CheckpointManager(ckpt_path)
+
         assembler.assemble_file_with_prefetch(
             recon=recon,
             cas_client=self.cas_client,
@@ -601,6 +621,7 @@ class SegmentedReconstructor:
             progress_tracker=progress_tracker,
             cache_adapter=cache_adapter,
             stop_event=self._stop_event,
+            checkpoint_manager=checkpoint_manager,
         )
 
     def _process_segment(self, seg: SegmentInfo) -> None:

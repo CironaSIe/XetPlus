@@ -214,6 +214,7 @@ class HostOptimizer:
         proxy: str = "",
         cache_dir: Optional[str] = None,
         dns_servers: Optional[List[str]] = None,
+        access_token: Optional[str] = None,
     ):
         """初始化 HOST 优选器。
 
@@ -221,8 +222,10 @@ class HostOptimizer:
             proxy: 代理 URL
             cache_dir: 缓存目录（默认 ~/.xet/cache/）
             dns_servers: 自定义 DoH 服务器列表
+            access_token: CAS 认证 token（用于真实带宽测速，无 token 时仅测连通性）
         """
         self.proxy = proxy
+        self.access_token = access_token
         if cache_dir:
             cache_path = Path(cache_dir)
             self.cache_path = cache_path / "host_optimize.json"
@@ -246,6 +249,16 @@ class HostOptimizer:
 
         # DoH 缓存数据
         self._doh_ips: Dict[str, List[str]] = {}
+
+    def set_access_token(self, token: Optional[str]) -> None:
+        """设置 CAS 认证 token（可在优选后调用，用于后续重新测速）。
+
+        Args:
+            token: CAS access_token，传 None 表示清除
+        """
+        self.access_token = token
+        if token:
+            logger.debug("[HostOpt] 已设置 CAS token，可用于真实带宽测速")
 
     def optimize(
         self,
@@ -721,8 +734,9 @@ class HostOptimizer:
 
         注意：
         - 对于 API/DATA 域名，使用 GET / 测速
-        - 对于 CAS 域名，返回 404/403 视为连接成功（仅验证联通性）
-        - 真实的 CAS 速度测试需要有效的认证 token
+        - 对于 CAS 域名，有 token 时使用 Bearer 认证测速，无 token 时仅验证连通性
+        - 有 token 但仍返回 4xx：说明该 IP 的 CDN 节点可能有问题（返回 None）
+        - 无 token 时返回 1.0 表示"连接可用但未真实测速"
 
         Returns:
             下载速度 (bytes/s)，失败返回 None
@@ -739,19 +753,28 @@ class HostOptimizer:
         try:
             start = time.time()
 
+            # 构造认证头（有 token 时对 CAS/DATA 域名启用真实测速）
+            category = get_domain_category(domain)
+            auth_header = None
+            if self.access_token and category in ("cas", "data"):
+                auth_header = f"Bearer {self.access_token}"
+
             if use_proxy and self.proxy:
                 # 代理模式
                 session = create_robust_session(proxy=self.proxy, retries=0)
                 session.verify = False  # 不验证证书，我们稍后会手动验证
                 url = f"https://{domain}/"
+                headers = {
+                    "Range": f"bytes=0-{RANGE_MAX}",
+                    "User-Agent": "xet-dl/host-optimize",
+                }
+                if auth_header:
+                    headers["Authorization"] = auth_header
                 resp = session.get(
                     url,
                     timeout=(5, 10),
                     stream=True,
-                    headers={
-                        "Range": f"bytes=0-{RANGE_MAX}",
-                        "User-Agent": "xet-dl/host-optimize",
-                    },
+                    headers=headers,
                 )
                 needs_close = True
             else:
@@ -772,31 +795,54 @@ class HostOptimizer:
                     server_hostname=domain
                 )
 
-                conn.request(
-                    "GET", "/",
-                    headers={
-                        "Host": domain,
-                        "User-Agent": "xet-dl/host-optimize",
-                        "Range": f"bytes=0-{RANGE_MAX}",
-                    },
-                )
+                headers = {
+                    "Host": domain,
+                    "User-Agent": "xet-dl/host-optimize",
+                    "Range": f"bytes=0-{RANGE_MAX}",
+                }
+                if auth_header:
+                    headers["Authorization"] = auth_header
+                conn.request("GET", "/", headers=headers)
                 resp = conn.getresponse()
 
             # 检查 HTTP 状态码
             status_code = getattr(resp, "status_code", None) or getattr(resp, "status", None)
 
-            # 4xx/5xx 但 TLS 连接成功：对于 CAS 域名这是预期的
-            # 返回一个极小的速度值表示"连接可用但未真实测速"
+            # 4xx/5xx 处理
             if status_code and status_code >= 400:
-                category = get_domain_category(domain)
                 if category == "cas":
-                    logger.debug(
-                        f"[HostOpt] {domain} 返回 {status_code}，TLS 连接成功（CAS 需要 token 才能真实测速）"
-                    )
+                    if self.access_token:
+                        # 有 token 仍返回 4xx：CDN 节点问题或端点不支持根路径测速
+                        logger.debug(
+                            f"[HostOpt] Transfer 测速 {ip} 返回 {status_code} "
+                            f"(已携带 token，该节点可能不支持 / 路径测速)"
+                        )
+                        # 有 token 时返回 None（不是真连通性问题，是无法测速）
+                        return None
+                    else:
+                        logger.debug(
+                            f"[HostOpt] {domain} 返回 {status_code}，TLS 连接成功"
+                            "（CAS 需要 token 才能真实测速）"
+                        )
+                        # 无 token：返回 1B/s 表示连接可用
+                        return 1.0
+                elif category == "data":
+                    if self.access_token:
+                        # DATA 域名的 transfer 端点需要 presigned URL，普通 Bearer 不够
+                        logger.debug(
+                            f"[HostOpt] Transfer 测速 {ip} 返回 {status_code} "
+                            f"(transfer 需要_presigned URL，非 Bearer 认证)"
+                        )
+                        return None
+                    else:
+                        logger.debug(
+                            f"[HostOpt] Transfer 测速 {ip} 返回 {status_code}，但 TLS 连接成功"
+                        )
+                        return 1.0
                 else:
+                    # API 域名
                     logger.debug(f"[HostOpt] Transfer 测速 {ip} 返回 {status_code}，但 TLS 连接成功")
-                # 返回 1 byte/s 表示连接可用但无法测速
-                return 1.0
+                    return 1.0
 
             # 读数据测速
             total_bytes = 0
@@ -1347,6 +1393,7 @@ def create_optimized_session(
     cache_dir: Optional[str] = None,
     refresh_hosts: bool = False,
     dns_servers: Optional[List[str]] = None,
+    access_token: Optional[str] = None,
 ) -> Tuple[requests.Session, Optional[HostOptimizer]]:
     """一步创建带 HOST 优选的 Session。
 
@@ -1358,6 +1405,7 @@ def create_optimized_session(
         cache_dir: 缓存目录
         refresh_hosts: 强制刷新 HOST 优选缓存
         dns_servers: 自定义 DoH 服务器列表
+        access_token: CAS 认证 token（用于真实带宽测速）
 
     Returns:
         (session, host_optimizer) 元组
@@ -1385,6 +1433,7 @@ def create_optimized_session(
             proxy=proxy,
             cache_dir=cache_dir,
             dns_servers=dns_servers,
+            access_token=access_token,
         )
         host_optimizer.optimize(force_refresh=refresh_hosts)
         logger.info("[Session] HOST 优选已启用")
