@@ -1039,8 +1039,6 @@ def download_command(args):
         _early_cas_endpoint = token_info.endpoint if token_info else None
         if _cached_first_xet_info:
             _early_file_hash = _cached_first_xet_info.get("xet_hash")
-        elif 'early_info' in dir() and early_info:
-            _early_file_hash = early_info.get("xet_hash")
 
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")

@@ -232,6 +232,7 @@ class HostOptimizer:
         self.access_token = access_token
         self.file_hash = file_hash
         self.cas_endpoint = cas_endpoint
+        self._quiet = False  # 控制实时输出（由调用方设置）
         if cache_dir:
             cache_path = Path(cache_dir)
             self.cache_path = cache_path / "host_optimize.json"
@@ -260,11 +261,31 @@ class HostOptimizer:
         """设置 CAS 认证 token（可在优选后调用，用于后续重新测速）。
 
         Args:
-            token: CAS access_token，传 None 表示清除
+            token: CAS access_token（JWT 格式），传 None 表示清除
         """
         self.access_token = token
         if token:
             logger.debug("[HostOpt] 已设置 CAS token，可用于真实带宽测速")
+
+    def set_quiet(self, quiet: bool = True) -> None:
+        """设置安静模式（抑制实时测速输出）。
+
+        Args:
+            quiet: True 表示不输出实时进度
+        """
+        self._quiet = quiet
+
+    def _has_valid_cas_jwt(self) -> bool:
+        """检查 access_token 是否为有效的 CAS JWT。
+
+        CAS JWT 特征：包含至少两个 '.' (base64url.header.payload.signature)
+        区别于 HF_TOKEN（通常不含 '.' 或格式不同）。
+        只有真正的 CAS JWT 才能通过 CAS API 认证。
+        """
+        if not self.access_token:
+            return False
+        # JWT 格式: xxx.yyy.zzz（三段 base64url 用点分隔）
+        return self.access_token.count(".") >= 2
 
     def optimize(
         self,
@@ -707,11 +728,18 @@ class HostOptimizer:
         _total_tests = 0
         _done_count = 0
 
+        # 实时输出函数（尊重 quiet 模式）
+        def _print(msg: str):
+            if not self._quiet:
+                print(msg, flush=True)
+
         # 统计总测试数（用于进度显示）
+        # CAS 域名：仅在有有效 CAS JWT 时才进行 API 延迟测速，否则用 RTT+证书
+        _can_do_cas_api = self.file_hash and self._has_valid_cas_jwt()
         cas_domains = {
             d: cands for d, cands in results.items()
             if get_domain_category(d) == "cas"
-            and self.file_hash and self.access_token
+            and _can_do_cas_api
         }
         non_cas_domains = {
             d: cands for d, cands in results.items() if d not in cas_domains
@@ -766,20 +794,20 @@ class HostOptimizer:
                                 if data_url and not sample_data_url:
                                     sample_data_url = data_url
                                 # 实时输出：CAS 延迟成功
-                                print(
+                                _print(
                                     f"   [{_done_count}/{_total_tests}] "
                                     f"CAS {ip} ({mode_str}) 延迟={latency_ms:.0f}ms",
                                     flush=True,
                                 )
                             else:
                                 # 实时输出：CAS 失败（404 等）
-                                print(
+                                _print(
                                     f"   [{_done_count}/{_total_tests}] "
                                     f"CAS {ip} ({mode_str}) 无响应",
                                     flush=True,
                                 )
                         except Exception as e:
-                            print(
+                            _print(
                                 f"   [{_done_count}/{_total_tests}] "
                                 f"CAS {ip} ({mode_str}) 异常: {type(e).__name__}",
                                 flush=True,
@@ -793,9 +821,20 @@ class HostOptimizer:
                     logger.debug("[HostOpt] CAS 测速超时，使用已完成结果")
 
             if not transfer_results.get(_primary_cas_domain):
-                logger.debug(
-                    f"[HostOpt] 主 CAS 域名测速无效，CAS 将用 RTT 选 IP"
-                )
+                if _can_do_cas_api:
+                    logger.debug(
+                        f"[HostOpt] 主 CAS 域名 {_primary_cas_domain} API 测速无效"
+                        f"(文件可能未在 CAS 注册或 V2 不支持)，CAS 将用 RTT 选 IP"
+                    )
+                else:
+                    reason = []
+                    if not self.file_hash:
+                        reason.append("无 file_hash")
+                    if not self._has_valid_cas_jwt():
+                        reason.append("token 非 CAS JWT 或为空")
+                    logger.debug(
+                        f"[HostOpt] 跳过 CAS API 延迟测速 ({', '.join(reason)})，CAS 将用 RTT+证书 选 IP"
+                    )
 
         # ---- 第二阶段：DATA + API 域名测速 ----
         if non_cas_domains and time.time() < _overall_deadline:
@@ -848,19 +887,19 @@ class HostOptimizer:
                                 )
                                 # 实时输出：成功
                                 if category == "data":
-                                    print(
+                                    _print(
                                         f"   [{_done_count}/{_total_tests}] "
                                         f"DATA {ip} ({mode_str}) {_format_speed(speed)}",
                                         flush=True,
                                     )
                                 elif category == "api":
-                                    print(
+                                    _print(
                                         f"   [{_done_count}/{_total_tests}] "
                                         f"API {ip} ({mode_str}) {_format_speed(speed)}",
                                         flush=True,
                                     )
                                 else:
-                                    print(
+                                    _print(
                                         f"   [{_done_count}/{_total_tests}] "
                                         f"{domain.split('.')[0]} {ip} ({mode_str}) {_format_speed(speed)}",
                                         flush=True,
@@ -869,13 +908,13 @@ class HostOptimizer:
                                 # 失败
                                 short_name = domain.split(".")[0]
                                 cat_label = {"api": "API", "data": "DATA"}.get(category, short_name)
-                                print(
+                                _print(
                                     f"   [{_done_count}/{_total_tests}] "
                                     f"{cat_label} {ip} ({mode_str}) 无响应",
                                     flush=True,
                                 )
                         except Exception as e:
-                            print(
+                            _print(
                                 f"   [{_done_count}/{_total_tests}] "
                                 f"{ip} ({mode_str}) 异常: {type(e).__name__}",
                                 flush=True,
@@ -1294,7 +1333,7 @@ class HostOptimizer:
             if needs_close and session is not None:
                 session.close()
 
-    def _get_certificate_fingerprint(
+    def _get_certificate_finger_print(
         self, ip: str, domain: str, use_proxy: bool
     ) -> Optional[Tuple[str, str, bool]]:
         """获取证书指纹和颁发者信息。
@@ -1413,7 +1452,7 @@ class HostOptimizer:
         if not self.proxy:
             # 没有代理时，无法验证（无基准）
             # 只检查直连证书的有效性
-            result = self._get_certificate_fingerprint(ip, domain, False)
+            result = self._get_certificate_finger_print(ip, domain, False)
             if result:
                 fingerprint, issuer, cert_valid = result
                 if cert_valid and issuer in TRUSTED_ISSUERS:
@@ -1426,7 +1465,7 @@ class HostOptimizer:
                 return (False, None, "无法获取证书")
 
         # 有代理：获取代理连接的证书指纹作为基准
-        proxy_result = self._get_certificate_fingerprint(ip, domain, True)
+        proxy_result = self._get_certificate_finger_print(ip, domain, True)
         if not proxy_result:
             return (False, None, "代理连接失败")
 
@@ -1441,7 +1480,7 @@ class HostOptimizer:
             # 因为代理本身已经验证了证书的有效性
 
         # 尝试获取直连证书指纹（用于比较）
-        direct_result = self._get_certificate_fingerprint(ip, domain, False)
+        direct_result = self._get_certificate_finger_print(ip, domain, False)
         if not direct_result:
             # 直连失败（通常是 GFW 阻断），但代理可用
             # 这是预期行为，代理连接的证书已验证通过
