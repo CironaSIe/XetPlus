@@ -702,7 +702,9 @@ class HostOptimizer:
         # 用于从 CAS 响应中提取的 presigned URL（供 DATA 域名测速用）
         sample_data_url: Optional[str] = None
 
-        # ---- 第一阶段：CAS 域名测速（获取延迟 + presigned URL）----
+        # ---- 第一阶段：CAS 域名测速（仅测主域名，获取延迟 + presigned URL）----
+        # 只测试 cas-server.xethub.hf.co（主CAS域名），避免对4个CAS域名的所有IP逐一测速
+        # 如果主域名失败（404=文件未注册/V2不支持），立即降级到 TCP RTT
         cas_domains = {
             d: cands for d, cands in results.items()
             if get_domain_category(d) == "cas"
@@ -712,10 +714,14 @@ class HostOptimizer:
             d: cands for d, cands in results.items() if d not in cas_domains
         }
 
-        if cas_domains:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        # 仅保留主 CAS 域名用于 API 测试（其他 CAS 域名用 TCP RTT 足矣）
+        _primary_cas_domain = "cas-server.xethub.hf.co"
+        primary_cas = {d: cands for d, cands in cas_domains.items() if d == _primary_cas_domain}
+
+        if primary_cas:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 cas_futures: Dict = {}
-                for domain, candidates in cas_domains.items():
+                for domain, candidates in primary_cas.items():
                     if self.proxy:
                         candidates.sort(key=lambda x: (x[1], x[2]))
                     else:
@@ -728,26 +734,38 @@ class HostOptimizer:
                             )
                         ] = (domain, ip, use_proxy, rtt)
 
-                for future in concurrent.futures.as_completed(
-                    cas_futures, timeout=30
-                ):
-                    domain, ip, use_proxy, rtt = cas_futures[future]
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            latency_ms, data_url = result
-                            # latency_ms 作为 speed 字段存储（CAS：越低越好）
-                            transfer_results.setdefault(domain, []).append(
-                                (ip, use_proxy, rtt, latency_ms)
-                            )
-                            # 保存第一个有效的 presigned URL
-                            if data_url and not sample_data_url:
-                                sample_data_url = data_url
-                                logger.debug(
-                                    f"[HostOpt] 已获取 presigned URL 样本用于 DATA 测速"
+                # 缩短超时：CAS 测速只关心 TTFB，不需要等太久
+                try:
+                    for future in concurrent.futures.as_completed(
+                        cas_futures, timeout=20
+                    ):
+                        domain, ip, use_proxy, rtt = cas_futures[future]
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                latency_ms, data_url = result
+                                # latency_ms 作为 speed 字段存储（CAS：越低越好）
+                                transfer_results.setdefault(domain, []).append(
+                                    (ip, use_proxy, rtt, latency_ms)
                                 )
-                    except Exception as e:
-                        logger.debug(f"[HostOpt] CAS API 测速异常 {ip}: {e}")
+                                # 保存第一个有效的 presigned URL
+                                if data_url and not sample_data_url:
+                                    sample_data_url = data_url
+                                    logger.debug(
+                                        f"[HostOpt] 已获取 presigned URL 样本用于 DATA 测速"
+                                    )
+                        except Exception as e:
+                            logger.debug(f"[HostOpt] CAS API 测速异常 {ip}: {e}")
+                except concurrent.futures.TimeoutError:
+                    logger.debug("[HostOpt] CAS API 测速部分超时，使用已完成结果")
+
+            # 主域名无有效结果：标记其余 CAS 域名也跳过 API 测试
+            if not transfer_results.get(_primary_cas_domain):
+                logger.debug(
+                    f"[HostOpt] 主 CAS 域名 {_primary_cas_domain} 测速无效"
+                    f"(文件可能未在 CAS 注册或 V2 不支持)，"
+                    f"CAS 域名将使用 TCP RTT 选 IP"
+                )
 
         # ---- 第二阶段：DATA + API 域名测速 ----
         if non_cas_domains:
@@ -789,18 +807,21 @@ class HostOptimizer:
                                 )
                             ] = (domain, ip, use_proxy, rtt)
 
-                for future in concurrent.futures.as_completed(
-                    transfer_futures, timeout=30
-                ):
-                    domain, ip, use_proxy, rtt = transfer_futures[future]
-                    try:
-                        speed = future.result()
-                        if speed is not None:
-                            transfer_results.setdefault(domain, []).append(
-                                (ip, use_proxy, rtt, speed)
-                            )
-                    except Exception as e:
-                        logger.debug(f"[HostOpt] Transfer 测速异常 {ip}: {e}")
+                try:
+                    for future in concurrent.futures.as_completed(
+                        transfer_futures, timeout=30
+                    ):
+                        domain, ip, use_proxy, rtt = transfer_futures[future]
+                        try:
+                            speed = future.result()
+                            if speed is not None:
+                                transfer_results.setdefault(domain, []).append(
+                                    (ip, use_proxy, rtt, speed)
+                                )
+                        except Exception as e:
+                            logger.debug(f"[HostOpt] Transfer 测速异常 {ip}: {e}")
+                except concurrent.futures.TimeoutError:
+                    logger.debug("[HostOpt] Transfer 测速部分超时，使用已完成结果")
 
         return transfer_results
 
@@ -1024,7 +1045,7 @@ class HostOptimizer:
                 session = create_robust_session(proxy=self.proxy, retries=0)
                 session.verify = False
                 url = f"https://{domain}{cas_path}"
-                resp = session.get(url, headers=headers, timeout=(5, 15))
+                resp = session.get(url, headers=headers, timeout=(5, 8))
                 needs_close = True
             else:
                 import http.client as _http_client
@@ -1032,7 +1053,7 @@ class HostOptimizer:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_REQUIRED
 
-                conn = _http_client.HTTPConnection(ip, 443, timeout=10)
+                conn = _http_client.HTTPConnection(ip, 443, timeout=6)
                 conn.connect()
                 conn.sock = ctx.wrap_socket(conn.sock, server_hostname=domain)
                 conn.request("GET", cas_path, headers=headers)
