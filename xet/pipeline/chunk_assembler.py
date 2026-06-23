@@ -250,7 +250,7 @@ class ChunkAssembler(PrefetchHelpers):
                                 break
 
                         if xorb_to_remove:
-                            removed_size = len(current_batch[xorb_to_remove].data)
+                            removed_size = current_batch[xorb_to_remove].memory_footprint()
                             del current_batch[xorb_to_remove]
                             current_memory -= removed_size
                             logger.debug(
@@ -267,11 +267,11 @@ class ChunkAssembler(PrefetchHelpers):
                         term.hash, compressed_data, recon
                     )
                     current_batch[term.hash] = xorb_data
-                    current_memory += len(xorb_data.data)
+                    current_memory += xorb_data.memory_footprint()
 
                     logger.debug(
                         f"[ChunkAssembler] 加载 xorb {term.hash[:16]}... "
-                        f"({len(xorb_data.data) / 1024 / 1024:.1f}MB), "
+                        f"({xorb_data.memory_footprint() / 1024 / 1024:.1f}MB), "
                         f"当前内存: {current_memory / 1024 / 1024:.1f}MB, "
                         f"缓存: {len(current_batch)} 个 xorb"
                     )
@@ -307,17 +307,17 @@ class ChunkAssembler(PrefetchHelpers):
                             break
                     if not found:
                         # end_chunk 超过所有已知 chunk，使用数据末尾
-                        end_byte = len(xorb_data.data)
+                        end_byte = xorb_data.data_size()
                 else:
                     end_byte = chunk_offsets_dict[end_chunk]
 
-                if end_byte > len(xorb_data.data):
+                if end_byte > xorb_data.data_size():
                     raise ValueError(
                         f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
-                        f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                        f"start={start_byte}, end={end_byte}, data_len={xorb_data.data_size()}"
                     )
 
-                segment = xorb_data.data[start_byte:end_byte]
+                segment = xorb_data.extract_range(start_byte, end_byte)
 
                 # 第一个 term 需要跳过 offset_into_first_range
                 if term_idx == 0 and recon.offset_into_first_range > 0:
@@ -357,8 +357,8 @@ class ChunkAssembler(PrefetchHelpers):
         xorb_hash: str,
         merged_data: bytes,
         recon: QueryReconstructionResponse,
-    ) -> "XorbBlockData":
-        """解压单个 xorb（用于分批处理）。
+    ):
+        """解压单个 xorb（返回 StreamingXorbAccessor，不一次性全量解压）。
 
         Args:
             xorb_hash: xorb 哈希值
@@ -366,14 +366,16 @@ class ChunkAssembler(PrefetchHelpers):
             recon: Reconstruction 响应（包含 fetch_info）
 
         Returns:
-            XorbBlockData 对象
+            StreamingXorbAccessor 对象（按需解压）
 
         Raises:
-            ImportError: lz4 或 blake3 未安装
+            ImportError: lz4 或 blake3 库未安装
             RuntimeError: 解压失败
         """
         try:
-            from xet.storage.xorb_deserializer import XorbDeserializer, XorbBlockData
+            from xet.storage.xorb_deserializer import (
+                XorbDeserializer, StreamingXorbAccessor,
+            )
         except ImportError as e:
             raise ImportError(
                 "[ChunkAssembler] 需要 lz4 和 blake3 库: pip install lz4 blake3"
@@ -390,43 +392,52 @@ class ChunkAssembler(PrefetchHelpers):
             key=lambda fi: fi.chunk_range.start
         )
 
-        # 分别反序列化每个 segment 并合并
-        all_chunk_offsets = []
-        all_data = bytearray()
-        data_offset = 0
+        # 根据段数量选择构造策略
+        if len(fetch_infos) == 1:
+            # 单段：扫描 header 获取索引，但保留全局 chunk ID 映射
+            fi = fetch_infos[0]
+            seg_data = merged_data  # 单段时 merged_data 就是整个 segment
+            seg_xorb = XorbDeserializer.deserialize(seg_data)
 
-        for seg_idx, fi in enumerate(fetch_infos):
-            # 提取这个 segment 的数据
-            segment_byte_length = fi.url_range.length()
-            segment_data = merged_data[data_offset:data_offset + segment_byte_length]
-            data_offset += segment_byte_length
+            base_cid = fi.chunk_range.start
+            chunk_offsets = [
+                (base_cid + lcidx, lboff)
+                for lcidx, lboff in seg_xorb.chunk_offsets
+            ]
+            return StreamingXorbAccessor(
+                raw_bytes=merged_data,
+                chunk_offsets=chunk_offsets,
+            )
+        else:
+            # 多段：需要先全量解压以获取正确的全局 offsets
+            # （多段合并场景下无法避免一次全量解压来建立全局映射）
+            # 但这只影响 offset 映射，数据仍按需解压
+            all_data_rebased = bytearray()
+            rebased_offsets = []
+            running_offset = 0
 
-            # 反序列化这个 segment
-            try:
-                segment_xorb = XorbDeserializer.deserialize(segment_data)
-            except Exception as e:
-                raise RuntimeError(
-                    f"[ChunkAssembler] 解压 xorb {xorb_hash[:16]}... "
-                    f"segment {seg_idx} 失败: {e}"
-                ) from e
+            fetch_infos_sorted = sorted(
+                recon.fetch_info[xorb_hash],
+                key=lambda fi: fi.chunk_range.start
+            )
+            pos = 0
+            for fi in fetch_infos_sorted:
+                seg_len = fi.url_range.length()
+                seg_data = merged_data[pos:pos + seg_len]
+                pos += seg_len
+                seg_xorb = XorbDeserializer.deserialize(seg_data)
 
-            # 合并 chunk_offsets
-            base_chunk_idx = fi.chunk_range.start
-            base_data_offset = len(all_data)
+                base_cid = fi.chunk_range.start
+                for lcidx, lboff in seg_xorb.chunk_offsets:
+                    rebased_offsets.append((base_cid + lcidx, running_offset + lboff))
+                all_data_rebased.extend(seg_xorb.data)
+                running_offset += len(seg_xorb.data)
 
-            for local_chunk_idx, local_byte_offset in segment_xorb.chunk_offsets:
-                global_chunk_idx = base_chunk_idx + local_chunk_idx
-                global_byte_offset = base_data_offset + local_byte_offset
-                all_chunk_offsets.append((global_chunk_idx, global_byte_offset))
-
-            # 追加数据
-            all_data.extend(segment_xorb.data)
-
-        # 创建合并后的 XorbBlockData
-        return XorbBlockData(
-            chunk_offsets=all_chunk_offsets,
-            data=bytes(all_data)
-        )
+            # 多段模式下使用预解压构造（因为已经解压了）
+            return StreamingXorbAccessor(
+                raw_bytes=bytes(all_data_rebased),
+                chunk_offsets=rebased_offsets,
+            )
 
     def _assemble_with_prefetch(
         self,
@@ -586,7 +597,7 @@ class ChunkAssembler(PrefetchHelpers):
                     )
 
                     # 检查水位线，预取后续 xorb
-                    current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
+                    current_cache_bytes = sum(x.memory_footprint() for x in self._xorb_cache.values())
                     if current_cache_bytes < low_watermark:
                         self._prefetch_upcoming_xorbs(
                             term_idx, recon, cas_client, file_hash,
@@ -623,17 +634,17 @@ class ChunkAssembler(PrefetchHelpers):
                                 break
                         if not found:
                             # end_chunk 超过所有已知 chunk，使用数据末尾
-                            end_byte = len(xorb_data.data)
+                            end_byte = xorb_data.data_size()
                     else:
                         end_byte = chunk_offsets_dict[end_chunk]
 
-                    if end_byte > len(xorb_data.data):
+                    if end_byte > xorb_data.data_size():
                         raise ValueError(
                             f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
-                            f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                            f"start={start_byte}, end={end_byte}, data_len={xorb_data.data_size()}"
                         )
 
-                    segment = xorb_data.data[start_byte:end_byte]
+                    segment = xorb_data.extract_range(start_byte, end_byte)
 
                     # 第一个 term 需要跳过 offset_into_first_range
                     if term_idx == 0 and recon.offset_into_first_range > 0:
@@ -668,7 +679,7 @@ class ChunkAssembler(PrefetchHelpers):
                     # 检查是否可以释放 xorb
                     if not self._is_xorb_needed_later(term.hash, term_idx, recon):
                         if term.hash in self._xorb_cache:
-                            released_size = len(self._xorb_cache[term.hash].data)
+                            released_size = self._xorb_cache[term.hash].memory_footprint()
                             del self._xorb_cache[term.hash]
                             logger.debug(
                                 f"[ChunkAssembler] 释放 xorb {term.hash[:16]}... "
@@ -677,7 +688,7 @@ class ChunkAssembler(PrefetchHelpers):
 
                     # 定期日志
                     if (term_idx + 1) % 100 == 0:
-                        cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
+                        cache_mb = sum(x.memory_footprint() for x in self._xorb_cache.values()) / 1024 / 1024
                         logger.debug(
                             f"[ChunkAssembler] 进度: {term_idx + 1}/{len(recon.terms)} terms, "
                             f"缓存: {cache_mb:.1f}MB, "
@@ -775,7 +786,7 @@ class ChunkAssembler(PrefetchHelpers):
                 )
 
                 # 检查水位线，预取后续 xorb
-                current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
+                current_cache_bytes = sum(x.memory_footprint() for x in self._xorb_cache.values())
                 if current_cache_bytes < low_watermark:
                     self._prefetch_upcoming_xorbs(
                         term_idx, recon, cas_client, file_hash,
@@ -809,15 +820,15 @@ class ChunkAssembler(PrefetchHelpers):
                     end_byte = chunk_offset_dict.get(end_chunk_idx)
                     if end_byte is None:
                         # 如果 end_chunk_idx 超出范围，使用数据末尾
-                        end_byte = len(xorb_data.data)
+                        end_byte = xorb_data.data_size()
 
-                if end_byte > len(xorb_data.data):
+                if end_byte > xorb_data.data_size():
                     raise ValueError(
                         f"[ChunkAssembler] Term #{term_idx} 数据范围越界: "
-                        f"start={start_byte}, end={end_byte}, data_len={len(xorb_data.data)}"
+                        f"start={start_byte}, end={end_byte}, data_len={xorb_data.data_size()}"
                     )
 
-                segment = xorb_data.data[start_byte:end_byte]
+                segment = xorb_data.extract_range(start_byte, end_byte)
 
                 # 第一个 term 需要跳过 offset_into_first_range
                 if term_idx == 0 and recon.offset_into_first_range > 0:
@@ -857,7 +868,7 @@ class ChunkAssembler(PrefetchHelpers):
                 # 检查是否可以释放 xorb
                 if not self._is_xorb_needed_later(term.hash, term_idx, recon):
                     if term.hash in self._xorb_cache:
-                        released_size = len(self._xorb_cache[term.hash].data)
+                        released_size = self._xorb_cache[term.hash].memory_footprint()
                         del self._xorb_cache[term.hash]
                         logger.debug(
                             f"[ChunkAssembler] 释放 xorb {term.hash[:16]}... "
@@ -866,7 +877,7 @@ class ChunkAssembler(PrefetchHelpers):
 
                 # 定期日志
                 if (term_idx + 1) % 100 == 0:
-                    cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
+                    cache_mb = sum(x.memory_footprint() for x in self._xorb_cache.values()) / 1024 / 1024
                     logger.debug(
                         f"[ChunkAssembler] 进度: {term_idx + 1}/{len(recon.terms)} terms, "
                         f"缓存: {cache_mb:.1f}MB"

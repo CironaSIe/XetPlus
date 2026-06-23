@@ -587,3 +587,288 @@ class XorbDeserializer:
                      f"{len(all_data)} bytes, {len(all_chunk_offsets)} chunks")
 
         return XorbBlockData(chunk_offsets=all_chunk_offsets, data=bytes(all_data))
+
+
+# ─────────────────────────────────────────────
+# StreamingXorbAccessor — 流式 xorb 访问器
+# ─────────────────────────────────────────────
+
+from dataclasses import dataclass
+import bisect
+
+
+@dataclass
+class _ChunkIndexEntry:
+    """Chunk 索引条目（内部使用）。"""
+    virtual_offset: int        # 在虚拟数据空间中的字节偏移
+    data_offset: int           # 在 raw_bytes 中的压缩数据偏移（header 之后）
+    compressed_len: int        # 压缩数据长度
+    comp_scheme: int           # 压缩方案 (0/1/2)
+    uncompressed_len: int      # 解压后长度
+
+
+class StreamingXorbAccessor:
+    """流式 xorb 访问器 — 不一次性全量解压。
+
+    只扫描 chunk header 建索引 (~8KB)，保留原始数据。
+    按需解压单个 chunk 或范围。
+
+    两种构造模式：
+    - 压缩模式（默认）：raw_bytes 是压缩的 xorb 数据，自动扫描 header 建索引。
+      extract_range() 时按需 LZ4 解压涉及的 chunks。
+    - 预解压模式：raw_bytes 已是解压后数据 + 外部提供 chunk_offsets。
+      extract_range() 直接对 raw_bytes 切片，不做 LZ4 解压。
+
+    对比 XorbBlockData:
+    - XorbBlockData:   64MB 全量解压数据 + offsets → 内存重
+    - StreamingXorb:   原始数据(16MB) + 8KB 索引 + 按需解压 → 内存轻
+
+    兼容接口:
+    - .chunk_offsets     → 与 XorbBlockData 格式一致 [(chunk_id, byte_offset), ...]
+    - .get_chunk_byte_indices() → 返回 [0, off1, off2, ..., total]
+    - .data_size()       → 虚拟数据总大小
+    - .memory_footprint()→ 实际内存占用 (len(raw_bytes))
+    """
+
+    def __init__(self, raw_bytes: bytes, chunk_offsets=None):
+        """
+        Args:
+            raw_bytes: xorb 原始字节数据
+                - 压缩模式：来自 HTTP/CAS/磁盘缓存的压缩数据
+                - 预解压模式：来自 chunk 缓存的已解压数据
+            chunk_offsets: 外部提供的 [(global_chunk_id, virtual_byte_offset), ...]
+                - 压缩模式：传 None（自动从 header 扫描生成，global_chunk_id 从 0 开始）
+                - 预解压模式：必须传入（手动构造的 offsets）
+        """
+        self._raw = raw_bytes
+        self._pre_decompressed = chunk_offsets is not None
+        self._index: list[_ChunkIndexEntry] = []
+        self._full_decompress_cache = None  # decompress_all() 的缓存
+
+        if self._pre_decompressed:
+            # 预解压模式：从外部 chunk_offsets 构建 index
+            # chunk_offsets 格式: [(global_chunk_id, virtual_byte_offset), ...]
+            # 按 virtual_offset 排序以支持二分查找
+            sorted_offsets = sorted(chunk_offsets, key=lambda x: x[1])
+            self._external_offsets = dict(chunk_offsets)  # global_chunk_id → virtual_offset
+
+            # 构建 _index（virtual_offset 递增序列）
+            prev_offset = 0
+            for chunk_id, byte_offset in sorted_offsets:
+                entry = _ChunkIndexEntry(
+                    virtual_offset=byte_offset,
+                    data_offset=byte_offset,  # 预解压模式下等于 virtual_offset
+                    compressed_len=0,          # 不适用
+                    comp_scheme=-1,            # 标记为预解压
+                    uncompressed_len=0,
+                )
+                self._index.append(entry)
+                prev_offset = byte_offset
+
+            self._data_size = sorted_offsets[-1][1] if sorted_offsets else 0
+            # 需要从外部推断最后一个 chunk 的大小
+            # 最后一个 virtual_offset 到 raw_bytes 末尾
+            if sorted_offsets:
+                last_offset = sorted_offsets[-1][1]
+                self._data_size = len(raw_bytes)  # 预解压模式下 raw 就是全量数据
+        else:
+            # 压缩模式：扫描所有 chunk header 构建索引
+            self._index, total_uncompressed = self._scan_headers(raw_bytes)
+            self._data_size = total_uncompressed
+
+    @staticmethod
+    def _scan_headers(data: bytes) -> tuple[list[_ChunkIndexEntry], int]:
+        """扫描 xorb 中所有 chunk header，构建索引。
+
+        Returns:
+            (index_list, total_uncompressed_size)
+        """
+        index = []
+        offset = 0
+        virtual_offset = 0
+        chunk_idx = 0
+
+        while offset + 8 <= len(data):
+            header = data[offset:offset + 8]
+            version = header[0]
+            compressed_len = int.from_bytes(header[1:4], 'little')
+            comp_scheme = header[4]
+            uncompressed_len = int.from_bytes(header[5:8], 'little')
+
+            if compressed_len == 0 and uncompressed_len == 0 and chunk_idx > 0:
+                # 可能是尾部填充，停止扫描
+                break
+
+            data_start = offset + 8
+            data_end = data_start + compressed_len
+
+            if data_end > len(data):
+                # 数据不完整，停止
+                logger.warning(
+                    f"[StreamingXorb] Header 扫描在偏移 {offset} 处数据不完整"
+                )
+                break
+
+            entry = _ChunkIndexEntry(
+                virtual_offset=virtual_offset,
+                data_offset=data_start,
+                compressed_len=compressed_len,
+                comp_scheme=comp_scheme,
+                uncompressed_len=uncompressed_len,
+            )
+            index.append(entry)
+
+            virtual_offset += uncompressed_len
+            offset = data_end
+            chunk_idx += 1
+
+        return index, virtual_offset
+
+    # ── 兼容 XorbBlockData 接口 ──
+
+    @property
+    def chunk_offsets(self):
+        """[(global_chunk_id, virtual_byte_offset), ...] — 与 XorbBlockData 格式完全一致。"""
+        if self._pre_decompressed:
+            # 预解压模式：返回构造时传入的 offsets
+            return [
+                (cid, off) for cid, off in sorted(self._external_offsets.items(),
+                                                   key=lambda x: x[0])
+            ]
+        else:
+            # 压缩模式：从 _index 重建 (global_chunk_id = 数组下标)
+            return [
+                (i, entry.virtual_offset)
+                for i, entry in enumerate(self._index)
+            ]
+
+    def data_size(self) -> int:
+        """虚拟数据总大小（用于边界检查）。"""
+        return self._data_size
+
+    def memory_footprint(self) -> int:
+        """实际内存占用 = len(raw_bytes)，用于水位线记账。"""
+        return len(self._raw)
+
+    def get_chunk_byte_indices(self) -> list:
+        """兼容接口 — 返回 [0, off1, off2, ..., total]。"""
+        if not self._index:
+            return [0, len(self._raw)] if self._pre_decompressed else [0]
+
+        indices = [0]  # 第一个 chunk 总是从 0 开始
+        for entry in self._index[1:]:
+            indices.append(entry.virtual_offset)
+        indices.append(self._data_size)
+        return indices
+
+    # ── 流式核心方法 ──
+
+    def extract_range(self, start_byte: int, end_byte: int) -> bytes:
+        """按需提取字节范围（只解压涉及的 chunks）。
+
+        替代 xorb_data.data[start:end] 的核心方法。
+
+        Args:
+            start_byte: 起始字节偏移（包含）
+            end_byte: 结束字节偏移（不包含）
+
+        Returns:
+            提取的字节数据
+
+        Raises:
+            ValueError: 范围越界
+        """
+        if start_byte < 0 or end_byte > self._data_size:
+            raise ValueError(
+                f"[StreamingXorb] 范围越界: [{start_byte}, {end_byte}), "
+                f"data_size={self._data_size}"
+            )
+        if start_byte >= end_byte:
+            return b''
+
+        if self._pre_decompressed:
+            # 预解压模式：直接切片，不做 LZ4 解压
+            return self._raw[start_byte:end_byte]
+
+        # 压缩模式：二分查找涉及的 chunks
+        virtual_offsets = [e.virtual_offset for e in self._index]
+
+        # 找到第一个 virtual_offset >= start_byte 的 chunk
+        start_idx = bisect.bisect_left(virtual_offsets, start_byte)
+        # 找到第一个 virtual_offset >= end_byte 的 chunk
+        end_idx = bisect.bisect_left(virtual_offsets, end_byte)
+
+        # 边界修正
+        if start_idx > 0:
+            start_idx -= 1  # 包含 start_byte 所在的 chunk
+        if end_idx >= len(self._index):
+            end_idx = len(self._index)
+
+        # 解压涉及的 chunks 并拼接
+        parts = []
+        for i in range(start_idx, end_idx):
+            entry = self._index[i]
+            chunk_data = self._decompress_single_entry(entry)
+            parts.append(chunk_data)
+
+        if not parts:
+            return b''
+
+        all_data = b''.join(parts)
+
+        # 计算在拼接数据中的切片偏移
+        first_entry = self._index[start_idx]
+        internal_start = start_byte - first_entry.virtual_offset
+        internal_end = internal_start + (end_byte - start_byte)
+
+        return all_data[internal_start:internal_end]
+
+    def _decompress_single_entry(self, entry: _ChunkIndexEntry) -> bytes:
+        """解压单个 chunk 条目。"""
+        if entry.comp_scheme == -1:
+            # 预解压模式的 entry（不应该走到这里）
+            return self._raw[
+                entry.data_offset:
+                entry.data_offset + entry.uncompressed_len
+            ]
+
+        comp_data = self._raw[
+            entry.data_offset:
+            entry.data_offset + entry.compressed_len
+        ]
+        return XorbDeserializer._decompress(
+            comp_data, entry.comp_scheme, entry.uncompressed_len
+        )
+
+    def decompress_all(self) -> 'XorbBlockData':
+        """全量解压（懒加载，缓存结果）。
+
+        仅在需要完整数据的场景调用：
+        - chunk 缓存写入 (put_xorb_decompressed)
+        - 其他需要 XorbBlockData 对象的场景
+
+        结果缓存避免重复解压。
+        """
+        if self._full_decompress_cache is not None:
+            return self._full_decompress_cache
+
+        if self._pre_decompressed:
+            # 预解压模式：raw 已经是解压后的数据
+            result = XorbBlockData(
+                chunk_offsets=self.chunk_offsets,
+                data=self._raw,
+            )
+        else:
+            # 压缩模式：逐个解压所有 chunks
+            all_data = bytearray()
+            for entry in self._index:
+                chunk_data = self._decompress_single_entry(entry)
+                all_data.extend(chunk_data)
+
+            result = XorbBlockData(
+                chunk_offsets=self.chunk_offsets,
+                data=bytes(all_data),
+            )
+
+        self._full_decompress_cache = result
+        return result

@@ -34,10 +34,10 @@ class PrefetchHelpers:
                 continue
 
             # 检查水位线
-            current_bytes = sum(
-                len(x.data) for x in self._xorb_cache.values()
+            current_cache_bytes = sum(
+                x.memory_footprint() for x in self._xorb_cache.values()
             )
-            if current_bytes >= max_load_bytes:
+            if current_cache_bytes >= max_load_bytes:
                 logger.debug(
                     f"[Cache] 达到水位线 ({self.prefetch_high_mb}MB)，"
                     f"停止加载磁盘缓存"
@@ -50,8 +50,8 @@ class PrefetchHelpers:
             cache_hit = cache_adapter.get_xorb_decompressed(xorb_hash, fetch_infos)
             if cache_hit:
                 decompressed_data, chunk_byte_indices = cache_hit
-                # 构造 XorbBlockData
-                from xet.storage.xorb_deserializer import XorbBlockData
+                # 构造 StreamingXorbAccessor（预解压模式）
+                from xet.storage.xorb_deserializer import StreamingXorbAccessor
 
                 # 从 fetch_infos 获取全局 chunk ID 范围
                 # fetch_infos 可能包含多个段，需要合并所有的 chunk 范围
@@ -67,9 +67,9 @@ class PrefetchHelpers:
                     if i < len(all_chunk_ids):
                         chunk_offsets.append((all_chunk_ids[i], chunk_byte_indices[i]))
 
-                xorb_data = XorbBlockData(
-                    chunk_offsets=chunk_offsets,
-                    data=decompressed_data
+                xorb_data = StreamingXorbAccessor(
+                    raw_bytes=decompressed_data,
+                    chunk_offsets=chunk_offsets
                 )
                 self._xorb_cache[xorb_hash] = xorb_data
                 loaded_count += 1
@@ -92,7 +92,7 @@ class PrefetchHelpers:
                     # 升级到 chunk 缓存
                     chunk_byte_indices = xorb_data.get_chunk_byte_indices()
                     cache_adapter.put_xorb_decompressed(
-                        xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.data
+                        xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.decompress_all().data
                     )
                 except Exception as e:
                     logger.warning(
@@ -100,7 +100,7 @@ class PrefetchHelpers:
                     )
 
         if loaded_count > 0:
-            cache_mb = sum(len(x.data) for x in self._xorb_cache.values()) / 1024 / 1024
+            cache_mb = sum(x.memory_footprint() for x in self._xorb_cache.values()) / 1024 / 1024
             total_xorbs = len(recon.fetch_info)
             hit_rate = (loaded_count / total_xorbs * 100) if total_xorbs > 0 else 0
             logger.info(
@@ -155,7 +155,7 @@ class PrefetchHelpers:
                     fetch_infos = recon.fetch_info[xorb_hash]
                     chunk_byte_indices = xorb_data.get_chunk_byte_indices()
                     cache_adapter.put_xorb_decompressed(
-                        xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.data
+                        xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.decompress_all().data
                     )
 
                 del self._download_futures[xorb_hash]
@@ -170,17 +170,25 @@ class PrefetchHelpers:
             cache_hit = cache_adapter.get_xorb_decompressed(xorb_hash, fetch_infos)
             if cache_hit:
                 decompressed_data, chunk_byte_indices = cache_hit
-                # 构造 XorbBlockData
-                from xet.storage.xorb_deserializer import XorbBlockData
+                # 构造 StreamingXorbAccessor（预解压模式）
+                from xet.storage.xorb_deserializer import StreamingXorbAccessor
 
-                # 从 chunk_byte_indices 重建 chunk_offsets
+                # 从 fetch_infos 获取全局 chunk ID 范围（与 _load_from_disk_cache 一致）
+                all_chunk_ids = []
+                for fi in fetch_infos:
+                    chunk_range = fi.chunk_range
+                    for chunk_id in range(chunk_range.start, chunk_range.end):
+                        all_chunk_ids.append(chunk_id)
+
+                # 构建 chunk_offsets: [(global_chunk_id, byte_offset), ...]
                 chunk_offsets = []
                 for i in range(len(chunk_byte_indices) - 1):
-                    chunk_offsets.append((i, chunk_byte_indices[i]))
+                    if i < len(all_chunk_ids):
+                        chunk_offsets.append((all_chunk_ids[i], chunk_byte_indices[i]))
 
-                xorb_data = XorbBlockData(
-                    chunk_offsets=chunk_offsets,
-                    data=decompressed_data
+                xorb_data = StreamingXorbAccessor(
+                    raw_bytes=decompressed_data,
+                    chunk_offsets=chunk_offsets
                 )
                 self._xorb_cache[xorb_hash] = xorb_data
                 logger.debug(f"[Cache] Chunk 缓存命中: {xorb_hash[:16]}...")
@@ -204,7 +212,7 @@ class PrefetchHelpers:
                 # 升级到 chunk 缓存
                 chunk_byte_indices = xorb_data.get_chunk_byte_indices()
                 cache_adapter.put_xorb_decompressed(
-                    xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.data
+                    xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.decompress_all().data
                 )
                 logger.debug(f"[Cache] Xorb 缓存命中（升级到 chunk）: {xorb_hash[:16]}...")
                 return
@@ -228,7 +236,7 @@ class PrefetchHelpers:
 
             chunk_byte_indices = xorb_data.get_chunk_byte_indices()
             cache_adapter.put_xorb_decompressed(
-                xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.data
+                xorb_hash, fetch_infos, chunk_byte_indices, xorb_data.decompress_all().data
             )
 
     def _prefetch_upcoming_xorbs(
@@ -252,7 +260,7 @@ class PrefetchHelpers:
             high_watermark: 高水位线（字节）
             progress_tracker: 进度跟踪器（可选）
         """
-        current_cache_bytes = sum(len(x.data) for x in self._xorb_cache.values())
+        current_cache_bytes = sum(x.memory_footprint() for x in self._xorb_cache.values())
 
         # 自适应预取：根据完成速率计算目标缓冲区
         completion_rate = self._rate_estimator.get_rate()  # bytes/s

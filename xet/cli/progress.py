@@ -4,12 +4,42 @@ from typing import Optional, Callable
 from rich.progress import (
     Progress,
     BarColumn,
-    DownloadColumn,
     TransferSpeedColumn,
     TimeRemainingColumn,
     TextColumn,
 )
 from rich.console import Console
+
+
+class _BinaryDownloadColumn:
+    """自定义下载量列 — 使用二进制单位 (/1024)，与 format_bytes() 保持一致。
+
+    替代 Rich 内置的 DownloadColumn（它使用 SI 单位 /1000，
+    会导致进度条显示 302.3 GB 而其他地方显示 281.5 GB 的不一致问题）。
+    """
+
+    def __init__(self):
+        self.units = ["B", "KiB", "MiB", "GiB", "TiB"]
+
+    def render(self, task):
+        """Render 进度条中的已下载/总量。"""
+        completed = task.completed or 0
+        total = task.total
+
+        if total is None or total <= 0:
+            # 总量未知，只显示已完成
+            return self._format(completed)
+        else:
+            # 显示 "完成/总量"
+            return f"{self._format(completed)}/{self._format(total)}"
+
+    def _format(self, n: float) -> str:
+        """格式化字节数为二进制单位字符串。"""
+        for unit in self.units:
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PiB"
 
 
 class ProgressDisplay:
@@ -54,12 +84,14 @@ class RichProgress(ProgressDisplay):
             self._filename_shown = True
 
         # 进度条：图标 + Xorb/Segment 信息 | 进度条 | 百分比 | 已下载/总大小 | 速度 | ETA
+        # 注意：使用自定义 BinaryDownloadColumn 替代 Rich 的 DownloadColumn，
+        # 确保 byte 格式化统一使用二进制制 (/1024)，与 format_bytes() 一致
         self.progress = Progress(
             TextColumn("[cyan]{task.description}"),  # Xorb/Segment 信息
             BarColumn(bar_width=None, style="cyan", complete_style="green"),
             "[progress.percentage]{task.percentage:>6.2f}%",  # 两位小数
             "•",
-            DownloadColumn(),
+            _BinaryDownloadColumn(),   # 二进制单位 (KiB/MiB/GiB) — 与 format_bytes 一致
             "•",
             TransferSpeedColumn(),
             "•",

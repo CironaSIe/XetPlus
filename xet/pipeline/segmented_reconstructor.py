@@ -364,20 +364,17 @@ class SegmentedReconstructor:
                         f"[SegmentedReconstructor] 发现 {len(self.completed_segments)} 个已完成段，跳过"
                     )
 
-            # 2. 预分配文件空间
+            # 2. 创建输出目录
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 仅在并行写入模式下预分配文件空间（随机偏移写入需要）
+            # 串行下载/串行下载都是顺序写入，不需要预分配
             if self.parallel_write:
-                # 并行写入模式：预分配以支持随机偏移写入
                 if not self.output_path.exists() or self.output_path.stat().st_size != self.file_size:
                     logger.info(f"[SegmentedReconstructor] 预分配文件空间: {self.file_size} bytes")
                     with open(self.output_path, 'wb') as f:
                         f.seek(self.file_size - 1)
                         f.write(b'\0')
-            else:
-                # 顺序写入模式：只需创建空文件，随写入自然增长
-                if not self.output_path.exists():
-                    logger.info(f"[SegmentedReconstructor] 创建空文件: {self.file_size} bytes")
-                    self.output_path.touch()
 
             # 3. 选择下载模式
             if self.parallel_segments > 1:
