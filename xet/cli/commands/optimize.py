@@ -57,6 +57,26 @@ def register_optimize_command(subparsers):
         action="store_true",
     )
 
+    parser.add_argument(
+        "--token",
+        help="HF Token（用于 CAS 认证和真实带宽测速）",
+    )
+
+    parser.add_argument(
+        "--file-hash",
+        help="文件 MerkleHash（用于 CAS reconstruction 端点延迟测速）",
+    )
+
+    parser.add_argument(
+        "--cas-endpoint",
+        help="CAS 服务地址（默认 https://cas-server.xethub.hf.co）",
+    )
+
+    parser.add_argument(
+        "--repo",
+        help="HuggingFace 仓库 ID（用于自动获取 token 和 file_hash）",
+    )
+
     parser.set_defaults(func=optimize_command)
 
 
@@ -71,10 +91,81 @@ def optimize_command(args) -> int:
     if args.dns_servers:
         dns_servers = [s.strip() for s in args.dns_servers.split(",")]
 
+    # ---- 自动获取 token 和 file_hash（如果提供了 --repo）----
+    _access_token = None
+    _file_hash = args.file_hash
+    _cas_endpoint = args.cas_endpoint or "https://cas-server.xethub.hf.co"
+
+    if args.repo:
+        from xet.cli.commands.download import (
+            detect_xet_file, list_hf_files, match_files,
+        )
+        from xet.network.auth import XetAuth
+        from xet.cli.config_manager import ConfigManager
+
+        config = ConfigManager()
+        hf_token = args.token or config.get_token()
+        if not hf_token:
+            print("✗ 缺少 HF Token，请用 --token 或设置 xet.token", file=sys.stderr)
+            return 1
+
+        # 创建基本 session 用于 API 调用
+        session = __import__("requests").Session()
+        session.trust_env = False
+
+        # 检测文件获取 auth_url 和 xet_hash
+        repo_id = args.repo
+        repo_type = "model" if "/" not in args.repo or len(args.repo.split("/")) == 2 else "dataset"
+        if "/" in args.repo and len(args.repo.split("/")) > 2:
+            parts = args.repo.rsplit("/", 1)
+            repo_id, filename = parts[0], parts[1]
+        else:
+            filename = None
+
+        auth_url = None  # 先初始化
+
+        try:
+            if filename:
+                xet_info = detect_xet_file(
+                    repo_id, repo_type, filename,
+                    hf_token, session, hf_endpoint=None,
+                )
+                _file_hash = xet_info.get("xet_hash") or _file_hash
+                auth_url = xet_info.get("auth_url")
+            else:
+                # 列出文件，取第一个匹配的
+                all_files = list_hf_files(repo_id, repo_type, hf_token, session)
+                matched = match_files(all_files, ["*"])
+                if matched:
+                    first = matched[0]
+                    xet_info = detect_xet_file(
+                        repo_id, repo_type, first,
+                        hf_token, session, hf_endpoint=None,
+                    )
+                    _file_hash = xet_info.get("xet_hash") or _file_hash
+                    auth_url = xet_info.get("auth_url")
+
+            # 获取 CAS token
+            if auth_url:
+                auth = XetAuth(hf_token=hf_token, session=session)
+                token_info = auth.get_token(repo_id=repo_id, repo_type=repo_type, auth_url=auth_url)
+                _access_token = token_info.access_token
+                _cas_endpoint = token_info.endpoint or _cas_endpoint
+                print(f"🔑 已获取 CAS token (endpoint={_cas_endpoint})")
+        except Exception as e:
+            print(f"⚠ 自动获取 token 失败: {e}（将使用基础测速）", file=sys.stderr)
+
+    elif args.token and not _file_hash:
+        # 有 token 但没 hash：仅传 token 做 DATA 测速（无 CAS 延迟测速）
+        _access_token = args.token
+
     # 创建优选器
     optimizer = HostOptimizer(
         proxy=args.proxy or "",
         dns_servers=dns_servers,
+        access_token=_access_token,
+        file_hash=_file_hash,
+        cas_endpoint=_cas_endpoint,
     )
 
     # 执行优选
