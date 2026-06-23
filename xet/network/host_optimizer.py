@@ -702,9 +702,12 @@ class HostOptimizer:
         # 用于从 CAS 响应中提取的 presigned URL（供 DATA 域名测速用）
         sample_data_url: Optional[str] = None
 
-        # ---- 第一阶段：CAS 域名测速（仅测主域名，获取延迟 + presigned URL）----
-        # 只测试 cas-server.xethub.hf.co（主CAS域名），避免对4个CAS域名的所有IP逐一测速
-        # 如果主域名失败（404=文件未注册/V2不支持），立即降级到 TCP RTT
+        # 全局超时：整个优选测速不超过 30 秒
+        _overall_deadline = time.time() + 30
+        _total_tests = 0
+        _done_count = 0
+
+        # 统计总测试数（用于进度显示）
         cas_domains = {
             d: cands for d, cands in results.items()
             if get_domain_category(d) == "cas"
@@ -714,10 +717,21 @@ class HostOptimizer:
             d: cands for d, cands in results.items() if d not in cas_domains
         }
 
-        # 仅保留主 CAS 域名用于 API 测试（其他 CAS 域名用 TCP RTT 足矣）
         _primary_cas_domain = "cas-server.xethub.hf.co"
         primary_cas = {d: cands for d, cands in cas_domains.items() if d == _primary_cas_domain}
 
+        # 计算总任务数
+        _n_cas = sum(min(len(c), MAX_CANDIDATES) for c in primary_cas.values()) if primary_cas else 0
+        _n_other = sum(
+            min(len(cands), MAX_CANDIDATES)
+            for domain, cands in non_cas_domains.items()
+        )
+        _total_tests = _n_cas + _n_other
+
+        if _total_tests > 0:
+            logger.info(f"[HostOpt] 测速 {_total_tests} 个候选 IP...")
+
+        # ---- 第一阶段：CAS 域名测速（仅主域名）----
         if primary_cas:
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 cas_futures: Dict = {}
@@ -734,46 +748,61 @@ class HostOptimizer:
                             )
                         ] = (domain, ip, use_proxy, rtt)
 
-                # 缩短超时：CAS 测速只关心 TTFB，不需要等太久
+                remaining_timeout = max(1, _overall_deadline - time.time())
                 try:
                     for future in concurrent.futures.as_completed(
-                        cas_futures, timeout=20
+                        cas_futures, timeout=remaining_timeout
                     ):
+                        _done_count += 1
                         domain, ip, use_proxy, rtt = cas_futures[future]
+                        mode_str = "代理" if use_proxy else "直连"
                         try:
                             result = future.result()
                             if result is not None:
                                 latency_ms, data_url = result
-                                # latency_ms 作为 speed 字段存储（CAS：越低越好）
                                 transfer_results.setdefault(domain, []).append(
                                     (ip, use_proxy, rtt, latency_ms)
                                 )
-                                # 保存第一个有效的 presigned URL
                                 if data_url and not sample_data_url:
                                     sample_data_url = data_url
-                                    logger.debug(
-                                        f"[HostOpt] 已获取 presigned URL 样本用于 DATA 测速"
-                                    )
+                                # 实时输出：CAS 延迟成功
+                                print(
+                                    f"   [{_done_count}/{_total_tests}] "
+                                    f"CAS {ip} ({mode_str}) 延迟={latency_ms:.0f}ms",
+                                    flush=True,
+                                )
+                            else:
+                                # 实时输出：CAS 失败（404 等）
+                                print(
+                                    f"   [{_done_count}/{_total_tests}] "
+                                    f"CAS {ip} ({mode_str}) 无响应",
+                                    flush=True,
+                                )
                         except Exception as e:
-                            logger.debug(f"[HostOpt] CAS API 测速异常 {ip}: {e}")
-                except concurrent.futures.TimeoutError:
-                    logger.debug("[HostOpt] CAS API 测速部分超时，使用已完成结果")
+                            print(
+                                f"   [{_done_count}/{_total_tests}] "
+                                f"CAS {ip} ({mode_str}) 异常: {type(e).__name__}",
+                                flush=True,
+                            )
 
-            # 主域名无有效结果：标记其余 CAS 域名也跳过 API 测试
+                        # 全局超时检查
+                        if time.time() > _overall_deadline:
+                            logger.debug("[HostOpt] 达到全局超时，停止等待")
+                            break
+                except concurrent.futures.TimeoutError:
+                    logger.debug("[HostOpt] CAS 测速超时，使用已完成结果")
+
             if not transfer_results.get(_primary_cas_domain):
                 logger.debug(
-                    f"[HostOpt] 主 CAS 域名 {_primary_cas_domain} 测速无效"
-                    f"(文件可能未在 CAS 注册或 V2 不支持)，"
-                    f"CAS 域名将使用 TCP RTT 选 IP"
+                    f"[HostOpt] 主 CAS 域名测速无效，CAS 将用 RTT 选 IP"
                 )
 
         # ---- 第二阶段：DATA + API 域名测速 ----
-        if non_cas_domains:
+        if non_cas_domains and time.time() < _overall_deadline:
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 transfer_futures: Dict = {}
                 for domain, candidates in non_cas_domains.items():
                     category = get_domain_category(domain)
-
                     if self.proxy:
                         if category in ("data", "cas"):
                             candidates.sort(key=lambda x: (x[1], x[2]))
@@ -784,7 +813,6 @@ class HostOptimizer:
 
                     top = candidates[:MAX_CANDIDATES]
                     for ip, use_proxy, rtt in top:
-                        # DATA 域名且有 presigned URL：使用吞吐量测试
                         if (
                             category == "data"
                             and sample_data_url
@@ -793,35 +821,71 @@ class HostOptimizer:
                             transfer_futures[
                                 executor.submit(
                                     self._data_throughput_test,
-                                    ip,
-                                    domain,
-                                    sample_data_url,
-                                    use_proxy,
+                                    ip, domain, sample_data_url, use_proxy,
                                 )
                             ] = (domain, ip, use_proxy, rtt)
                         else:
-                            # 其他情况：使用标准 HTTP 测试
                             transfer_futures[
                                 executor.submit(
                                     self._http_transfer_test, ip, domain, use_proxy
                                 )
                             ] = (domain, ip, use_proxy, rtt)
 
+                remaining_timeout = max(1, _overall_deadline - time.time())
                 try:
                     for future in concurrent.futures.as_completed(
-                        transfer_futures, timeout=30
+                        transfer_futures, timeout=remaining_timeout
                     ):
+                        _done_count += 1
                         domain, ip, use_proxy, rtt = transfer_futures[future]
+                        mode_str = "代理" if use_proxy else "直连"
+                        category = get_domain_category(domain)
                         try:
                             speed = future.result()
                             if speed is not None:
                                 transfer_results.setdefault(domain, []).append(
                                     (ip, use_proxy, rtt, speed)
                                 )
+                                # 实时输出：成功
+                                if category == "data":
+                                    print(
+                                        f"   [{_done_count}/{_total_tests}] "
+                                        f"DATA {ip} ({mode_str}) {_format_speed(speed)}",
+                                        flush=True,
+                                    )
+                                elif category == "api":
+                                    print(
+                                        f"   [{_done_count}/{_total_tests}] "
+                                        f"API {ip} ({mode_str}) {_format_speed(speed)}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"   [{_done_count}/{_total_tests}] "
+                                        f"{domain.split('.')[0]} {ip} ({mode_str}) {_format_speed(speed)}",
+                                        flush=True,
+                                    )
+                            else:
+                                # 失败
+                                short_name = domain.split(".")[0]
+                                cat_label = {"api": "API", "data": "DATA"}.get(category, short_name)
+                                print(
+                                    f"   [{_done_count}/{_total_tests}] "
+                                    f"{cat_label} {ip} ({mode_str}) 无响应",
+                                    flush=True,
+                                )
                         except Exception as e:
-                            logger.debug(f"[HostOpt] Transfer 测速异常 {ip}: {e}")
+                            print(
+                                f"   [{_done_count}/{_total_tests}] "
+                                f"{ip} ({mode_str}) 异常: {type(e).__name__}",
+                                flush=True,
+                            )
+
+                        if time.time() > _overall_deadline:
+                            logger.debug("[HostOpt] 达到全局超时，停止等待")
+                            break
                 except concurrent.futures.TimeoutError:
-                    logger.debug("[HostOpt] Transfer 测速部分超时，使用已完成结果")
+                    logger.debug("[HostOpt] Transfer 测速超时，使用已完成结果")
 
         return transfer_results
 
