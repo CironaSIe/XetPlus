@@ -256,22 +256,25 @@ class PrefetchHelpers:
 
         # 自适应预取：根据完成速率计算目标缓冲区
         completion_rate = self._rate_estimator.get_rate()  # bytes/s
-        target_buffer_time = 60.0  # 60秒缓冲（可配置）
+        target_buffer_time = 10.0  # 10 秒缓冲（覆盖网络抖动即可）
+
+        # 硬上限：不超过 max_memory_mb 配置值
+        max_buffer_bytes = self.max_memory_mb * 1024 * 1024
 
         if completion_rate > 0:
-            # 目标缓冲区 = 速率 × 时间
+            # 目标缓冲区 = 速率 × 时间，但不超过硬上限
             target_buffer_bytes = completion_rate * target_buffer_time
-            # 取高水位线和目标缓冲区的较大值
-            adaptive_watermark = max(high_watermark, int(target_buffer_bytes))
+            adaptive_watermark = min(max_buffer_bytes, max(int(target_buffer_bytes), high_watermark))
 
             logger.debug(
                 f"[Prefetch] 自适应预取: 速率={completion_rate / 1024 / 1024:.2f} MB/s, "
                 f"目标缓冲={target_buffer_bytes / 1024 / 1024:.1f}MB, "
+                f"硬上限={max_buffer_bytes / 1024 / 1024:.0f}MB, "
                 f"使用水位={adaptive_watermark / 1024 / 1024:.1f}MB"
             )
         else:
-            # 速率未知，使用固定高水位线
-            adaptive_watermark = high_watermark
+            # 速率未知，使用固定高水位线（不超过硬上限）
+            adaptive_watermark = min(high_watermark, max_buffer_bytes)
 
         # 收集后续需要的 xorb
         upcoming_xorbs = []
