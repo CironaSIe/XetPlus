@@ -379,14 +379,20 @@ class HostOptimizer:
                         )
                         futures[future] = (domain, ip)
 
-                for future in concurrent.futures.as_completed(futures, timeout=30):
-                    domain, ip = futures[future]
-                    try:
-                        valid, issuer, error = future.result()
-                        cert_results[(domain, ip)] = (valid, issuer, error)
-                    except Exception as e:
-                        logger.debug(f"[HostOpt] 证书验证异常 {ip}: {e}")
-                        cert_results[(domain, ip)] = (False, None, str(e))
+                try:
+                    for future in concurrent.futures.as_completed(futures, timeout=30):
+                        domain, ip = futures[future]
+                        try:
+                            valid, issuer, error = future.result()
+                            cert_results[(domain, ip)] = (valid, issuer, error)
+                        except Exception as e:
+                            logger.debug(f"[HostOpt] 证书验证异常 {ip}: {e}")
+                            cert_results[(domain, ip)] = (False, None, str(e))
+                except concurrent.futures.TimeoutError:
+                    logger.debug("[HostOpt] 证书验证部分超时，使用已完成结果")
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
 
         # 6. 按域名选最优 + 保存详细结果
         for domain, candidates in results.items():
@@ -816,9 +822,17 @@ class HostOptimizer:
                         # 全局超时检查
                         if time.time() > _overall_deadline:
                             logger.debug("[HostOpt] 达到全局超时，停止等待")
+                            # 取消所有未完成的 future
+                            for f in cas_futures:
+                                if not f.done():
+                                    f.cancel()
                             break
                 except concurrent.futures.TimeoutError:
                     logger.debug("[HostOpt] CAS 测速超时，使用已完成结果")
+                    # 取消所有未完成的 future，避免 executor.shutdown(wait=True) 阻塞
+                    for f in cas_futures:
+                        if not f.done():
+                            f.cancel()
 
             if not transfer_results.get(_primary_cas_domain):
                 if _can_do_cas_api:
@@ -922,9 +936,17 @@ class HostOptimizer:
 
                         if time.time() > _overall_deadline:
                             logger.debug("[HostOpt] 达到全局超时，停止等待")
+                            # 取消所有未完成的 future
+                            for f in transfer_futures:
+                                if not f.done():
+                                    f.cancel()
                             break
                 except concurrent.futures.TimeoutError:
                     logger.debug("[HostOpt] Transfer 测速超时，使用已完成结果")
+                    # 取消所有未完成的 future
+                    for f in transfer_futures:
+                        if not f.done():
+                            f.cancel()
 
         return transfer_results
 
