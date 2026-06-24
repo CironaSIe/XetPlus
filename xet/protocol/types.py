@@ -486,17 +486,4 @@ class XetFileInfo:
         """
         return self.location is not None
 
-@dataclass
-class XetTokenInfo:
-    """CAS JWT Token 信息。
 
-    从 HuggingFace 获取的用于访问 CAS 服务的 token。
-
-    Attributes:
-        access_token: JWT access token 字符串
-        endpoint: CAS 服务的基础 URL（如 https://cas.huggingface.co）
-        expiration: token 过期时间戳（Unix 时间）
-    """
-    access_token: str
-    endpoint: str
-    expiration: int

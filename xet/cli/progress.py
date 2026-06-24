@@ -4,6 +4,7 @@ from typing import Optional, Callable
 from rich.progress import (
     Progress,
     BarColumn,
+    ProgressColumn,
     TransferSpeedColumn,
     TimeRemainingColumn,
     TextColumn,
@@ -12,7 +13,7 @@ from rich.table import Column
 from rich.console import Console
 
 
-class _BinaryDownloadColumn:
+class _BinaryDownloadColumn(ProgressColumn):
     """自定义下载量列 — 使用二进制单位 (/1024)，与 format_bytes() 保持一致。
 
     替代 Rich 内置的 DownloadColumn（它使用 SI 单位 /1000，

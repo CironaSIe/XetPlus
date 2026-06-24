@@ -581,6 +581,8 @@ class SegmentedReconstructor:
         """
         logger.debug("[SegmentWriter] 启动")
 
+        assert self._write_queue is not None  # 仅 _reconstruct_parallel 启动该线程
+
         try:
             # 打开文件（r+b模式）
             with open(self.output_path, 'r+b') as f:
@@ -681,6 +683,7 @@ class SegmentedReconstructor:
             return
 
         # 3. 发送到write_queue（含 seg_index，由 writer 落盘后标记完成）
+        assert self._write_queue is not None  # 仅 _reconstruct_parallel 调用该方法
         self._write_queue.put((seg.start, segment_data, seg.index))
 
         logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 下载+解压完成: {len(segment_data)} bytes, 已入队等待写入")
@@ -697,15 +700,17 @@ class SegmentedReconstructor:
         if self.parallel_segments > 1:
             # 并行模式：bytes 级进度由 writer 线程上报，worker 只报 xorbs/terms/segments
             base_bytes = 0
-            _worker_cb = lambda stats: self.progress_callback({
-                k: v for k, v in stats.items()
-                if k in (
+            _worker_cb = None
+            if self.progress_callback:
+                _progress_keys = (
                     'total_xorbs', 'completed_xorbs', 'active_xorbs',
                     'total_terms', 'processed_terms',
-                    # 不包含 completed_segments/total_segments — 这些由 writer 上报
                     'current_segment',
                 )
-            })
+                _cb: Callable = self.progress_callback
+                _worker_cb = lambda stats: _cb({
+                    k: v for k, v in stats.items() if k in _progress_keys
+                })
         else:
             # 串行模式：seg.start 是已完成段的偏移，累加显示正确
             base_bytes = seg.start
@@ -982,7 +987,7 @@ class SegmentedReconstructor:
             logger.warning(f"[SegmentedReconstructor] 清理失败: {e}")
 
 
-def _format_size(n: int) -> str:
+def _format_size(n: float) -> str:
     """格式化字节数为人类可读字符串（用于控制台输出）。"""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:

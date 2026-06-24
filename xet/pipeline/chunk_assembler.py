@@ -294,6 +294,7 @@ class ChunkAssembler(PrefetchHelpers):
                     )
 
                 start_byte = chunk_offsets_dict[start_chunk]
+                end_byte = 0
 
                 # end_chunk 可能不在 chunk_offsets 中（表示最后一个 chunk 之后）
                 if end_chunk not in chunk_offsets_dict:
@@ -737,6 +738,7 @@ class ChunkAssembler(PrefetchHelpers):
 
         try:
             # 根据是否有 checkpoint 选择文件打开模式
+            existing_size = 0
             if start_term_idx > 0 and part_path.exists():
                 # 从 checkpoint 恢复：使用 r+b 模式追加，并验证现有文件大小
                 file_mode = 'r+b'
@@ -887,6 +889,7 @@ class ChunkAssembler(PrefetchHelpers):
                         )
 
                     start_byte = chunk_offsets_dict[start_chunk]
+                    end_byte = 0
 
                     # end_chunk 可能不在 chunk_offsets 中（表示最后一个 chunk 之后）
                     if end_chunk not in chunk_offsets_dict:

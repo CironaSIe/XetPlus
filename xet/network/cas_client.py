@@ -22,6 +22,7 @@ from xet.network.auth import XetAuth
 from xet.network.low_speed_timeout import LowSpeedTimeoutError
 from xet.network.url_refresh_coordinator import URLRefreshCoordinator
 from xet.network.adaptive_concurrency import AdaptiveConcurrencyController
+from xet.network.retry_coordinator import RetryCoordinator
 import time
 import random
 
@@ -355,9 +356,10 @@ class CASClient:
 
         # 只保留需要的 fetch_info（去重）
         needed_xorb_hashes = {term.hash for term in filtered_terms}
-        filtered_fetch_info = [
-            fi for fi in recon.fetch_info if fi.hash in needed_xorb_hashes
-        ]
+        filtered_fetch_info = {
+            k: v for k, v in recon.fetch_info.items()
+            if k in needed_xorb_hashes
+        }
 
         logger.debug(
             f"[CAS] 客户端过滤: {len(recon.terms)} terms → {len(filtered_terms)} terms, "
@@ -501,7 +503,7 @@ class CASClient:
                 last_check_time = now
                 last_check_received = total_received
 
-        return buffer  # bytearray，避免 bytes() 的额外复制
+        return bytes(buffer)  # 转为 bytes 匹配返回类型
 
     def get_xorb_data_with_retry(
         self,
@@ -618,11 +620,14 @@ class CASClient:
                         is_retrying = True
 
                     # 释放 ACC 并报告失败
+                    status_code = e.response.status_code if e.response else 0
                     if acc_acquired and self._acc:
                         self._acc.release()
-                        self._acc.report_failure(status_code=e.response.status_code)
+                        self._acc.report_failure(status_code=status_code)
 
-                    status_code = e.response.status_code
+                    if not e.response:
+                        logger.error(f"[CAS] HTTPError 无 response 对象")
+                        raise
 
                     # 401: Token 过期 → 强制刷新 + 重新获取 reconstruction
                     if status_code == 401:

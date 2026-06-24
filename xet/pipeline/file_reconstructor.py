@@ -283,6 +283,7 @@ class FileReconstructor:
 
             # 6. 验证 SHA256（如果提供）
             sha256_ok = True
+            actual_sha256 = ""
             if expected_sha256:
                 logger.info("[FileReconstructor] 计算文件 SHA256 校验和...")
                 actual_sha256 = calculate_sha256(self.output_path)

@@ -362,6 +362,7 @@ class FileVerifier:
         fetch_infos = recon.fetch_info[xorb_hash]
         sorted_infos = sorted(fetch_infos, key=lambda fi: fi.chunk_range.start)
         segments = []
+        assert self.cas_client is not None
         for fi in sorted_infos:
             segment_data = self.cas_client.get_xorb_data_with_retry(
                 url=fi.url, url_range=fi.url_range,
@@ -418,9 +419,11 @@ class FileVerifier:
                 else:
                     end_byte = chunk_offsets_dict[end_chunk]
 
+                assert isinstance(end_byte, int)
                 if end_byte > accessor.data_size():
                     raise ValueError(f"Term #{term_idx} 数据越界")
 
+                assert isinstance(start_byte, int)
                 segment = accessor.extract_range(start_byte, end_byte)
 
                 if term_idx == 0 and recon.offset_into_first_range > 0:

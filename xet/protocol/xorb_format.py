@@ -148,8 +148,10 @@ def _decompress_lz4(compressed: bytes, expected_size: int) -> bytes:
             "需要 lz4 库来解压 xorb 数据。请运行: pip install lz4"
         )
 
+    import lz4.frame  # type: ignore[import-untyped]
+
     try:
-        decompressed = lz4.frame.decompress(compressed)
+        decompressed = lz4.frame.decompress(compressed)  # type: ignore[attr-defined]
         return decompressed
     except Exception as e:
         raise XorbCompressionError(f"LZ4 解压失败: {e}") from e
