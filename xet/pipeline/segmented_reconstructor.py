@@ -415,7 +415,9 @@ class SegmentedReconstructor:
             # 仅在并行写入模式下预分配文件空间（随机偏移写入需要）
             # 串行下载/串行下载都是顺序写入，不需要预分配
             if self.parallel_write:
-                if not self.output_path.exists() or self.output_path.stat().st_size != self.file_size:
+                need_prealloc = (not self.output_path.exists()
+                                 or self.output_path.stat().st_size != self.file_size)
+                if need_prealloc:
                     logger.info(f"[SegmentedReconstructor] 预分配文件空间: {self.file_size} bytes")
                     with open(self.output_path, 'wb') as f:
                         f.seek(self.file_size - 1)
