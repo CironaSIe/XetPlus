@@ -16,6 +16,7 @@
 """
 import json
 import logging
+import os
 import threading
 import time
 import queue
@@ -249,6 +250,14 @@ class SegmentedReconstructor:
         # 全局写队列（并行模式使用）
         self._write_queue: Optional[queue.Queue] = None
         self._writer_thread: Optional[threading.Thread] = None
+        # Writer 累计写入量（并行模式下 writer 线程独有，无需加锁）
+        self._total_written: int = 0
+        # Writer 异常传播（daemon 线程异常不会自动传播到主线程）
+        self._writer_exception: Optional[Exception] = None
+        self._writer_exception_event = threading.Event()
+        # 异步 checkpoint 保存（避免写盘 I/O 阻塞 writer 写入循环）
+        self._checkpoint_dirty: bool = False
+        self._checkpoint_timer: Optional[threading.Timer] = None
 
         logger.info(
             f"[SegmentedReconstructor] 初始化完成: "
@@ -499,6 +508,7 @@ class SegmentedReconstructor:
         # 3. 使用线程池并行处理
         success_count = 0
         failed_segments = []
+        any_worker_failed = False
 
         with ThreadPoolExecutor(max_workers=self.parallel_segments) as executor:
             # 提交所有待处理段
@@ -512,19 +522,32 @@ class SegmentedReconstructor:
                 seg = future_to_seg[future]
 
                 # 检查中断信号
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() and not any_worker_failed:
                     logger.warning("[SegmentedReconstructor] 用户中断，取消所有段")
                     for f in future_to_seg:
                         f.cancel()
                     raise KeyboardInterrupt()
 
+                # 检查 writer 线程是否崩溃
+                if self._writer_exception_event.is_set():
+                    logger.error("[SegmentedReconstructor] Writer 线程已崩溃，取消所有段")
+                    self._stop_event.set()
+                    for f in future_to_seg:
+                        f.cancel()
+                    raise RuntimeError("Writer 线程崩溃") from self._writer_exception
+
                 try:
                     future.result()
                     success_count += 1
-                    logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 完成")
+                    logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 下载完成")
                 except Exception as e:
                     logger.error(f"[SegmentedReconstructor] 段 {seg.index} 失败: {e}")
                     failed_segments.append((seg, e))
+                    # 任一段失败 → 通知所有 worker 和 writer 停止
+                    any_worker_failed = True
+                    self._stop_event.set()
+                    for f in future_to_seg:
+                        f.cancel()
 
         # 4. 停止writer线程
         self._write_queue.put(None)
@@ -546,7 +569,8 @@ class SegmentedReconstructor:
     def _writer_worker(self) -> None:
         """全局writer线程（接收写入任务并执行）。
 
-        从write_queue接收 (offset, data) 元组，写入文件。
+        从write_queue接收 (offset, data, seg_index) 元组，写入文件。
+        写入+fsync后负责标记段完成和上报进度。
         收到 None 时退出。
         """
         logger.debug("[SegmentWriter] 启动")
@@ -555,27 +579,62 @@ class SegmentedReconstructor:
             # 打开文件（r+b模式）
             with open(self.output_path, 'r+b') as f:
                 while True:
-                    # 从队列获取任务
-                    item = self._write_queue.get()
+                    # 检查停止信号（避免队列空时卡住无法退出）
+                    if self._stop_event.is_set():
+                        logger.debug("[SegmentWriter] 停止信号已设置，退出")
+                        break
+
+                    # 从队列获取任务（带超时防止 StopEvent 无法被感知）
+                    try:
+                        item = self._write_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
 
                     # None 表示结束
                     if item is None:
                         logger.debug("[SegmentWriter] 收到停止信号")
                         break
 
-                    offset, data = item
+                    offset, data, seg_index = item
 
                     # 写入文件
                     f.seek(offset)
                     f.write(data)
                     f.flush()
+                    os.fsync(f.fileno())
+
+                    self._total_written += len(data)
+
+                    # Writer 负责标记段完成（数据已落盘）
+                    self._mark_segment_completed_by_index(seg_index)
 
                     logger.debug(
-                        f"[SegmentWriter] 写入完成: offset={offset}, size={len(data)}"
+                        f"[SegmentWriter] 写入完成: offset={offset}, size={len(data)}, "
+                        f"seg_index={seg_index}, total_written={self._total_written}"
                     )
+
+                    # Writer 是 bytes 和段进度的唯一来源
+                    if self.progress_callback:
+                        with self._lock:
+                            completed_count = len(self.completed_segments)
+                        self.progress_callback({
+                            'assembled_bytes': self._total_written,
+                            'total_bytes': self.file_size,
+                            'downloaded_bytes': self._total_written,
+                            'progress_pct': (
+                                self._total_written / self.file_size * 100
+                            ) if self.file_size > 0 else 0,
+                            'completed_segments': completed_count,
+                            'total_segments': len(self.segments),
+                            'current_segment': completed_count
+                                if completed_count < len(self.segments)
+                                else len(self.segments),
+                        })
 
         except Exception as e:
             logger.error(f"[SegmentWriter] 写入失败: {e}")
+            self._writer_exception = e
+            self._writer_exception_event.set()
             raise
 
         logger.debug("[SegmentWriter] 退出")
@@ -611,13 +670,10 @@ class SegmentedReconstructor:
         # 2. 下载和重建数据到内存
         segment_data = self._download_and_assemble_segment(seg, recon)
 
-        # 3. 发送到write_queue
-        self._write_queue.put((seg.start, segment_data))
+        # 3. 发送到write_queue（含 seg_index，由 writer 落盘后标记完成）
+        self._write_queue.put((seg.start, segment_data, seg.index))
 
-        # 4. 标记完成并保存 checkpoint
-        self._mark_segment_completed(seg)
-
-        logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 完成: {len(segment_data)} bytes")
+        logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 下载+解压完成: {len(segment_data)} bytes, 已入队等待写入")
 
     def _stream_assembly_to_temp(self, seg: SegmentInfo, recon, seg_temp: Path) -> None:
         """用 ChunkAssembler 流式组装段数据到临时文件。
@@ -629,17 +685,26 @@ class SegmentedReconstructor:
         """
         # 在创建 ProgressTracker 之前先计算基础值（断点续传时 .part 文件已有数据）
         if self.parallel_segments > 1:
-            # 并行模式：初始进度已在 reconstruct_file() 中报告，段间不叠加
+            # 并行模式：bytes 级进度由 writer 线程上报，worker 只报 xorbs/terms/segments
             base_bytes = 0
+            _worker_cb = lambda stats: self.progress_callback({
+                k: v for k, v in stats.items()
+                if k in (
+                    'total_xorbs', 'completed_xorbs', 'active_xorbs',
+                    'total_terms', 'processed_terms',
+                    'total_segments', 'completed_segments', 'current_segment',
+                )
+            })
         else:
             # 串行模式：seg.start 是已完成段的偏移，累加显示正确
             base_bytes = seg.start
+            _worker_cb = self.progress_callback
         part_path = self.temp_dir / f"seg_{seg.index}.tmp.part"
         if part_path.exists():
             base_bytes += part_path.stat().st_size
 
         progress_tracker = ProgressTracker(
-            callback=self.progress_callback,
+            callback=_worker_cb,
             initial_assembled=base_bytes,
         )
         # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
@@ -778,6 +843,8 @@ class SegmentedReconstructor:
                 f.seek(seg.start)
                 with open(seg_temp, 'rb') as src:
                     shutil.copyfileobj(src, f)
+                f.flush()
+                os.fsync(f.fileno())
 
             # 仅在成功完成后清理临时文件（中断时保留以支持断点续传）
             if seg_temp.exists():
@@ -818,12 +885,14 @@ class SegmentedReconstructor:
                 logger.debug(f"[SegmentedReconstructor] 清理临时文件: {seg_temp}")
 
     def _mark_segment_completed(self, seg: SegmentInfo) -> None:
-        """标记段为已完成并保存 checkpoint。
+        """标记段为已完成并保存 checkpoint（同步模式，模式 ② 使用）。
 
         Args:
             seg: 分段信息
         """
         with self._lock:
+            if seg.completed:
+                return
             seg.completed = True
             self.completed_segments.append({
                 'index': seg.index,
@@ -833,11 +902,52 @@ class SegmentedReconstructor:
             })
             self.completed_set.add((seg.start, seg.end))
 
-            # 保存 checkpoint
-            self.segment_checkpoint.save(
-                file_hash=self.file_hash,
-                completed_segments=self.completed_segments,
-            )
+        # 保存 checkpoint
+        self.segment_checkpoint.save(
+            file_hash=self.file_hash,
+            completed_segments=self.completed_segments,
+        )
+
+    def _mark_segment_completed_by_index(self, seg_index: int) -> None:
+        """Writer 线程：落盘后标记段完成，并触发异步 checkpoint 保存。
+
+        Args:
+            seg_index: 段索引
+        """
+        with self._lock:
+            seg = self.segments[seg_index]
+            if seg.completed:
+                return  # 防重复标记（writer 队列可能包含相同 seg 的旧数据）
+            seg.completed = True
+            self.completed_segments.append({
+                'index': seg.index,
+                'start': seg.start,
+                'end': seg.end,
+                'size': seg.size,
+            })
+            self.completed_set.add((seg.start, seg.end))
+
+        # 异步保存 checkpoint（不阻塞 writer 写入循环）
+        self._schedule_checkpoint_save()
+
+    def _schedule_checkpoint_save(self) -> None:
+        """安排异步 checkpoint 保存（合并多个段写入一次保存）。"""
+        self._checkpoint_dirty = True
+        if self._checkpoint_timer is None:
+            self._checkpoint_timer = threading.Timer(1.0, self._flush_checkpoint)
+            self._checkpoint_timer.daemon = True
+            self._checkpoint_timer.start()
+
+    def _flush_checkpoint(self) -> None:
+        """执行 checkpoint 保存（在 Timer 线程中运行）。"""
+        with self._lock:
+            if self._checkpoint_dirty:
+                self.segment_checkpoint.save(
+                    file_hash=self.file_hash,
+                    completed_segments=self.completed_segments,
+                )
+                self._checkpoint_dirty = False
+            self._checkpoint_timer = None
 
     def stop(self) -> None:
         """停止重建（触发中断）。"""
