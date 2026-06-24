@@ -543,8 +543,12 @@ class SegmentedReconstructor:
                     success_count += 1
                     logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 下载完成")
                 except Exception as e:
-                    logger.error(f"[SegmentedReconstructor] 段 {seg.index} 失败: {e}")
-                    failed_segments.append((seg, e))
+                    # cancelled 是可预期的（其他段失败后触发），不认为是失败
+                    if not future.cancelled():
+                        logger.error(f"[SegmentedReconstructor] 段 {seg.index} 失败: {e}")
+                        failed_segments.append((seg, e))
+                    else:
+                        logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 被取消")
                     # 任一段失败 → 通知所有 worker 和 writer 停止
                     any_worker_failed = True
                     self._stop_event.set()
@@ -581,15 +585,14 @@ class SegmentedReconstructor:
             # 打开文件（r+b模式）
             with open(self.output_path, 'r+b') as f:
                 while True:
-                    # 检查停止信号（避免队列空时卡住无法退出）
-                    if self._stop_event.is_set():
-                        logger.debug("[SegmentWriter] 停止信号已设置，退出")
-                        break
-
-                    # 从队列获取任务（带超时防止 StopEvent 无法被感知）
+                    # 从队列获取任务（带超时，定期检查停止信号）
                     try:
                         item = self._write_queue.get(timeout=1.0)
                     except queue.Empty:
+                        # 队列空时检查是否需要退出
+                        if self._stop_event.is_set():
+                            logger.debug("[SegmentWriter] 队列空 + 停止信号，退出")
+                            break
                         continue
 
                     # None 表示结束
@@ -671,6 +674,11 @@ class SegmentedReconstructor:
 
         # 2. 下载和重建数据到内存
         segment_data = self._download_and_assemble_segment(seg, recon)
+
+        # 2.5. 检查是否已被停止（其他 worker 失败或 Ctrl+C）
+        if self._stop_event.is_set():
+            logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 已取消，丢弃下载数据")
+            return
 
         # 3. 发送到write_queue（含 seg_index，由 writer 落盘后标记完成）
         self._write_queue.put((seg.start, segment_data, seg.index))
