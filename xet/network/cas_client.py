@@ -416,7 +416,7 @@ class CASClient:
         min_speed: int = 50 * 1024,  # 50 KB/s
         check_interval: float = 10.0,  # 每 10s 检查一次
         low_speed_grace: float = 30.0,  # 连续低速 30s 触发重试
-    ) -> bytes:
+    ) -> bytearray:
         """下载 xorb 数据（带低速检测）。
 
         使用流式下载，每隔 check_interval 检查速度。
@@ -503,7 +503,7 @@ class CASClient:
                 last_check_time = now
                 last_check_received = total_received
 
-        return bytes(buffer)  # 转为 bytes 匹配返回类型
+        return buffer
 
     def get_xorb_data_with_retry(
         self,
@@ -512,7 +512,7 @@ class CASClient:
         xorb_hash: str,
         file_hash: str,
         use_streaming: bool = False,
-    ) -> bytes:
+    ) -> bytes | bytearray:
         """带 URL/Token 自动刷新的 xorb 下载（高级重试逻辑）。
 
         集成所有高级特性：
