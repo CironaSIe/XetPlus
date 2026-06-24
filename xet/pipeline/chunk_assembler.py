@@ -7,6 +7,7 @@
 1. 批量模式（已弃用）：先下载所有 xorb，再按需解压 - 大文件会 OOM
 2. 预取模式（推荐）：按需下载和解压，水位线控制 - 内存占用可控
 """
+import hashlib
 import logging
 import threading
 import time
@@ -531,6 +532,105 @@ class ChunkAssembler(PrefetchHelpers):
             )
 
     @staticmethod
+    def _verify_resume_terms(part_path, recon, offset_into_first,
+                             per_term_hashes, expected_start_term_idx,
+                             logger) -> int:
+        """续传时校验已写入文件中的 term 数据完整性。
+
+        从最后一个已完成的 term 开始，验证其 SHA256 与 checkpoint 记录一致。
+        如果最后 term 损坏，向前回溯找到第一个完好的 term 作为续传起点。
+
+        Args:
+            part_path: .part 文件路径
+            recon: reconstruction 数据（含 terms 列表）
+            offset_into_first: 第一个 term 的偏移量
+            per_term_hashes: checkpoint 中存储的 {term_idx: TermHashRecord}
+            expected_start_term_idx: checkpoint 记录的起始 term
+            logger: logging 实例
+
+        Returns:
+            调整后的起始 term 索引（校验通过则不变，失败则回退）
+        """
+        if not part_path.exists() or not per_term_hashes:
+            return expected_start_term_idx
+
+        completed_indices = sorted(per_term_hashes.keys())
+        if not completed_indices:
+            return expected_start_term_idx
+
+        logger.info(
+            f"[ChunkAssembler] 续传校验: 检查全部 {len(completed_indices)} 个已完成 term "
+            f"(#{completed_indices[0]}~#{completed_indices[-1]}), "
+            f"目标起点 Term #{expected_start_term_idx}"
+        )
+        terms_to_check = completed_indices
+
+        with open(part_path, 'rb') as f:
+            for term_idx in reversed(terms_to_check):
+                if term_idx >= expected_start_term_idx:
+                    logger.info(
+                        f"[ChunkAssembler] 续传校验: Term #{term_idx} >= "
+                        f"目标起点 #{expected_start_term_idx}, 跳过"
+                    )
+                    continue
+                record = per_term_hashes.get(term_idx)
+                if not record:
+                    logger.info(
+                        f"[ChunkAssembler] 续传校验: Term #{term_idx} 无 hash 记录, 跳过"
+                    )
+                    continue
+
+                try:
+                    f.seek(record.file_offset)
+                    data = f.read(record.unpacked_length)
+                    if len(data) != record.unpacked_length:
+                        logger.warning(
+                            f"[ChunkAssembler] 续传校验: Term #{term_idx} 文件不完整: "
+                            f"期望 {record.unpacked_length} bytes, "
+                            f"实际 {len(data)} bytes, 跳过继续检查"
+                        )
+                        continue
+
+                    actual_hash = hashlib.sha256(data).hexdigest()
+                    if actual_hash == record.sha256:
+                        good_start = term_idx + 1
+                        logger.warning(
+                            f"[ChunkAssembler] 续传校验: Term #{term_idx} ✅ "
+                            f"(offset={record.file_offset}, "
+                            f"len={record.unpacked_length}) "
+                            f"SHA256 匹配, 从 Term #{good_start} 继续"
+                        )
+                        return good_start
+                    else:
+                        logger.warning(
+                            f"[ChunkAssembler] 续传校验: Term #{term_idx} ❌ "
+                            f"(offset={record.file_offset}, "
+                            f"len={record.unpacked_length}) "
+                            f"SHA256 不匹配, 继续向前检查"
+                        )
+
+                except (OSError, IOError) as e:
+                    logger.warning(
+                        f"[ChunkAssembler] 续传校验: Term #{term_idx} 读取失败: {e}, "
+                        f"跳过继续检查"
+                    )
+                    continue
+
+        # 所有检查的 term 都损坏了，从第一个检查的 term 开始续传
+        first_checked = min(terms_to_check)
+        if first_checked < expected_start_term_idx:
+            logger.warning(
+                f"[ChunkAssembler] 续传校验: 已完成的 term 全部损坏, "
+                f"回退到 Term #{first_checked}"
+            )
+            return first_checked
+        logger.info(
+            f"[ChunkAssembler] 续传校验: 所有检查项均无有效回退, "
+            f"保持原起点 Term #{expected_start_term_idx}"
+        )
+        return expected_start_term_idx
+
+    @staticmethod
     def _estimate_restart_term(recon, actual_file_size: int) -> int:
         """根据实际文件大小估算应从哪个 term 重新开始。
 
@@ -579,8 +679,20 @@ class ChunkAssembler(PrefetchHelpers):
         total_written = 0
 
         # 计算从 checkpoint 恢复时已写入的字节数
+        # 优先使用 checkpoint.confirmed_bytes（续传时直接记录的实际写入量）
+        # 回退到从 terms 累加计算（兼容旧版 checkpoint）
+        confirmed_bytes = 0
         bytes_already_written = 0
-        if start_term_idx > 0:
+        if start_term_idx > 0 and checkpoint_manager and checkpoint_manager._cache:
+            confirmed_bytes = checkpoint_manager._cache.confirmed_bytes
+
+        if confirmed_bytes > 0:
+            bytes_already_written = confirmed_bytes
+            logger.debug(
+                f"[ChunkAssembler] Checkpoint 恢复: 已确认写入 {confirmed_bytes} bytes "
+                f"(从 confirmed_bytes), 将从 term {start_term_idx} 继续"
+            )
+        elif start_term_idx > 0:
             for i in range(start_term_idx):
                 term = recon.terms[i]
                 if i == 0:
@@ -588,9 +700,40 @@ class ChunkAssembler(PrefetchHelpers):
                 else:
                     bytes_already_written += term.unpacked_length
             logger.debug(
-                f"[ChunkAssembler] Checkpoint 恢复: 已写入 {bytes_already_written} bytes, "
-                f"将从 term {start_term_idx} 继续"
+                f"[ChunkAssembler] Checkpoint 恢复: 已写入 {bytes_already_written} bytes "
+                f"(从 terms 累加), 将从 term {start_term_idx} 继续"
             )
+
+        need_truncate = False
+
+        # === 续传 term 数据完整性校验 ===
+        # 用 checkpoint 记录的 per-term SHA256 验证 .part 文件中已完成 term 的数据
+        # 只对顺序写入模式生效（并行模式写入顺序不确定）
+        if start_term_idx > 0 and part_path.exists() and checkpoint_manager:
+            checkpoint = checkpoint_manager._cache
+            if checkpoint and checkpoint.per_term_hashes:
+                adjusted = self._verify_resume_terms(
+                    part_path, recon, recon.offset_into_first_range,
+                    checkpoint.per_term_hashes, start_term_idx, logger,
+                )
+                if adjusted < start_term_idx:
+                    old_start = start_term_idx
+                    start_term_idx = adjusted
+                    # 重新计算 bytes_already_written
+                    bytes_already_written = 0
+                    for i in range(start_term_idx):
+                        term = recon.terms[i]
+                        if i == 0:
+                            bytes_already_written += max(0, term.unpacked_length - recon.offset_into_first_range)
+                        else:
+                            bytes_already_written += term.unpacked_length
+                    logger.info(
+                        f"[ChunkAssembler] 续传校验后调整: "
+                        f"Term #{old_start} → Term #{start_term_idx}, "
+                        f"保留 {bytes_already_written / 1024 / 1024:.1f} MB, "
+                        f"稍后截断文件清除损坏数据"
+                    )
+                    need_truncate = True
 
         try:
             # 根据是否有 checkpoint 选择文件打开模式
@@ -600,8 +743,10 @@ class ChunkAssembler(PrefetchHelpers):
                 existing_size = part_path.stat().st_size
                 # 容差：term 级大小计算与实际文件大小可能存在微小差异
                 # （OS 块对齐、文件系统元数据等），差异 < 1MB 时视为一致
-                size_diff = abs(existing_size - bytes_already_written)
-                if size_diff > 1024 * 1024:  # 差异超过 1MB 才触发恢复调整
+                if need_truncate:
+                    # 校验已判定文件尾部数据损坏，直接截断，不进入大小比对
+                    pass
+                elif abs(existing_size - bytes_already_written) > 1024 * 1024:  # 差异超过 1MB 才触发恢复调整
                     if existing_size > bytes_already_written:
                         # 文件比预期大：说明上次运行写入了数据但 checkpoint 未保存
                         # （这是有效数据，不应截断！用实际文件大小作为恢复基准）
@@ -623,37 +768,82 @@ class ChunkAssembler(PrefetchHelpers):
                             )
                             start_term_idx = estimated_restart
                     else:
-                        # 文件比预期小：部分数据未 flush 到磁盘。
-                        # 根据实际文件大小估算最后一个完整 term，保留已有数据。
-                        estimated_restart = self._estimate_restart_term(
-                            recon, existing_size
-                        )
-                        if estimated_restart < start_term_idx:
-                            old_start = start_term_idx
-                            start_term_idx = estimated_restart
-                            bytes_already_written = existing_size
+                        # 文件比预期小：部分数据未 flush 到磁盘或数据丢失。
+                        # 使用 confirmed_bytes（如果有）作为更准确的基准。
+                        if confirmed_bytes > 0 and existing_size >= confirmed_bytes:
+                            # confirmed_bytes 是上次保存时确实在磁盘上的量，
+                            # 只要文件大小 >= confirmed_bytes，数据就没丢。
+                            # 但 bytes_already_written 可能高估（因 OS 缓存延迟）。
+                            # 用实际文件大小重新估算起始 term。
                             logger.warning(
-                                f"[ChunkAssembler] 文件不完整: "
-                                f"期望 {bytes_already_written / 1024 / 1024:.1f} MB, "
-                                f"实际 {existing_size / 1024 / 1024:.1f} MB. "
-                                f"回退到 Term #{start_term_idx}（原计划 #{old_start}），"
-                                f"保留 {existing_size / 1024 / 1024:.1f} MB 已有数据"
+                                f"[ChunkAssembler] 文件大小 {existing_size / 1024 / 1024:.1f} MB "
+                                f"介于 checkpoint 确认 {confirmed_bytes / 1024 / 1024:.1f} MB "
+                                f"与期望 {bytes_already_written / 1024 / 1024:.1f} MB 之间，"
+                                f"按实际大小估算续传位置"
                             )
+                            estimated_restart = self._estimate_restart_term(
+                                recon, existing_size
+                            )
+                            if estimated_restart < start_term_idx:
+                                start_term_idx = estimated_restart
+                                bytes_already_written = existing_size
                         else:
-                            # 文件虽小但差距不大，可能是 OS 缓存延迟，仍尝试继续
-                            logger.info(
-                                f"[ChunkAssembler] 文件略小于预期 "
-                                f"({existing_size}/{bytes_already_written})，"
-                                f"尝试从 Term #{start_term_idx} 继续写入"
+                            # 无 confirmed_bytes 或文件比 confirmed 还小：数据丢失
+                            estimated_restart = self._estimate_restart_term(
+                                recon, existing_size
                             )
+                            if estimated_restart < start_term_idx:
+                                old_start = start_term_idx
+                                start_term_idx = estimated_restart
+                                bytes_already_written = existing_size
+                                if confirmed_bytes > 0:
+                                    logger.warning(
+                                        f"[ChunkAssembler] 数据丢失: "
+                                        f"checkpoint 确认 {confirmed_bytes / 1024 / 1024:.1f} MB, "
+                                        f"但文件只有 {existing_size / 1024 / 1024:.1f} MB. "
+                                        f"回退到 Term #{start_term_idx}（原计划 #{old_start}）"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[ChunkAssembler] 文件不完整: "
+                                        f"期望 {bytes_already_written / 1024 / 1024:.1f} MB, "
+                                        f"实际 {existing_size / 1024 / 1024:.1f} MB. "
+                                        f"回退到 Term #{start_term_idx}（原计划 #{old_start}），"
+                                        f"保留 {existing_size / 1024 / 1024:.1f} MB 已有数据"
+                                    )
+                else:
+                    # 文件虽小但差距不大，可能是 OS 缓存延迟，仍尝试继续
+                    logger.info(
+                        f"[ChunkAssembler] 文件略小于预期 "
+                        f"({existing_size}/{bytes_already_written})，"
+                        f"尝试从 Term #{start_term_idx} 继续写入"
+                    )
             else:
                 # 全新下载：使用 wb 模式
                 file_mode = 'wb'
 
             with open(part_path, file_mode) as f:
-                # 如果是追加模式，seek 到文件末尾
                 if file_mode == 'r+b':
-                    f.seek(0, 2)  # SEEK_END
+                    if need_truncate:
+                        # 修正进度基线：baseline 之前包含了整个 .part 文件大小，
+                        # truncate 后实际已确认数据变少，需同步调低
+                        orig_baseline = progress_tracker.get_assembled_bytes() if progress_tracker else 0
+                        logger.info(
+                            f"[ChunkAssembler] 截断文件到 {bytes_already_written / 1024 / 1024:.1f} MB, "
+                            f"清除损坏数据"
+                        )
+                        f.truncate(bytes_already_written)
+                        f.seek(bytes_already_written)
+                        if progress_tracker:
+                            baseline_correction = bytes_already_written - existing_size
+                            progress_tracker.adjust_assembled(baseline_correction)
+                            logger.debug(
+                                f"[ChunkAssembler] 进度基线修正: "
+                                f"{orig_baseline / 1024 / 1024:.1f} MB → "
+                                f"{progress_tracker.get_assembled_bytes() / 1024 / 1024:.1f} MB"
+                            )
+                    else:
+                        f.seek(0, 2)  # SEEK_END
                     current_pos = f.tell()
                     logger.debug(f"[ChunkAssembler] 文件指针位置: {current_pos}")
 
@@ -732,6 +922,10 @@ class ChunkAssembler(PrefetchHelpers):
                             )
                         segment = segment[offset:]
 
+                    # ★ 计算 per-term SHA256（segment 已调整完毕）
+                    segment_hash = hashlib.sha256(segment).hexdigest()
+                    file_offset = f.tell()  # 写入前的文件绝对偏移
+
                     # 写入文件
                     f.write(segment)
                     total_written += len(segment)
@@ -743,13 +937,23 @@ class ChunkAssembler(PrefetchHelpers):
                         progress_tracker.increment_assembled(len(segment))
                         progress_tracker.increment_terms(1)
 
-                    # Term 级 checkpoint（使用配置的保存间隔）
+                    # Term 级 checkpoint + per-term SHA256
                     if checkpoint_manager:
                         checkpoint_manager.mark_term_completed(
                             file_hash=file_hash,
                             term_idx=term_idx,
                             xorb_hash=term.hash,
-                            save_interval=self.checkpoint_interval
+                            save_interval=self.checkpoint_interval,
+                            confirmed_bytes=f.tell(),
+                        )
+                        checkpoint_manager.record_term_hash(
+                            file_hash=file_hash,
+                            term_index=term_idx,
+                            sha256=segment_hash,
+                            file_offset=file_offset,
+                            unpacked_length=len(segment),
+                            xorb_hash=term.hash,
+                            save_interval=self.checkpoint_interval,
                         )
 
                     # 检查是否可以释放 xorb
@@ -922,6 +1126,10 @@ class ChunkAssembler(PrefetchHelpers):
                         )
                     segment = segment[offset:]
 
+                # ★ 计算 per-term SHA256（segment 已调整完毕）
+                segment_hash = hashlib.sha256(segment).hexdigest()
+                file_offset = max(0, current_offset)
+
                 # 计算写入偏移量
                 write_offset = max(0, current_offset)
 
@@ -938,13 +1146,23 @@ class ChunkAssembler(PrefetchHelpers):
                 if progress_tracker:
                     progress_tracker.increment_terms(1)
 
-                # Term 级 checkpoint
+                # Term 级 checkpoint + per-term SHA256
                 if checkpoint_manager:
                     checkpoint_manager.mark_term_completed(
                         file_hash=file_hash,
                         term_idx=term_idx,
                         xorb_hash=term.hash,
-                        save_interval=self.checkpoint_interval
+                        save_interval=self.checkpoint_interval,
+                        confirmed_bytes=current_offset,
+                    )
+                    checkpoint_manager.record_term_hash(
+                        file_hash=file_hash,
+                        term_index=term_idx,
+                        sha256=segment_hash,
+                        file_offset=file_offset,
+                        unpacked_length=len(segment),
+                        xorb_hash=term.hash,
+                        save_interval=self.checkpoint_interval,
                     )
 
                 # 检查是否可以释放 xorb

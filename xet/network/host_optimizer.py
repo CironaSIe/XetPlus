@@ -367,38 +367,43 @@ class HostOptimizer:
             logger.warning("[HostOpt] 所有 IP 均不可达")
             return self.mappings, False, bool(all_ips)
 
-        # 4. HTTP Transfer 测速（对 Top 候选）
-        transfer_results = self._transfer_test_top(results)
-
-        # 5. 证书验证（仅对每个域名 Top N 候选，不全部验证）
-        cert_results = {}
-        cert_top_n = 3  # 每个域最多验证前 3 个
-        if transfer_results:
+        # 4. 证书验证（RTT 通全部候选 — 先验证再测速）
+        #    顺序：RTT → 证书 → HTTP Transfer
+        #    先过滤掉证书不达标的 IP，避免在拦截/伪造节点上浪费 HTTP 测速时间
+        _cert_start_note = sum(len(v) for v in results.values())
+        logger.info(f"[HostOpt] 证书验证 {_cert_start_note} 个候选...")
+        cert_results: Dict[Tuple[str, str], Tuple[bool, Optional[str], Optional[str]]] = {}
+        _all_cert_tasks = [(domain, ip) for domain, cands in results.items() for ip, _, _ in cands]
+        if _all_cert_tasks:
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-            futures = {}
+            _cert_futures = {}
+            for domain, ip in _all_cert_tasks:
+                _f = executor.submit(self._validate_ip_with_certificate, ip, domain)
+                _cert_futures[_f] = (domain, ip)
             try:
-                for domain, transfers in transfer_results.items():
-                    # 只取 Top N 做证书验证（按 speed 降序）
-                    sorted_transfers = sorted(transfers, key=lambda x: -x[3])
-                    for ip, use_proxy, rtt, speed in sorted_transfers[:cert_top_n]:
-                        future = executor.submit(
-                            self._validate_ip_with_certificate, ip, domain
-                        )
-                        futures[future] = (domain, ip)
-
-                try:
-                    for future in concurrent.futures.as_completed(futures, timeout=30):
-                        domain, ip = futures[future]
-                        try:
-                            valid, issuer, error = future.result()
-                            cert_results[(domain, ip)] = (valid, issuer, error)
-                        except Exception as e:
-                            logger.debug(f"[HostOpt] 证书验证异常 {ip}: {e}")
-                            cert_results[(domain, ip)] = (False, None, str(e))
-                except concurrent.futures.TimeoutError:
-                    logger.debug("[HostOpt] 证书验证部分超时，使用已完成结果")
+                for _f in concurrent.futures.as_completed(_cert_futures, timeout=25):
+                    domain, ip = _cert_futures[_f]
+                    try:
+                        cert_results[(domain, ip)] = _f.result()
+                    except Exception as e:
+                        cert_results[(domain, ip)] = (False, None, str(e))
+            except concurrent.futures.TimeoutError:
+                logger.debug("[HostOpt] 证书验证部分超时")
             finally:
                 executor.shutdown(wait=False)
+            _n_pass = sum(1 for v in cert_results.values() if v[0])
+            logger.info(f"[HostOpt] 证书验证完成: {_n_pass}/{len(cert_results)} 通过")
+
+        # 5. HTTP Transfer 测速（仅对证书有效的候选 + 未验证的 fallback）
+        #    用证书结果过滤 results，证书通过的保留；全部未通过的域名仍保留所有候选
+        _cert_passed: Set[Tuple[str, str]] = {
+            (d, ip) for (d, ip), (v, _, _) in cert_results.items() if v
+        }
+        _transfer_input = {}
+        for domain, cands in results.items():
+            _filtered = [(ip, p, r) for ip, p, r in cands if (domain, ip) in _cert_passed]
+            _transfer_input[domain] = _filtered if _filtered else cands
+        transfer_results = self._transfer_test_top(_transfer_input)
 
         # 6. 按域名选最优 + 保存详细结果
         for domain, candidates in results.items():
@@ -652,13 +657,19 @@ class HostOptimizer:
         finally:
             session.close()
 
+    MAX_CANDIDATES_PER_DOMAIN = 99  # 防呆上限，实际不限制
+
     def _speed_test_all(
         self, all_ips: Dict[str, List[str]]
     ) -> Dict[str, List[Tuple[str, bool, float]]]:
-        """对所有 IP 并行测速。
+        """对所有 IP 并行测速，每个域名保留 Top N 个最快候选。
+
+        大量 IP 候选（有时 40+）在 HTTP Transfer 测速阶段会非常慢。
+        这里用 TCP RTT 快速筛选，只保留最快的 N 个（直连+代理各保留），
+        后续 HTTP 测速大幅减少连接数。
 
         Returns:
-            {domain: [(ip, use_proxy, rtt), ...]}
+            {domain: [(ip, use_proxy, rtt), ...]} 最多 MAX_CANDIDATES_PER_DOMAIN 个
         """
         results: Dict[str, List] = {}
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
@@ -691,7 +702,21 @@ class HostOptimizer:
                 logger.debug("[HostOpt] TCP 测速部分超时，使用已完成结果")
         finally:
             executor.shutdown(wait=False)
-        return results
+
+        # 每个域名按 RTT 排序，只保留 Top N 个
+        trimmed = {}
+        for domain, candidates in results.items():
+            # 按 RTT 升序（最快的在前）
+            candidates.sort(key=lambda x: x[2])
+            if len(candidates) > self.MAX_CANDIDATES_PER_DOMAIN:
+                logger.debug(
+                    f"[HostOpt] {domain}: {len(candidates)} 候选 → "
+                    f"裁剪为 Top {self.MAX_CANDIDATES_PER_DOMAIN}（RTT 最快）"
+                )
+                trimmed[domain] = candidates[:self.MAX_CANDIDATES_PER_DOMAIN]
+            else:
+                trimmed[domain] = candidates
+        return trimmed
 
     def _tcp_rtt(self, ip: str, port: int, use_proxy: bool) -> Optional[float]:
         """TCP 连接测速。
@@ -712,8 +737,9 @@ class HostOptimizer:
 
         try:
             start = time.time()
+            conn_timeout = 2 if not use_proxy else 3
             sock = socket.create_connection(
-                (target_host, target_port), timeout=3
+                (target_host, target_port), timeout=conn_timeout
             )
             rtt = time.time() - start
             sock.close()
@@ -795,9 +821,14 @@ class HostOptimizer:
                     best_for_api = primary_candidates[0]
 
                 ip, use_proxy, rtt = best_for_api
-                logger.info(f"[HostOpt] 获取 presigned URL: {ip} ({'代理' if use_proxy else '直连'})")
+                _print(f"  CAS API 延迟测速 {ip} ({'代理' if use_proxy else '直连'})...")
+                # 用线程 + 超时兜底，防止 Windows + SSL socket 的 getresponse() 无限阻塞
+                _api_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
-                    api_result = self._cas_api_test(ip, _primary_cas_domain, use_proxy)
+                    _api_future = _api_executor.submit(
+                        self._cas_api_test, ip, _primary_cas_domain, use_proxy
+                    )
+                    api_result = _api_future.result(timeout=8)
                     if api_result:
                         _latency_ms, data_url = api_result
                         if data_url:
@@ -810,8 +841,13 @@ class HostOptimizer:
                             )
                     else:
                         logger.debug(f"[HostOpt] Presigned URL 获取失败（将跳过 DATA 测速）")
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"[HostOpt] Presigned URL 请求超时（8s），将跳过 DATA 测速")
+                    _print(f"  CAS API 延迟测速超时（8s），DATA 域名将用 RTT 选 IP")
                 except Exception as e:
                     logger.debug(f"[HostOpt] Presigned URL 获取异常: {e}")
+                finally:
+                    _api_executor.shutdown(wait=False)
 
         # ---- 非 CAS 域名（API / DATA）：HTTP Transfer 测速 ----
         if non_cas_domains:
@@ -996,7 +1032,7 @@ class HostOptimizer:
 
                 # Python 3.13+ 不支持 server_hostname 参数
                 # 需要先创建连接，再手动 wrap socket
-                conn = _http_client.HTTPConnection(ip, 443, timeout=10)
+                conn = _http_client.HTTPConnection(ip, 443, timeout=3)
                 conn.connect()
 
                 # 手动进行 TLS 握手，设置 SNI
@@ -1167,7 +1203,7 @@ class HostOptimizer:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_REQUIRED
 
-                conn = _http_client.HTTPConnection(ip, 443, timeout=6)
+                conn = _http_client.HTTPConnection(ip, 443, timeout=3)
                 conn.connect()
                 conn.sock = ctx.wrap_socket(conn.sock, server_hostname=domain)
                 conn.request("GET", cas_path, headers=headers)
@@ -1286,7 +1322,7 @@ class HostOptimizer:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_REQUIRED
 
-                conn = _http_client.HTTPConnection(ip, 443, timeout=10)
+                conn = _http_client.HTTPConnection(ip, 443, timeout=3)
                 conn.connect()
                 conn.sock = ctx.wrap_socket(conn.sock, server_hostname=domain)
                 conn.request("GET", url_path, headers=headers)

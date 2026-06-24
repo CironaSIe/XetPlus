@@ -3,7 +3,7 @@
 定义 Pipeline Layer 使用的数据类型，包括下载任务、checkpoint 等。
 """
 from dataclasses import dataclass, field
-from typing import Set
+from typing import Set, Dict, Optional
 
 from xet.protocol.types import HttpRange
 
@@ -37,6 +37,26 @@ class XorbDownloadTask:
 
 
 @dataclass
+class TermHashRecord:
+    """单个 term 的 SHA256 校验记录。
+
+    在组装时计算并持久化，用于后续的 verify 和 repair 操作。
+
+    Attributes:
+        term_index: term 索引
+        sha256: SHA256(segment) 十六进制字符串
+        file_offset: 该 term 在最终文件中的起始偏移
+        unpacked_length: segment 长度（用于读取文件指定范围）
+        xorb_hash: 来源 xorb hash（repair 时需要下载）
+    """
+    term_index: int
+    sha256: str
+    file_offset: int
+    unpacked_length: int
+    xorb_hash: str
+
+
+@dataclass
 class ReconstructionCheckpoint:
     """文件重建 checkpoint。
 
@@ -49,13 +69,19 @@ class ReconstructionCheckpoint:
         last_term_index: 最后完成的 term 索引（用于快速恢复）
         timestamp: checkpoint 更新时间戳（秒）
         version: checkpoint 格式版本
+        per_term_hashes: term 级 SHA256 校验记录（用于 verify/repair）
+        expected_sha256: 服务器提供的文件级 SHA256（验证锚点）
+        confirmed_bytes: 上次保存时确认已写入磁盘的字节数（续传校验用）
     """
     file_hash: str
     completed_xorbs: Set[str] = field(default_factory=set)
     completed_terms: Set[tuple] = field(default_factory=set)  # {(term_idx, xorb_hash)}
     last_term_index: int = -1
     timestamp: int = 0
-    version: int = 2  # 升级到 v2（支持 term 级）
+    version: int = 5  # v5: 新增 confirmed_bytes
+    per_term_hashes: Dict[int, TermHashRecord] = field(default_factory=dict)
+    expected_sha256: str = ""  # 服务器提供的文件级 SHA256（验证锚点）
+    confirmed_bytes: int = 0  # 续传时验证写入量的基准
 
     def __post_init__(self):
         """验证数据。"""
@@ -70,15 +96,58 @@ class ReconstructionCheckpoint:
         """
         self.completed_xorbs.add(xorb_hash)
 
-    def mark_term_completed(self, term_idx: int, xorb_hash: str) -> None:
+    def mark_term_completed(self, term_idx: int, xorb_hash: str,
+                            confirmed_bytes: int = 0) -> None:
         """标记一个 term 为已完成。
 
         Args:
             term_idx: term 索引
             xorb_hash: term 所属的 xorb hash
+            confirmed_bytes: 当前已写入文件的总字节数（用于续传校验）
         """
         self.completed_terms.add((term_idx, xorb_hash))
         self.last_term_index = max(self.last_term_index, term_idx)
+        if confirmed_bytes > self.confirmed_bytes:
+            self.confirmed_bytes = confirmed_bytes
+
+    def record_term_hash(self, term_index: int, sha256: str,
+                         file_offset: int, unpacked_length: int,
+                         xorb_hash: str) -> None:
+        """记录一个 term 的 SHA256 校验值。
+
+        Args:
+            term_index: term 索引
+            sha256: SHA256(segment) 十六进制字符串
+            file_offset: 该 term 在文件中的起始偏移
+            unpacked_length: segment 长度
+            xorb_hash: 来源 xorb hash
+        """
+        self.per_term_hashes[term_index] = TermHashRecord(
+            term_index=term_index,
+            sha256=sha256,
+            file_offset=file_offset,
+            unpacked_length=unpacked_length,
+            xorb_hash=xorb_hash,
+        )
+
+    def has_per_term_hashes(self) -> bool:
+        """检查是否包含 per-term 校验存档。
+
+        Returns:
+            True 如果包含 term 级校验记录
+        """
+        return len(self.per_term_hashes) > 0
+
+    def get_term_hash(self, term_index: int) -> Optional[TermHashRecord]:
+        """获取指定 term 的校验记录。
+
+        Args:
+            term_index: term 索引
+
+        Returns:
+            TermHashRecord 或 None
+        """
+        return self.per_term_hashes.get(term_index)
 
     def is_term_completed(self, term_idx: int) -> bool:
         """检查一个 term 是否已完成。
@@ -108,14 +177,29 @@ class ReconstructionCheckpoint:
 
     def to_dict(self) -> dict:
         """序列化为字典。"""
-        return {
+        result = {
             "file_hash": self.file_hash,
             "completed_xorbs": list(self.completed_xorbs),
-            "completed_terms": [list(t) for t in self.completed_terms],  # [(idx, hash), ...]
+            "completed_terms": [list(t) for t in self.completed_terms],
             "last_term_index": self.last_term_index,
             "timestamp": self.timestamp,
             "version": self.version,
+            "per_term_hashes": {
+                str(k): {
+                    "term_index": v.term_index,
+                    "sha256": v.sha256,
+                    "file_offset": v.file_offset,
+                    "unpacked_length": v.unpacked_length,
+                    "xorb_hash": v.xorb_hash,
+                }
+                for k, v in self.per_term_hashes.items()
+            },
         }
+        if self.expected_sha256:
+            result["expected_sha256"] = self.expected_sha256
+        if self.confirmed_bytes:
+            result["confirmed_bytes"] = self.confirmed_bytes
+        return result
 
     @staticmethod
     def from_dict(data: dict) -> "ReconstructionCheckpoint":
@@ -125,6 +209,18 @@ class ReconstructionCheckpoint:
         if "completed_terms" in data:
             completed_terms = {tuple(t) for t in data["completed_terms"]}
 
+        # 兼容 v1/v2 格式（无 per_term_hashes）
+        per_term_hashes = {}
+        if "per_term_hashes" in data:
+            for k, v in data["per_term_hashes"].items():
+                per_term_hashes[int(k)] = TermHashRecord(
+                    term_index=v.get("term_index", int(k)),
+                    sha256=v["sha256"],
+                    file_offset=v["file_offset"],
+                    unpacked_length=v["unpacked_length"],
+                    xorb_hash=v["xorb_hash"],
+                )
+
         return ReconstructionCheckpoint(
             file_hash=data["file_hash"],
             completed_xorbs=set(data.get("completed_xorbs", [])),
@@ -132,4 +228,7 @@ class ReconstructionCheckpoint:
             last_term_index=data.get("last_term_index", -1),
             timestamp=data.get("timestamp", 0),
             version=data.get("version", 1),
+            per_term_hashes=per_term_hashes,
+            expected_sha256=data.get("expected_sha256", ""),
+            confirmed_bytes=data.get("confirmed_bytes", 0),
         )

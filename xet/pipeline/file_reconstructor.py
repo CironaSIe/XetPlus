@@ -274,36 +274,67 @@ class FileReconstructor:
             )
             logger.info(f"[FileReconstructor] 文件组装完成: {self.output_path}")
 
-            # 5. 清理 checkpoint
-            if self.checkpoint_manager:
-                logger.info("[FileReconstructor] 清理 checkpoint...")
-                self.checkpoint_manager.clear(file_hash)
-
-            # 6. 验证文件大小
+            # 5. 验证文件大小
             actual_size = self.output_path.stat().st_size
             if expected_size > 0 and actual_size != expected_size:
                 raise ReconstructionError(
                     f"文件大小不匹配: 期望 {expected_size}, 实际 {actual_size}"
                 )
 
-            # 7. 验证 SHA256（如果提供）
+            # 6. 验证 SHA256（如果提供）
+            sha256_ok = True
             if expected_sha256:
                 logger.info("[FileReconstructor] 计算文件 SHA256 校验和...")
                 actual_sha256 = calculate_sha256(self.output_path)
                 if actual_sha256.lower() != expected_sha256.lower():
-                    # 校验失败，删除损坏的文件
+                    sha256_ok = False
                     logger.error(
                         f"[FileReconstructor] SHA256 校验失败!\n"
                         f"  期望: {expected_sha256}\n"
                         f"  实际: {actual_sha256}"
                     )
-                    # 删除损坏的文件
-                    self.output_path.unlink(missing_ok=True)
-                    raise ReconstructionError(
-                        f"SHA256 校验失败: 期望 {expected_sha256[:16]}..., "
-                        f"实际 {actual_sha256[:16]}... (文件已删除)"
+                    # 保存期望 SHA256 到 checkpoint（供 verify 命令使用）
+                    try:
+                        if self.checkpoint_manager:
+                            self.checkpoint_manager.set_expected_sha256(file_hash, expected_sha256)
+                    except Exception:
+                        logger.warning("[FileReconstructor] 保存 expected_sha256 到 checkpoint 失败")
+
+                    # 保存 sidecar 文件（供 verify 命令查找 checkpoint）
+                    try:
+                        sidecar = self.output_path.with_suffix(self.output_path.suffix + ".xet_verify")
+                        import json
+                        with open(sidecar, 'w', encoding='utf-8') as vf:
+                            json.dump({
+                                'file_hash': file_hash,
+                                'size': actual_size,
+                                'expected_sha256': expected_sha256,
+                                'actual_sha256': actual_sha256,
+                                'version': 2,
+                            }, vf)
+                    except Exception:
+                        pass
+
+                    print(
+                        f"\n  ✗ SHA256 校验失败\n"
+                        f"    文件已保留: {self.output_path}\n"
+                        f"    运行以下命令验证和修复:\n"
+                        f"      xet verify {self.output_path}\n"
+                        f"      xet verify --repair {self.output_path}\n",
+                        flush=True,
                     )
-                logger.info(f"[FileReconstructor] ✅ SHA256 校验通过: {actual_sha256[:16]}...")
+
+            # 7. 清理 checkpoint（仅在 SHA256 校验通过或未启用校验时）
+            # 校验失败时保留 checkpoint 以备 verify/repair
+            if self.checkpoint_manager and sha256_ok:
+                logger.info("[FileReconstructor] 清理 checkpoint...")
+                self.checkpoint_manager.clear(file_hash)
+
+            if not sha256_ok:
+                raise ReconstructionError(
+                    f"SHA256 校验失败: 期望 {expected_sha256[:16]}..., "
+                    f"实际 {actual_sha256[:16]}... (文件已保留，请运行 xet verify --repair)"
+                )
 
             logger.info(
                 f"[FileReconstructor] ✅ 文件重建成功: {self.output_path} "
@@ -314,6 +345,9 @@ class FileReconstructor:
 
         except KeyboardInterrupt:
             logger.warning("[FileReconstructor] 用户中断")
+            raise
+
+        except ReconstructionError:
             raise
 
         except Exception as e:

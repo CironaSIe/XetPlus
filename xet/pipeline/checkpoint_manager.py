@@ -67,14 +67,7 @@ class CheckpointManager:
                     )
                     return None
 
-                checkpoint = ReconstructionCheckpoint(
-                    file_hash=data['file_hash'],
-                    completed_xorbs=set(data.get('completed_xorbs', [])),
-                    completed_terms=set(tuple(t) for t in data.get('completed_terms', [])),
-                    last_term_index=data.get('last_term_index', -1),
-                    timestamp=data.get('timestamp', 0),
-                    version=data.get('version', 1),
-                )
+                checkpoint = ReconstructionCheckpoint.from_dict(data)
 
                 logger.info(
                     f"[Checkpoint] 加载成功: {checkpoint.completion_count()} 个 xorb, "
@@ -101,32 +94,8 @@ class CheckpointManager:
 
         with self._lock:
             try:
-                # 确保目录存在
-                self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # 写入 JSON
-                with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
-                    json.dump(
-                        {
-                            'file_hash': checkpoint.file_hash,
-                            'completed_xorbs': list(checkpoint.completed_xorbs),
-                            'completed_terms': [list(t) for t in checkpoint.completed_terms],
-                            'last_term_index': checkpoint.last_term_index,
-                            'timestamp': checkpoint.timestamp,
-                            'version': checkpoint.version,
-                        },
-                        f,
-                        indent=2,
-                    )
-
-                # 更新缓存
-                self._cache = checkpoint
-
-                logger.debug(
-                    f"[Checkpoint] 保存成功: {checkpoint.completion_count()} 个 xorb"
-                )
-
-            except (IOError, OSError) as e:
+                self._save_unsafe(checkpoint)
+            except Exception as e:
                 logger.error(f"[Checkpoint] 保存失败: {e}")
 
     def mark_completed(self, file_hash: str, xorb_hash: str) -> None:
@@ -160,7 +129,8 @@ class CheckpointManager:
             self._save_unsafe(checkpoint)
 
     def mark_term_completed(self, file_hash: str, term_idx: int, xorb_hash: str,
-                            save_interval: int = 1) -> None:
+                            save_interval: int = 1,
+                            confirmed_bytes: int = 0) -> None:
         """标记一个 term 为已完成并定期保存。
 
         Args:
@@ -168,45 +138,62 @@ class CheckpointManager:
             term_idx: term 索引
             xorb_hash: term 所属的 xorb hash
             save_interval: 保存间隔（每 N 个 term 保存一次，默认 1）
+            confirmed_bytes: 当前已写入文件的总字节数（续传校验用）
         """
         with self._lock:
-            # 尝试从缓存加载
-            checkpoint = self._cache if self._cache and self._cache.file_hash == file_hash else None
-
-            # 如果缓存无效，尝试从文件加载（无锁）
-            if not checkpoint:
-                checkpoint = self._load_unsafe(file_hash)
-
-            # 如果仍然没有，创建新的
-            if not checkpoint:
-                checkpoint = ReconstructionCheckpoint(
-                    file_hash=file_hash,
-                    completed_xorbs=set(),
-                    timestamp=int(time.time()),
-                )
+            checkpoint = self._get_or_create_checkpoint(file_hash)
 
             # 标记 term 完成
-            checkpoint.mark_term_completed(term_idx, xorb_hash)
+            checkpoint.mark_term_completed(term_idx, xorb_hash,
+                                           confirmed_bytes=confirmed_bytes)
             checkpoint.timestamp = int(time.time())
 
-            # 双重保存策略：
-            # 1. 计数触发：每 N 个 term 保存一次（默认每个 term 都保存）
-            # 2. 时间兜底：超过 5 秒未保存则强制保存（防止长 xorb 下载期间丢失进度）
-            now = time.time()
-            should_save = (
-                term_idx % save_interval == 0 or term_idx == 0
-                or (now - self._last_save_time) > 5.0
+            # 定期保存策略
+            self._maybe_save_checkpoint(checkpoint, term_idx, save_interval)
+
+    def record_term_hash(self, file_hash: str, term_index: int,
+                         sha256: str, file_offset: int,
+                         unpacked_length: int, xorb_hash: str,
+                         save_interval: int = 1) -> None:
+        """记录一个 term 的 SHA256 校验值并定期保存。
+
+        Args:
+            file_hash: 文件的 MerkleHash
+            term_index: term 索引
+            sha256: SHA256(segment) 十六进制字符串
+            file_offset: 该 term 在文件中的起始偏移
+            unpacked_length: segment 长度
+            xorb_hash: 来源 xorb hash
+            save_interval: 保存间隔（每 N 个 term 保存一次，默认 1）
+        """
+        with self._lock:
+            checkpoint = self._get_or_create_checkpoint(file_hash)
+
+            # 记录 term 校验值
+            checkpoint.record_term_hash(
+                term_index=term_index,
+                sha256=sha256,
+                file_offset=file_offset,
+                unpacked_length=unpacked_length,
+                xorb_hash=xorb_hash,
             )
-            if should_save:
-                self._save_unsafe(checkpoint)
-                self._last_save_time = now
-                logger.debug(
-                    f"[Checkpoint] Term {term_idx} 已保存 "
-                    f"({len(checkpoint.completed_terms)} terms total)"
-                )
-            else:
-                # 只更新缓存
-                self._cache = checkpoint
+            checkpoint.timestamp = int(time.time())
+
+            # 定期保存策略
+            self._maybe_save_checkpoint(checkpoint, term_index, save_interval)
+
+    def set_expected_sha256(self, file_hash: str, expected_sha256: str) -> None:
+        """保存期望的文件级 SHA256 到 checkpoint（供 verify 使用）。
+
+        Args:
+            file_hash: 文件的 MerkleHash
+            expected_sha256: 服务器提供的文件 SHA256
+        """
+        with self._lock:
+            checkpoint = self._get_or_create_checkpoint(file_hash)
+            checkpoint.expected_sha256 = expected_sha256
+            checkpoint.timestamp = int(time.time())
+            self._save_unsafe(checkpoint)
 
     def clear(self, file_hash: str) -> None:
         """清除指定文件的 checkpoint。
@@ -229,6 +216,52 @@ class CheckpointManager:
             except Exception as e:
                 logger.warning(f"[Checkpoint] 清除失败: {e}")
 
+    def _get_or_create_checkpoint(self, file_hash: str) -> ReconstructionCheckpoint:
+        """获取或创建 checkpoint（在持锁状态下调用）。
+
+        Args:
+            file_hash: 文件的 MerkleHash
+
+        Returns:
+            已有的或新的 ReconstructionCheckpoint
+        """
+        checkpoint = self._cache if self._cache and self._cache.file_hash == file_hash else None
+        if not checkpoint:
+            checkpoint = self._load_unsafe(file_hash)
+        if not checkpoint:
+            checkpoint = ReconstructionCheckpoint(
+                file_hash=file_hash,
+                completed_xorbs=set(),
+                timestamp=int(time.time()),
+            )
+            # per_term_hashes 默认空 dict，无需额外初始化
+        return checkpoint
+
+    def _maybe_save_checkpoint(self, checkpoint: ReconstructionCheckpoint,
+                               term_idx: int, save_interval: int) -> None:
+        """根据保存策略决定是否持久化（在持锁状态下调用）。
+
+        使用双重策略：
+        1. 计数触发：每 N 个 term 保存一次
+        2. 时间兜底：超过 5 秒未保存则强制保存
+        """
+        now = time.time()
+        should_save = (
+            term_idx % save_interval == 0 or term_idx == 0
+            or (now - self._last_save_time) > 5.0
+        )
+        if should_save:
+            self._save_unsafe(checkpoint)
+            self._last_save_time = now
+            logger.debug(
+                f"[Checkpoint] Term {term_idx} 已保存 "
+                f"({len(checkpoint.completed_terms)} terms, "
+                f"{checkpoint.confirmed_bytes / 1024 / 1024:.1f} MB confirmed, "
+                f"{len(checkpoint.per_term_hashes)} hashes)"
+            )
+        else:
+            self._cache = checkpoint
+
     def _load_unsafe(self, file_hash: str) -> Optional[ReconstructionCheckpoint]:
         """加载 checkpoint（不加锁，仅供内部使用）。
 
@@ -248,14 +281,7 @@ class CheckpointManager:
             if data.get('file_hash') != file_hash:
                 return None
 
-            return ReconstructionCheckpoint(
-                file_hash=data['file_hash'],
-                completed_xorbs=set(data.get('completed_xorbs', [])),
-                completed_terms=set(tuple(t) for t in data.get('completed_terms', [])),
-                last_term_index=data.get('last_term_index', -1),
-                timestamp=data.get('timestamp', 0),
-                version=data.get('version', 1),
-            )
+            return ReconstructionCheckpoint.from_dict(data)
 
         except Exception:
             return None
@@ -272,19 +298,9 @@ class CheckpointManager:
         try:
             self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
+            data = checkpoint.to_dict()
             with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
-                json.dump(
-                    {
-                        'file_hash': checkpoint.file_hash,
-                        'completed_xorbs': list(checkpoint.completed_xorbs),
-                        'completed_terms': [list(t) for t in checkpoint.completed_terms],
-                        'last_term_index': checkpoint.last_term_index,
-                        'timestamp': checkpoint.timestamp,
-                        'version': checkpoint.version,
-                    },
-                    f,
-                    indent=2,
-                )
+                json.dump(data, f, indent=2)
 
             self._cache = checkpoint
 

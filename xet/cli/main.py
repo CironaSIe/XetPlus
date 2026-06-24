@@ -11,6 +11,7 @@ from xet.cli.commands import (
     register_info_command,
     register_config_command,
     register_optimize_command,
+    register_verify_command,
 )
 
 try:
@@ -193,6 +194,7 @@ def main():
     register_info_command(subparsers)
     register_config_command(subparsers)
     register_optimize_command(subparsers)
+    register_verify_command(subparsers)
 
     # 解析参数
     args = parser.parse_args()

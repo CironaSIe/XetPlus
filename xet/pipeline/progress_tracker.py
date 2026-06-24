@@ -167,6 +167,16 @@ class ProgressTracker:
             self._assembled_bytes += n
             self._notify()
 
+    def adjust_assembled(self, delta: int) -> None:
+        """调整已组装字节数（truncate 后修正基线用）。
+
+        Args:
+            delta: 修正量（可为负值）
+        """
+        with self._lock:
+            self._assembled_bytes += delta
+            self._notify()
+
     def get_downloaded_bytes(self) -> int:
         """获取已下载字节数。"""
         with self._lock:
