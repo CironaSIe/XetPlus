@@ -7,7 +7,7 @@
 import logging
 import uuid
 import threading
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import requests
 
@@ -94,6 +94,21 @@ class CASClient:
         # Reconstruction 新鲜度跟踪（用于预检 URL 过期）
         self._last_recon_time: float = 0.0
         self._last_recon_file: str = ""
+        # Reconstruction 响应缓存 {file_hash: (response, timestamp)}
+        self._recon_cache: Dict[str, Tuple[QueryReconstructionResponse, float]] = {}
+        self._recon_cache_lock = threading.Lock()
+        # 共享刷新结果：最近一次 403 恢复中获取的 reconstruction（跨线程共享）
+        self._shared_refresh_recon: Optional[Tuple[str, QueryReconstructionResponse, float]] = None
+        self._shared_refresh_lock = threading.Lock()
+
+    def _set_recon_cache(self, file_hash: str, recon: QueryReconstructionResponse):
+        """缓存 reconstruction 响应供 403/401 恢复时复用。"""
+        with self._recon_cache_lock:
+            self._recon_cache[file_hash] = (recon, time.time())
+            # 只保留最近一个文件（避免内存泄漏）
+            for k in list(self._recon_cache.keys()):
+                if k != file_hash:
+                    del self._recon_cache[k]
 
     def _get_headers(self) -> dict:
         """获取标准请求头（含认证）。
@@ -138,6 +153,14 @@ class CASClient:
             requests.HTTPError: API 返回错误状态码
             ValueError: 响应格式无效
         """
+        # 检查内存缓存
+        with self._recon_cache_lock:
+            if file_hash in self._recon_cache:
+                cached_recon, cached_ts = self._recon_cache[file_hash]
+                if time.time() - cached_ts < self._recon_refresh_interval:
+                    logger.debug(f"[CAS] Reconstruction 缓存命中: {file_hash[:16]}...")
+                    return cached_recon
+
         headers = self._get_headers()
 
         # 尝试 V2 API（如果尚未确认不可用）
@@ -151,7 +174,9 @@ class CASClient:
 
                 if resp.status_code == 200:
                     self._v2_available = True
-                    return QueryReconstructionResponse.from_dict(resp.json())
+                    recon = QueryReconstructionResponse.from_dict(resp.json())
+                    self._set_recon_cache(file_hash, recon)
+                    return recon
                 elif resp.status_code == 401:
                     # 401: Token 过期，刷新后重试
                     self._refresh_token()
@@ -161,7 +186,9 @@ class CASClient:
                     )
                     resp.raise_for_status()
                     self._v2_available = True
-                    return QueryReconstructionResponse.from_dict(resp.json())
+                    recon = QueryReconstructionResponse.from_dict(resp.json())
+                    self._set_recon_cache(file_hash, recon)
+                    return recon
                 elif resp.status_code in (404, 501):
                     # V2 不可用，fallback V1
                     self._v2_available = False
@@ -191,7 +218,9 @@ class CASClient:
             )
 
         resp.raise_for_status()
-        return QueryReconstructionResponse.from_dict(resp.json())
+        recon = QueryReconstructionResponse.from_dict(resp.json())
+        self._set_recon_cache(file_hash, recon)
+        return recon
 
     @with_retry(max_attempts=3, backoff_base=2.0, retry_on=(requests.RequestException,))
     def get_segment_reconstruction(
@@ -523,13 +552,39 @@ class CASClient:
             for attempt in range(self.retry_max):
                 self._check_interrupt()
 
+                # 优先使用共享刷新结果中的新 URL（防止同一 file_hash 反复 403）
+                with self._shared_refresh_lock:
+                    if self._shared_refresh_recon is not None:
+                        s_file_hash, s_recon, s_ts = self._shared_refresh_recon
+                        if s_file_hash == file_hash and time.time() - s_ts < 120:
+                            if attempt == 0:
+                                logger.debug(
+                                    f"[CAS] xorb={xorb_hash[:16]}... 使用共享 reconstruction"
+                                )
+                            try:
+                                current_url, current_range = self._find_xorb_in_recon(
+                                    xorb_hash, s_recon, url_range
+                                )
+                            except Exception:
+                                # 共享结果中找不到此 xorb，使用原始 URL
+                                pass
+
                 # 检查是否应该停止重试（全局协调）
                 if self._retry_coordinator and self._retry_coordinator.should_stop_retrying():
+                    status = self._retry_coordinator.get_status()
+                    retry_elapsed = status.get('all_retry_elapsed') or 0
                     logger.error(
                         f"[CAS] RetryCoordinator 触发全局停止，"
-                        f"xorb={xorb_hash[:16]}..."
+                        f"xorb={xorb_hash[:16]}..., "
+                        f"active={status['active']}, retrying={status['retrying']}, "
+                        f"all_retry_elapsed={retry_elapsed:.0f}s"
                     )
-                    raise RuntimeError("全局重试协调器触发停止")
+                    raise RuntimeError(
+                        f"全局重试协调器触发停止: "
+                        f"{status['retrying']}/{status['active']} 个 xorb 全部重试 "
+                        f"持续 {retry_elapsed:.0f}s "
+                        f"(宽限 {self._retry_coordinator._all_retry_grace:.0f}s)"
+                    )
 
                 # 1. 获取 ACC 许可
                 if self._acc:
@@ -599,6 +654,9 @@ class CASClient:
                         )
                         try:
                             self._force_refresh_token()
+                            # token 已变，清除缓存强制获取新 presigned URL
+                            with self._recon_cache_lock:
+                                self._recon_cache.pop(file_hash, None)
                             recon = self.get_reconstruction(file_hash)
                             current_url, current_range = self._find_xorb_in_recon(
                                 xorb_hash, recon, url_range
@@ -629,7 +687,15 @@ class CASClient:
                             logger.info("[CAS] 获得 URL 刷新权限")
                             try:
                                 self._force_refresh_token()  # 先刷新 token
+                                # 403 后缓存中的旧 URL 已失效，强制走 API
+                                with self._recon_cache_lock:
+                                    self._recon_cache.pop(file_hash, None)
                                 recon = self.get_reconstruction(file_hash)
+                                # 共享给其他等待中的线程
+                                with self._shared_refresh_lock:
+                                    self._shared_refresh_recon = (
+                                        file_hash, recon, time.time()
+                                    )
                                 current_url, current_range = self._find_xorb_in_recon(
                                     xorb_hash, recon, url_range
                                 )
@@ -644,14 +710,33 @@ class CASClient:
                                 if attempt == self.retry_max - 1:
                                     raise
                         else:
-                            # 其他线程在刷新或冷却期，等待后重试
-                            logger.info("[CAS] 其他线程在刷新 URL，等待...")
+                            # 其他线程在刷新或冷却期，尝试使用共享结果
+                            logger.info("[CAS] 403: 等待刷新结果...")
 
                         # 403 专用退避（比普通错误更长）
                         base_403 = 5.0
                         delay = base_403 * (2.5 ** attempt) * random.uniform(0.7, 1.3)
                         logger.debug(f"[CAS] 403 退避: {delay:.2f}s")
                         self._interruptible_sleep(delay)
+
+                        # 退避后检查是否有其他线程刷新的共享结果
+                        with self._shared_refresh_lock:
+                            if self._shared_refresh_recon is not None:
+                                s_file_hash, s_recon, s_ts = self._shared_refresh_recon
+                                if s_file_hash == file_hash and time.time() - s_ts < 60:
+                                    try:
+                                        current_url, current_range = self._find_xorb_in_recon(
+                                            xorb_hash, s_recon, url_range
+                                        )
+                                        logger.info(
+                                            f"[CAS] 403 恢复: 复用共享 reconstruction "
+                                            f"(file={s_file_hash[:16]}..., age={time.time()-s_ts:.0f}s)"
+                                        )
+                                        continue  # 直接重试新 URL
+                                    except Exception:
+                                        # 共享结果中找不到此 xorb，继续正常循环
+                                        pass
+
                         continue
 
                     else:

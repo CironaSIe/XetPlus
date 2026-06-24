@@ -11,6 +11,7 @@ import os
 import re
 import fnmatch
 import logging
+import threading
 import requests
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
@@ -777,10 +778,12 @@ def download_single_file(
 
     # 捕获最新进度（供中断时显示）
     _latest_stats: Dict[str, Any] = {}
+    _progress_lock = threading.Lock()
 
     def progress_callback(stats):
-        _latest_stats.update(stats)
-        progress.update(stats)
+        with _progress_lock:
+            _latest_stats.update(stats)
+            progress.update(stats)
 
     # 执行下载
     try:
@@ -827,7 +830,7 @@ def download_single_file(
                     parallel_write=getattr(args, 'parallel_write', False),
                     buffer_mb=getattr(args, 'buffer_mb', 32),
                     ip_pool_manager=ip_pool_manager,  # ← 传递
-                    host_optimizer=host_optimizer if optimize_hosts else None,  # ← 传递
+                    host_optimizer=host_optimizer,  # ← 传递（None 或优选结果）
                 )
 
                 result_path, xorb_hashes = reconstructor.reconstruct_file(
@@ -900,6 +903,20 @@ def download_single_file(
             print(
                 f"\n  ✗ 下载因连续失败而停止: {e}\n"
                 f"  ↳ 已保存断点: {progress_str}{seg_str} (可重新运行命令续传)",
+                file=sys.stderr,
+            )
+        elif "全局重试协调器触发停止" in str(e):
+            print(
+                f"\n  ✗ 所有 xorb 下载同时失败（协调器触发停止）: {e}",
+                file=sys.stderr,
+            )
+            print(
+                f"  ↳ 已保存断点: {progress_str}{seg_str}",
+                file=sys.stderr,
+            )
+            print(
+                "  ↳ 建议检查日志了解各 xorb 失败原因: "
+                "查看 log 中 [CAS] xorb=... 下载失败的条目",
                 file=sys.stderr,
             )
         else:
@@ -1070,6 +1087,11 @@ def download_command(args):
         if optimize_hosts:
             print("🚀 正在执行 HOST 优选（DoH 查询 + 测速）...")
 
+        # 提取 repo/commit 上下文（供 API warm-up 使用）
+        _optimize_repo = repo_id if not file_hash else None  # hash 模式用 dummy，跳过
+        _optimize_commit = getattr(args, 'revision', None) or "main"
+        _optimize_filename = filename if not file_hash else None
+
         session, host_optimizer = create_optimized_session(
             proxy=proxy or "",
             optimize_hosts=optimize_hosts,
@@ -1078,12 +1100,19 @@ def download_command(args):
             access_token=_early_access_token,
             file_hash=_early_file_hash,
             cas_endpoint=_early_cas_endpoint,
+            repo=_optimize_repo,
+            commit=_optimize_commit,
+            filename=_optimize_filename,
+            hf_token=hf_token,
         )
 
-        if optimize_hosts and host_optimizer:
+        if host_optimizer:
             mappings = host_optimizer.mappings
             if mappings:
-                print(f"✅ HOST 优选完成: {len(mappings)} 个域名")
+                if optimize_hosts:
+                    print(f"✅ HOST 优选完成: {len(mappings)} 个域名")
+                else:
+                    print(f"✅ 已从缓存加载 HOST 优选结果: {len(mappings)} 个域名")
 
                 # 检查是否有详细结果可以显示
                 detailed_results = getattr(host_optimizer, 'detailed_results', {})
@@ -1157,12 +1186,33 @@ def download_command(args):
                             elif status == "transfer_failed":
                                 # Transfer 失败
                                 print(f"     ❌ {ip}  {mode}  RTT={rtt*1000:.0f}ms  Transfer失败")
-            else:
-                print("⚠ HOST 优选未生效，将使用系统 DNS")
 
-        # 3.5. 初始化 IP 池管理器（如果启用了优选）
+            # 输出 warmup 状态摘要
+            warmup = getattr(host_optimizer, 'warmup_status', {})
+            if any(warmup.values()):
+                parts = []
+                if warmup.get("api_ok"):
+                    parts.append("API Warm-up ✅")
+                else:
+                    parts.append("API Warm-up ⬜")
+                if warmup.get("cas_ok"):
+                    parts.append("CAS Warm-up ✅")
+                else:
+                    parts.append("CAS Warm-up ⬜")
+                if warmup.get("data_ok"):
+                    parts.append("DATA 带宽测试 ✅")
+                else:
+                    parts.append("DATA 带宽测试 ⬜")
+                print(f"   Warm-up: {' | '.join(parts)}")
+            else:
+                print("   未执行 Warm-up（使用系统 DNS 或外部传入上下文）")
+
+        else:
+            print("⚠ HOST 优选未生效，将使用系统 DNS")
+
+        # 3.5. 初始化 IP 池管理器（如果有优选结果）
         ip_pool_manager = None
-        if optimize_hosts and host_optimizer:
+        if host_optimizer:
             from xet.network.ip_pool_manager import IPPoolManager
 
             cache_file = Path.home() / ".xet" / "cache" / "host_optimize.json"

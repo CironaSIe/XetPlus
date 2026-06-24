@@ -217,6 +217,10 @@ class HostOptimizer:
         access_token: Optional[str] = None,
         file_hash: Optional[str] = None,
         cas_endpoint: Optional[str] = None,
+        repo: Optional[str] = None,
+        commit: Optional[str] = None,
+        filename: Optional[str] = None,
+        hf_token: Optional[str] = None,
     ):
         """初始化 HOST 优选器。
 
@@ -227,11 +231,19 @@ class HostOptimizer:
             access_token: CAS 认证 token（用于真实带宽测速，无 token 时仅测连通性）
             file_hash: 文件 MerkleHash（用于 CAS reconstruction 端点测速 + 获取 presigned URL）
             cas_endpoint: CAS 服务地址（如 https://cas-server.xethub.hf.co）
+            repo: 仓库 ID（如 mykor/granite-embedding-97m），用于 API warm-up
+            commit: commit hash 或分支名（用于 API warm-up）
+            filename: 文件名（用于 API warm-up）
+            hf_token: HuggingFace 用户 token（用于 API warm-up 获取 CAS token）
         """
         self.proxy = proxy
         self.access_token = access_token
         self.file_hash = file_hash
         self.cas_endpoint = cas_endpoint
+        self.repo = repo
+        self.commit = commit
+        self.filename = filename
+        self.hf_token = hf_token
         self._quiet = False  # 控制实时输出（由调用方设置）
         if cache_dir:
             cache_path = Path(cache_dir)
@@ -256,6 +268,16 @@ class HostOptimizer:
 
         # DoH 缓存数据
         self._doh_ips: Dict[str, List[str]] = {}
+
+        # Warm-up 状态（Phase 3 结果）
+        self.warmup_status: Dict[str, bool] = {
+            "api_ok": False,
+            "cas_ok": False,
+            "data_ok": False,
+        }
+        self._presigned_url: Optional[str] = None
+        self._warmup_latency: Dict[str, Dict[str, float]] = {}  # 域名 → {IP → 延迟 ms}
+        self._api_latency_ms: Optional[float] = None  # API warm-up 响应时间 ms
 
     def set_access_token(self, token: Optional[str]) -> None:
         """设置 CAS 认证 token（可在优选后调用，用于后续重新测速）。
@@ -286,6 +308,11 @@ class HostOptimizer:
             return False
         # JWT 格式: xxx.yyy.zzz（三段 base64url 用点分隔）
         return self.access_token.count(".") >= 2
+
+    def _print_msg(self, msg: str, **kwargs):
+        """带 quiet 控制的实时输出。"""
+        if not self._quiet:
+            print(msg, flush=True)
 
     def optimize(
         self,
@@ -394,8 +421,7 @@ class HostOptimizer:
             _n_pass = sum(1 for v in cert_results.values() if v[0])
             logger.info(f"[HostOpt] 证书验证完成: {_n_pass}/{len(cert_results)} 通过")
 
-        # 5. HTTP Transfer 测速（仅对证书有效的候选 + 未验证的 fallback）
-        #    用证书结果过滤 results，证书通过的保留；全部未通过的域名仍保留所有候选
+        # 5. 证书通过过滤 + 构建候选池
         _cert_passed: Set[Tuple[str, str]] = {
             (d, ip) for (d, ip), (v, _, _) in cert_results.items() if v
         }
@@ -403,6 +429,42 @@ class HostOptimizer:
         for domain, cands in results.items():
             _filtered = [(ip, p, r) for ip, p, r in cands if (domain, ip) in _cert_passed]
             _transfer_input[domain] = _filtered if _filtered else cands
+
+        # 保存 cert-passed 候选供 warmup 使用
+        self._cert_passed_candidates = _transfer_input
+
+        # ====================================================================
+        #   Phase 3: Warm-up 链（顺序执行，结果向下游传递）
+        #   Phase 3A: API Warm-up → 获取 file_hash + CAS token
+        #   Phase 3B: CAS Warm-up → 所有 CAS IP 延迟 + presigned URL
+        #   Phase 3C: DATA 带宽测试（在 _transfer_test_top 内完成）
+        # ====================================================================
+
+        # Phase 3A: API Warm-up
+        api_candidates_raw = []
+        for domain, cands in _transfer_input.items():
+            if get_domain_category(domain) == "api":
+                for ip, use_proxy, rtt in cands:
+                    api_candidates_raw.append((domain, ip, use_proxy, rtt))
+        # API warm-up 需要代理（huggingface.co 被墙），代理候选排前
+        api_candidates_raw.sort(key=lambda x: (not x[2], x[3]))
+
+        if api_candidates_raw:
+            self._api_warmup_test(api_candidates_raw)
+        else:
+            logger.debug("[HostOpt] Phase 3A: 无 API 候选，跳过")
+
+        # Phase 3B: CAS Warm-up
+        cas_domains = {
+            d: cands for d, cands in _transfer_input.items()
+            if get_domain_category(d) == "cas"
+        }
+        if cas_domains and self.file_hash:
+            self._cas_warmup_all(cas_domains)
+        else:
+            logger.debug("[HostOpt] Phase 3B: 无 CAS 候选或无 file_hash，跳过")
+
+        # Phase 3C: DATA 带宽测试 + API fallback
         transfer_results = self._transfer_test_top(_transfer_input)
 
         # 6. 按域名选最优 + 保存详细结果
@@ -747,133 +809,399 @@ class HostOptimizer:
         except (socket.timeout, OSError):
             return None
 
+    # ========================================================================
+    #  Phase 3A: API Warm-up - 获取 CAS token + file_hash（链式依赖上游）
+    # ========================================================================
+
+    def _api_warmup_test(
+        self,
+        api_candidates: List[Tuple[str, str, bool, float]],
+    ) -> Tuple[bool, Optional[float]]:
+        """Phase 3A: API Warm-up — 用最优 API IP 调 HF Hub resolve 获取 CAS 上下文。
+
+        顺序执行链中的第一步。输出（access_token, file_hash, cas_endpoint）
+        供 Phase 3B (CAS warm-up) 和 Phase 3C (DATA 带宽测速) 使用。
+
+        Args:
+            api_candidates: [(domain, ip, use_proxy, rtt), ...]
+
+        Returns:
+            (success, latency_ms) — latency 为 HF Hub resolve 响应时间
+        """
+        if not self.repo or not self.commit or not self.filename:
+            logger.debug("[HostOpt] Phase 3A: 无 repo/commit/filename，跳过")
+            return (False, None)
+
+        # 已有完整上下文时跳过（外部传入的 token/hash）
+        if self.file_hash and self._has_valid_cas_jwt() and self.cas_endpoint:
+            logger.info("[HostOpt] Phase 3A: 已有完整 CAS 上下文，跳过")
+            self.warmup_status["api_ok"] = True
+            return (True, 0.0)
+
+        # 选最优 API IP：huggingface.co 强制代理，hf-mirror.com 可选直连
+        if not api_candidates:
+            logger.debug("[HostOpt] Phase 3A: 无 API 候选")
+            return (False, None)
+
+        # huggingface.co → 代理优先；hf-mirror.com → 直连优先
+        domain, best_ip, use_proxy, rtt = api_candidates[0]
+
+        hf_token = self.hf_token or self.access_token
+        if not hf_token:
+            logger.debug("[HostOpt] Phase 3A: 无 HF token")
+            return (False, None)
+
+        hf_endpoint = f"https://{domain}"
+        resolve_url = f"{hf_endpoint}/{self.repo}/resolve/{self.commit}/{self.filename}"
+
+        _print = self._print_msg
+        _print(f"  API Warm-up {best_ip} ({'代理' if use_proxy else '直连'})...")
+
+        try:
+            start = time.time()
+            headers = {
+                "Authorization": f"Bearer {hf_token}",
+                "User-Agent": "xet-dl/api-warmup",
+            }
+            session = create_robust_session(
+                proxy=self.proxy if use_proxy else "", retries=1
+            )
+            resp = session.head(
+                resolve_url, headers=headers, timeout=15, allow_redirects=False
+            )
+            latency_ms = (time.time() - start) * 1000
+
+            import re
+
+            # 解析 Link 头
+            link_header = resp.headers.get("Link", "")
+            auth_url = None
+            recon_url = None
+            if link_header:
+                auth_m = re.search(r'<([^>]+)>;\s*rel="xet-auth"', link_header)
+                if auth_m:
+                    auth_url = auth_m.group(1)
+                    if not auth_url.startswith("http"):
+                        auth_url = f"{hf_endpoint}{auth_url}"
+                recon_m = re.search(
+                    r'<([^>]+)>;\s*rel="xet-reconstruction-info"', link_header
+                )
+                if recon_m:
+                    recon_url = recon_m.group(1)
+
+            if not recon_url:
+                logger.warning(
+                    "[HostOpt] Phase 3A: 响应无 xet-reconstruction-info（非 XET 文件）"
+                )
+                return (False, latency_ms)
+
+            # 从 recon URL 提取 file_hash（64 位 hex）
+            hash_m = re.search(r'/([0-9a-f]{64})', recon_url, re.IGNORECASE)
+            if hash_m:
+                self.file_hash = hash_m.group(1)
+                logger.info(
+                    f"[HostOpt] Phase 3A: file_hash={self.file_hash[:16]}..."
+                )
+
+            # 提取 cas_endpoint
+            parsed_recon = urlparse(recon_url)
+            self.cas_endpoint = (
+                f"{parsed_recon.scheme}://{parsed_recon.netloc}"
+            )
+
+            # 调用 xet-auth URL 获取 CAS JWT
+            if auth_url:
+                try:
+                    auth_headers = {"Authorization": f"Bearer {hf_token}"}
+                    auth_resp = session.get(auth_url, headers=auth_headers, timeout=15)
+                    auth_resp.raise_for_status()
+                    auth_data = auth_resp.json()
+                    if "accessToken" in auth_data:
+                        self.access_token = auth_data["accessToken"]
+                        if "endpoint" in auth_data and auth_data["endpoint"]:
+                            self.cas_endpoint = auth_data["endpoint"]
+                        logger.info(
+                            "[HostOpt] Phase 3A: CAS JWT 获取成功, "
+                            f"endpoint={self.cas_endpoint}"
+                        )
+                    else:
+                        logger.warning(
+                            "[HostOpt] Phase 3A: xet-auth 响应无 accessToken"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[HostOpt] Phase 3A: 获取 CAS JWT 失败: {e}"
+                    )
+
+            self.warmup_status["api_ok"] = bool(self.file_hash)
+            self._api_latency_ms = latency_ms
+            _print(
+                f"  API Warm-up 完成: {latency_ms:.0f}ms, "
+                f"file_hash={'有' if self.file_hash else '无'}, "
+                f"token={'有' if self._has_valid_cas_jwt() else '无'}"
+            )
+            return (self.warmup_status["api_ok"], latency_ms)
+
+        except requests.exceptions.Timeout:
+            logger.warning("[HostOpt] Phase 3A: 超时 (15s)")
+            return (False, None)
+        except Exception as e:
+            logger.warning(
+                f"[HostOpt] Phase 3A: {type(e).__name__}: {e}"
+            )
+            return (False, None)
+
+    # ========================================================================
+    #  Phase 3B: CAS Warm-up — 对所有 CAS IP 重建 API 测 TTFB + 取 presigned URL
+    # ========================================================================
+
+    def _cas_warmup_all(
+        self,
+        cas_domains: Dict[str, List[Tuple[str, bool, float]]],
+    ) -> Optional[str]:
+        """Phase 3B: CAS Warm-up — 对所有 CAS 候选测 reconstruction 真实延迟。
+
+        用 Phase 3A 获取的 file_hash + access_token 调 reconstruction API。
+        测量每个 IP 的 TTFB，取第一个成功的 presigned URL。
+
+        Args:
+            cas_domains: {domain: [(ip, use_proxy, rtt), ...]}
+
+        Returns:
+            presigned URL（用于 DATA 带宽测速），全部失败时返回 None
+        """
+        if not self.file_hash or not self._has_valid_cas_jwt() or not self.cas_endpoint:
+            logger.debug(
+                "[HostOpt] Phase 3B: 缺少 file_hash / CAS token / endpoint，跳过"
+            )
+            return None
+
+        cas_path = f"{urlparse(self.cas_endpoint).path}/v2/reconstructions/{self.file_hash}"
+        cas_path = cas_path.replace("//", "/")
+
+        _print = self._print_msg
+        _print(f"  CAS Warm-up ({len(cas_domains)} 个域名, 共 "
+               f"{sum(len(v) for v in cas_domains.values())} 候选)...")
+
+        presigned_url: Optional[str] = None
+        cas_latency_results: Dict[str, List] = {}
+
+        def _test_one_cas(ip: str, domain: str, use_proxy: bool) -> Optional[Tuple[float, Optional[str]]]:
+            cas_start = time.time()
+            try:
+                session = create_robust_session(
+                    proxy=self.proxy if use_proxy else "", retries=0
+                )
+                session.verify = False
+
+                headers = {
+                    "Host": domain,
+                    "Authorization": f"Bearer {self.access_token}",
+                    "User-Agent": "xet-dl/cas-warmup",
+                    "Accept": "application/json",
+                }
+
+                if use_proxy and self.proxy:
+                    url = f"https://{domain}{cas_path}"
+                    resp = session.get(url, headers=headers, timeout=(5, 10))
+                else:
+                    import http.client as _http_client
+
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_REQUIRED
+
+                    conn = _http_client.HTTPConnection(ip, 443, timeout=3)
+                    conn.connect()
+                    conn.sock = ctx.wrap_socket(conn.sock, server_hostname=domain)
+                    conn.request("GET", cas_path, headers=headers)
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    # 读取完再进入统一处理（http.client 无 iter_content）
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+                status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+                ttfb_ms = (time.time() - cas_start) * 1000
+
+                if status and status >= 400:
+                    logger.debug(
+                        f"[HostOpt] Phase 3B: {ip} ({domain}) TTFB={ttfb_ms:.0f}ms "
+                        f"status={status}"
+                    )
+                    return None
+
+                if not hasattr(resp, "iter_content"):
+                    pass  # body already read for http.client
+                else:
+                    body = b""
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        body += chunk
+
+                # 提取 presigned URL
+                if body and not presigned_url:
+                    try:
+                        import json as _json
+                        from xet.protocol.types import QueryReconstructionResponse
+
+                        recon_data = _json.loads(body)
+                        recon = QueryReconstructionResponse.from_dict(recon_data)
+                        if recon.fetch_info:
+                            first_key = next(iter(recon.fetch_info), None)
+                            if first_key and recon.fetch_info[first_key]:
+                                _url = recon.fetch_info[first_key][0].url
+                                # 用 nonlocal 写入外部变量
+                                return (ttfb_ms, _url)
+                    except Exception as e:
+                        logger.debug(
+                            f"[HostOpt] Phase 3B: 解析响应提取 URL 失败: {e}"
+                        )
+
+                return (ttfb_ms, None)
+
+            except (ssl.SSLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+                logger.debug(
+                    f"[HostOpt] Phase 3B: {ip} ({domain}) 连接失败: {type(e).__name__}"
+                )
+                return None
+            except Exception as e:
+                logger.debug(
+                    f"[HostOpt] Phase 3B: {ip} ({domain}) 异常: {type(e).__name__}: {e}"
+                )
+                return None
+
+        # 并行测所有 CAS 候选
+        all_tasks: List[Tuple[str, str, bool, float]] = []
+        for domain, cands in cas_domains.items():
+            for ip, use_proxy, rtt in cands:
+                all_tasks.append((domain, ip, use_proxy, rtt))
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        futures = {}
+        for domain, ip, use_proxy, rtt in all_tasks:
+            f = executor.submit(_test_one_cas, ip, domain, use_proxy)
+            futures[f] = (domain, ip, use_proxy, rtt)
+
+        try:
+            for f in concurrent.futures.as_completed(futures, timeout=20):
+                domain, ip, use_proxy, rtt = futures[f]
+                try:
+                    result = f.result()
+                    if result:
+                        latency_ms, url_from = result
+                        cas_latency_results.setdefault(domain, []).append(
+                            (ip, use_proxy, rtt, latency_ms)
+                        )
+                        if url_from and not presigned_url:
+                            presigned_url = url_from
+                            logger.info(
+                                f"[HostOpt] Phase 3B: presigned URL 来自 {ip} "
+                                f"(latency={latency_ms:.0f}ms)"
+                            )
+                        _print(
+                            f"  CAS {ip} ({'代理' if use_proxy else '直连'}) "
+                            f"{latency_ms:.0f}ms"
+                            + (" ✓ URL" if url_from else "")
+                        )
+                    else:
+                        _print(
+                            f"  CAS {ip} ({'代理' if use_proxy else '直连'}) 无响应"
+                        )
+                except Exception as e:
+                    _print(f"  CAS {ip} ({'代理' if use_proxy else '直连'}) 异常")
+        except concurrent.futures.TimeoutError:
+            logger.debug("[HostOpt] Phase 3B: 部分超时，使用已完成结果")
+        finally:
+            executor.shutdown(wait=False)
+
+        # 将延迟结果保存到 self._warmup_latency（供后续 IP 选择用）
+        for domain, results_list in cas_latency_results.items():
+            self._warmup_latency[domain] = {
+                r[0]: r[3] for r in results_list  # ip → latency_ms
+            }
+
+        ok_count = sum(len(v) for v in cas_latency_results.values())
+        total = len(all_tasks)
+        self.warmup_status["cas_ok"] = ok_count > 0
+        _print(f"  CAS Warm-up 完成: {ok_count}/{total} 可达"
+               + (f", presigned URL={'有' if presigned_url else '无'}" if presigned_url else ""))
+
+        if presigned_url:
+            self._presigned_url = presigned_url
+
+        return presigned_url
+
     def _transfer_test_top(
         self, results: Dict[str, List[Tuple[str, bool, float]]]
     ) -> Dict[str, List[Tuple[str, bool, float, float]]]:
-        """HTTP Transfer 测速（对每个域名的 Top 候选）。
+        """Phase 3C: DATA 带宽测速 + API fallback。
 
-        分域名类型使用不同测速策略：
-        - CAS 域名：_cas_api_test() 测 reconstruction 端点延迟（TTFB ms）
-          同时提取 presigned URL 供 DATA 测速使用
-        - DATA 域名：_data_throughput_test() 用 presigned URL 测真实下载带宽
-        - API 域名：_http_transfer_test() 用 GET / 测速
+        在 Phase 3A (API warm-up) 和 Phase 3B (CAS warm-up) 之后调用。
+        - DATA 域名：用 warm-up 获取的 presigned URL 测真实下载带宽
+        - API 域名：_http_transfer_test() 用 GET / 测速（备选延迟参考）
+        - CAS 域名：已由 _cas_warmup_all() 完成，此处取 warmup 结果
 
         Returns:
             {domain: [(ip, use_proxy, rtt, speed), ...]}
-            speed 含义因域名而异：
-            - CAS: 延迟毫秒数（越低越好）
-            - DATA/API: 下载带宽 bytes/s（越高越好）
+            speed 含义：
+            - CAS: 延迟毫秒数（越低越好，来自 warm-up）
+            - DATA: 下载带宽 bytes/s（越高越好）
+            - API: 下载带宽 bytes/s（越高越好）
         """
         transfer_results: Dict[str, List] = {}
 
-        # 用于从 CAS 响应中提取的 presigned URL（供 DATA 域名测速用）
-        sample_data_url: Optional[str] = None
-
-        # 全局超时：整个优选测速不超过 60 秒
+        sample_data_url = self._presigned_url
         _overall_deadline = time.time() + 60
         _total_tests = 0
         _done_count = 0
+        _print = self._print_msg
 
-        # 实时输出函数（尊重 quiet 模式）
-        def _print(msg: str, **kwargs):
-            if not self._quiet:
-                print(msg, flush=True)
-
-        # ---- 按域名类型分类 ----
-        _can_do_cas_api = self.file_hash and self._has_valid_cas_jwt()
-        _primary_cas_domain = "cas-server.xethub.hf.co"
-
-        # 所有 CAS 域名（不再限制只有主域名或有 JWT 的才进入）
-        cas_domains_all = {
-            d: cands for d, cands in results.items()
-            if get_domain_category(d) == "cas"
-        }
-        non_cas_domains = {
-            d: cands for d, cands in results.items()
-            if d not in cas_domains_all
-        }
-
-        # CAS 域名：直接使用 RTT 结果作为"速度"指标（RTT 越低越好）
-        # 不再逐个做慢速 HTTP API 测试，只做证书验证
-        for domain, candidates in cas_domains_all.items():
-            if self.proxy:
-                candidates.sort(key=lambda x: (x[1], x[2]))
+        # ---- CAS 域名：取 warm-up 结果，无 warm-up 则 RTT fallback ----
+        for domain, candidates in results.items():
+            if get_domain_category(domain) != "cas":
+                continue
+            warmup_latencies = self._warmup_latency.get(domain, {})
+            if warmup_latencies:
+                _cand_list = []
+                for ip, use_proxy, rtt in candidates:
+                    latency_ms = warmup_latencies.get(ip, rtt * 1000)
+                    _cand_list.append((ip, use_proxy, rtt, latency_ms))
+                _cand_list.sort(key=lambda x: (x[1], x[3]))
+                transfer_results[domain] = _cand_list
+                logger.info(
+                    f"[HostOpt] {domain}: {len(candidates)} 个候选（基于 warm-up 延迟）"
+                )
             else:
                 candidates.sort(key=lambda x: (x[1], x[2]))
+                _cand_list = [(ip, use_proxy, rtt, rtt * 1000) for ip, use_proxy, rtt in candidates]
+                transfer_results[domain] = _cand_list
+                logger.info(f"[HostOpt] {domain}: {len(candidates)} 个候选（基于 RTT 排序）")
 
-            _cand_list = []
-            for ip, use_proxy, rtt in candidates:
-                rtt_ms = rtt * 1000  # 转为毫秒
-                _cand_list.append((ip, use_proxy, rtt, rtt_ms))
-            transfer_results[domain] = _cand_list
-            logger.info(f"[HostOpt] {domain}: {len(candidates)} 个候选（基于 RTT 排序）")
+        # ---- DATA + API 域名：HTTP Transfer 测速 ----
+        domains_need_test = {
+            d: cands for d, cands in results.items()
+            if get_domain_category(d) in ("data", "api")
+        }
 
-        # 对主 CAS 域名的 Top1 直连候选做 1 次快速 API 调用，获取 presigned URL
-        if _can_do_cas_api and _primary_cas_domain in cas_domains_all:
-            primary_candidates = cas_domains_all[_primary_cas_domain]
-            if primary_candidates:
-                best_for_api = None
-                for ip, use_proxy, rtt in primary_candidates:
-                    if not use_proxy:
-                        best_for_api = (ip, use_proxy, rtt)
-                        break
-                if not best_for_api:
-                    best_for_api = primary_candidates[0]
+        if domains_need_test:
+            data_no_url_domains = []
+            real_test_domains = {}
 
-                ip, use_proxy, rtt = best_for_api
-                _print(f"  CAS API 延迟测速 {ip} ({'代理' if use_proxy else '直连'})...")
-                # 用线程 + 超时兜底，防止 Windows + SSL socket 的 getresponse() 无限阻塞
-                _api_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                try:
-                    _api_future = _api_executor.submit(
-                        self._cas_api_test, ip, _primary_cas_domain, use_proxy
-                    )
-                    api_result = _api_future.result(timeout=8)
-                    if api_result:
-                        _latency_ms, data_url = api_result
-                        if data_url:
-                            sample_data_url = data_url
-                            logger.info(f"[HostOpt] Presigned URL 获取成功 (latency={_latency_ms:.0f}ms)")
-                        else:
-                            logger.info(
-                                f"[HostOpt] CAS API 响应成功但无 presigned URL "
-                                f"(latency={_latency_ms:.0f}ms，DATA 将用 RTT 选 IP)"
-                            )
-                    else:
-                        logger.debug(f"[HostOpt] Presigned URL 获取失败（将跳过 DATA 测速）")
-                except concurrent.futures.TimeoutError:
-                    logger.warning(f"[HostOpt] Presigned URL 请求超时（8s），将跳过 DATA 测速")
-                    _print(f"  CAS API 延迟测速超时（8s），DATA 域名将用 RTT 选 IP")
-                except Exception as e:
-                    logger.debug(f"[HostOpt] Presigned URL 获取异常: {e}")
-                finally:
-                    _api_executor.shutdown(wait=False)
-
-        # ---- 非 CAS 域名（API / DATA）：HTTP Transfer 测速 ----
-        if non_cas_domains:
-            # DATA 域名无 presigned URL 时，直接用 RTT（和 CAS 域名一样）
-            # 不走无意义的 _http_transfer_test（只会返回 403/1.0）
-            _data_no_url_domains = []
-            _domains_need_test = {}
-
-            for domain, candidates in non_cas_domains.items():
+            for domain, candidates in domains_need_test.items():
                 category = get_domain_category(domain)
                 if category == "data" and not sample_data_url:
-                    # 无 presigned URL：RTT 排序，跳过 HTTP 测速
-                    if self.proxy:
-                        candidates.sort(key=lambda x: (x[1], x[2]))
-                    else:
-                        candidates.sort(key=lambda x: (x[1], x[2]))
+                    candidates.sort(key=lambda x: (x[1], x[2]))
                     _cand_list = [(ip, use_proxy, rtt, rtt * 1000) for ip, use_proxy, rtt in candidates]
                     transfer_results[domain] = _cand_list
                     logger.info(f"[HostOpt] {domain}: {len(candidates)} 个候选（无 presigned URL，基于 RTT 排序）")
-                    _data_no_url_domains.append(domain)
+                    data_no_url_domains.append(domain)
                 else:
-                    _domains_need_test[domain] = candidates
+                    real_test_domains[domain] = candidates
 
-            # 只对需要真实测速的域名发起 HTTP 测试
-            if _domains_need_test:
-                _n_other = sum(len(cands) for cands in _domains_need_test.values())
+            if real_test_domains:
+                _n_other = sum(len(cands) for cands in real_test_domains.values())
                 _total_tests = _n_other
 
                 if _total_tests > 0:
@@ -882,7 +1210,7 @@ class HostOptimizer:
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
                 transfer_futures: Dict = {}
                 try:
-                    for domain, candidates in _domains_need_test.items():
+                    for domain, candidates in real_test_domains.items():
                         category = get_domain_category(domain)
                         if self.proxy:
                             if category in ("data", "cas"):
@@ -1654,7 +1982,7 @@ class HostOptimizer:
             return None
 
     def _load_cache(self) -> bool:
-        """加载优选缓存（支持新旧格式）。"""
+        """加载优选缓存（支持 v1/v2 格式 + warmup 上下文匹配）。"""
         if not self.cache_path.exists():
             return False
 
@@ -1678,9 +2006,10 @@ class HostOptimizer:
             # 支持新旧格式
             version = data.get("version", "1.0")
             if version == "2.0" and "domains" in data:
-                # 新格式：提取最佳 IP 和完整池
+                # v2 格式：提取最佳 IP 和完整池
                 self.mappings = {}
                 self.detailed_results = {}
+                self._warmup_latency = {}
                 for domain, domain_data in data["domains"].items():
                     self.mappings[domain] = {
                         "ip": domain_data["best_ip"],
@@ -1689,10 +2018,47 @@ class HostOptimizer:
                         "speed": domain_data["best_speed"],
                     }
                     self.detailed_results[domain] = domain_data.get("ips", [])
+                    if "warmup_latencies" in domain_data:
+                        self._warmup_latency[domain] = domain_data["warmup_latencies"]
+                    if "api_latency_ms" in domain_data:
+                        self._api_latency_ms = domain_data["api_latency_ms"]
+
+                # 读取 warmup 状态
+                self.warmup_status = data.get("warmup_status", {
+                    "api_ok": False, "cas_ok": False, "data_ok": False
+                })
+
+                # 读取上下文
+                cached_ctx = data.get("context", {})
+                # 上下文匹配：同一 repo+commit 则复用 warmup 结果
+                has_cache_ctx = bool(cached_ctx.get("repo"))
+                has_current_ctx = bool(self.repo)
+                ctx_match = (
+                    has_cache_ctx
+                    and has_current_ctx
+                    and cached_ctx.get("repo") == self.repo
+                    and cached_ctx.get("commit") == self.commit
+                )
+                if has_current_ctx and not ctx_match:
+                    logger.info(
+                        f"[HostOpt] 缓存上下文不匹配（缓存: {cached_ctx.get('repo')}@{cached_ctx.get('commit')[:8] if cached_ctx.get('commit') else '?'} "
+                        f"→ 当前: {self.repo}@{self.commit[:8] if self.commit else '?'}），跳过 warmup 结果复用"
+                    )
+                    self.warmup_status = {"api_ok": False, "cas_ok": False, "data_ok": False}
+                    # 仍复用 IP 和 RTT 数据，但标记 warmup 无效
+                else:
+                    if ctx_match:
+                        logger.info(
+                            f"[HostOpt] 缓存上下文匹配（repo={self.repo}），复用 warmup 结果"
+                        )
+                    # 恢复 file_hash（从缓存上下文）
+                    if cached_ctx.get("file_hash"):
+                        self.file_hash = cached_ctx.get("file_hash")
             else:
                 # 旧格式：仅有最佳 IP
                 self.mappings = data.get("mappings", {})
                 self.detailed_results = {}
+                self.warmup_status = {"api_ok": False, "cas_ok": False, "data_ok": False}
 
             # 检查代理依赖：如果某些域名需要代理但当前没有代理配置
             if not self.proxy:
@@ -1716,7 +2082,7 @@ class HostOptimizer:
             return False
 
     def _save_cache(self) -> None:
-        """保存优选缓存（包含完整 IP 池）。"""
+        """保存优选缓存（包含完整 IP 池 + warmup 状态 + 上下文）。"""
         try:
             # 构建完整数据结构
             domains_data = {}
@@ -1724,20 +2090,33 @@ class HostOptimizer:
                 category = get_domain_category(domain)
                 detailed = self.detailed_results.get(domain, [])
 
-                domains_data[domain] = {
+                entry = {
                     "category": category,
                     "best_ip": mapping["ip"],
                     "best_use_proxy": mapping.get("use_proxy", False),
                     "best_rtt": mapping.get("rtt", 0),
                     "best_speed": mapping.get("speed", 0),
-                    "ips": detailed,  # 完整 IP 池
+                    "ips": detailed,
                 }
+                # CAS 域名附加 warmup 延迟数据
+                if category == "cas" and domain in self._warmup_latency:
+                    entry["warmup_latencies"] = self._warmup_latency[domain]
+                # API 域名附加 warmup 响应时间
+                if category == "api" and self._api_latency_ms is not None:
+                    entry["api_latency_ms"] = self._api_latency_ms
+                domains_data[domain] = entry
 
             data = {
                 "version": "2.0",
                 "timestamp": int(time.time()),
                 "proxy_config": self.proxy,
                 "domains": domains_data,
+                "warmup_status": dict(self.warmup_status),
+                "context": {
+                    "repo": self.repo,
+                    "commit": self.commit,
+                    "file_hash": self.file_hash,
+                },
             }
 
             with open(self.cache_path, 'w') as f:
@@ -1881,6 +2260,10 @@ def create_optimized_session(
     access_token: Optional[str] = None,
     file_hash: Optional[str] = None,
     cas_endpoint: Optional[str] = None,
+    repo: Optional[str] = None,
+    commit: Optional[str] = None,
+    filename: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ) -> Tuple[requests.Session, Optional[HostOptimizer]]:
     """一步创建带 HOST 优选的 Session。
 
@@ -1895,6 +2278,10 @@ def create_optimized_session(
         access_token: CAS 认证 token（用于真实带宽测速）
         file_hash: 文件 MerkleHash（用于 CAS reconstruction 端点延迟测速）
         cas_endpoint: CAS 服务地址（如 https://cas-server.xethub.hf.co）
+        repo: 仓库 ID，用于 API warm-up（如 mykor/granite-embedding-97m）
+        commit: commit hash 或分支名，用于 API warm-up
+        filename: 文件名，用于 API warm-up
+        hf_token: HuggingFace 用户 token，用于 API warm-up 获取 CAS token
 
     Returns:
         (session, host_optimizer) 元组
@@ -1925,9 +2312,32 @@ def create_optimized_session(
             access_token=access_token,
             file_hash=file_hash,
             cas_endpoint=cas_endpoint,
+            repo=repo,
+            commit=commit,
+            filename=filename,
+            hf_token=hf_token,
         )
         host_optimizer.optimize(force_refresh=refresh_hosts)
         logger.info("[Session] HOST 优选已启用")
+    else:
+        # 即使未指定 --optimize-hosts，也尝试加载缓存中的优选结果
+        host_optimizer = HostOptimizer(
+            proxy=proxy,
+            cache_dir=cache_dir,
+            dns_servers=dns_servers,
+            access_token=access_token,
+            file_hash=file_hash,
+            cas_endpoint=cas_endpoint,
+            repo=repo,
+            commit=commit,
+            filename=filename,
+            hf_token=hf_token,
+        )
+        if host_optimizer._load_cache():
+            host_optimizer._install_patch()
+            logger.info("[Session] 已从缓存加载 HOST 优选结果（运行 xet optimize 可刷新）")
+        else:
+            host_optimizer = None
 
     # 2. 创建 Session
     if host_optimizer:

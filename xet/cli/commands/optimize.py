@@ -79,6 +79,16 @@ def register_optimize_command(subparsers):
     )
 
     parser.add_argument(
+        "--commit",
+        help="Git revision（分支名或 commit hash，默认 main）",
+    )
+
+    parser.add_argument(
+        "--file",
+        help="文件名（配合 --repo 使用，指定单个文件进行 warm-up）",
+    )
+
+    parser.add_argument(
         "--hf-endpoint",
         help="HuggingFace API 端点（如 https://hf-mirror.com，默认 huggingface.co）",
     )
@@ -210,6 +220,12 @@ def optimize_command(args) -> int:
         # 有 token 但没 hash：仅传 token 做 DATA 测速（无 CAS 延迟测速）
         _access_token = args.token
 
+    # 提取 warm-up 上下文
+    _optimize_repo = args.repo if hasattr(args, 'repo') else None
+    _optimize_commit = args.commit if hasattr(args, 'commit') else None
+    _optimize_filename = getattr(args, 'file', None)  # --file 参数
+    _optimize_hf_token = args.token or ConfigManager().get_token() if hasattr(args, 'token') else None
+
     # 创建优选器
     optimizer = HostOptimizer(
         proxy=args.proxy or "",
@@ -217,6 +233,10 @@ def optimize_command(args) -> int:
         access_token=_access_token,
         file_hash=_file_hash,
         cas_endpoint=_cas_endpoint,
+        repo=_optimize_repo,
+        commit=_optimize_commit,
+        filename=_optimize_filename,
+        hf_token=_optimize_hf_token,
     )
     optimizer.set_quiet(args.quiet)  # 安静模式：抑制实时测速输出
 

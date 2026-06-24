@@ -135,19 +135,17 @@ class RichProgress(ProgressDisplay):
             # 构建简洁的描述：图标 + 位置信息
             desc_parts = []
 
-            # 始终显示 Xorb 进度
-            if total_xorbs > 0:
-                desc_parts.append(f"📦 {completed_xorbs}/{total_xorbs}")
+            # 始终显示 Xorb 进度（即使为 0/0，让用户看到正在解析中的状态）
+            desc_parts.append(
+                f"📦 {completed_xorbs}/{total_xorbs}" if total_xorbs > 0
+                else f"📦 ?/?"
+            )
 
-            # 只要 segment 总数大于 0，就显示段进度（不带"段"字）
+            # 只要 segment 总数大于 0，就显示段进度
             if total_segments > 0:
                 desc_parts.append(f"🔗 {completed_segments}/{total_segments}")
 
-            # 如果没有任何信息，使用默认图标
-            if not desc_parts:
-                description = "⬇️  下载中"
-            else:
-                description = " | ".join(desc_parts)
+            description = " | ".join(desc_parts)
 
             # Rich 需要字节数来正确格式化速度和已下载量
             assembled_bytes = stats.get("assembled_bytes", 0)

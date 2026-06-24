@@ -628,7 +628,12 @@ class SegmentedReconstructor:
             seg_temp: 临时文件路径
         """
         # 在创建 ProgressTracker 之前先计算基础值（断点续传时 .part 文件已有数据）
-        base_bytes = seg.start  # 已完成段的偏移
+        if self.parallel_segments > 1:
+            # 并行模式：初始进度已在 reconstruct_file() 中报告，段间不叠加
+            base_bytes = 0
+        else:
+            # 串行模式：seg.start 是已完成段的偏移，累加显示正确
+            base_bytes = seg.start
         part_path = self.temp_dir / f"seg_{seg.index}.tmp.part"
         if part_path.exists():
             base_bytes += part_path.stat().st_size
@@ -639,8 +644,11 @@ class SegmentedReconstructor:
         )
         # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
         progress_tracker.set_total_bytes(self.file_size)
+        progress_tracker.set_total_xorbs(len(recon.fetch_info))
+        progress_tracker.set_total_terms(len(recon.terms))
+        progress_tracker.set_total_segments(len(self.segments))
 
-        if base_bytes > seg.start:
+        if base_bytes > (0 if self.parallel_segments > 1 else seg.start):
             logger.debug(
                 f"[SegmentedReconstructor] 段 {seg.index} ProgressTracker 基线: "
                 f"{base_bytes / 1024 / 1024:.1f} MB (含 {part_path.stat().st_size / 1024 / 1024:.1f} MB 已有数据)"

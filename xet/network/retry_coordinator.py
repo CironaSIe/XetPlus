@@ -113,8 +113,9 @@ class RetryCoordinator:
             elapsed = time.time() - self._all_retry_since
             if elapsed >= self._all_retry_grace:
                 logger.error(
-                    f"[RetryCoord] ❌ 所有并行下载持续重试 {elapsed:.0f}s "
-                    f"(超过宽限 {self._all_retry_grace:.0f}s)，触发全局停止"
+                    f"[RetryCoord] ❌ 全部 {len(self._active_hashes)} 个活跃 xorb "
+                    f"持续重试 {elapsed:.0f}s "
+                    f"(宽限 {self._all_retry_grace:.0f}s)，触发全局停止"
                 )
                 self._global_stop = True
                 return True
