@@ -43,6 +43,9 @@ class CASClient:
         session_id: 会话 ID（用于跟踪）
     """
 
+    # Reconstruction URL 默认新鲜度阈值（30 秒主动刷新）
+    _recon_refresh_interval = 30
+
     def __init__(
         self,
         endpoint: str,
@@ -88,6 +91,9 @@ class CASClient:
         self.session_id = uuid.uuid4().hex[:16]
         # V2 API 版本探测缓存
         self._v2_available: Optional[bool] = None
+        # Reconstruction 新鲜度跟踪（用于预检 URL 过期）
+        self._last_recon_time: float = 0.0
+        self._last_recon_file: str = ""
 
     def _get_headers(self) -> dict:
         """获取标准请求头（含认证）。
@@ -338,7 +344,6 @@ class CASClient:
             offset_into_first_range=new_offset,
         )
 
-    @with_retry(max_attempts=5, backoff_base=1.5, retry_on=(requests.RequestException,))
     def get_xorb_data(self, url: str, url_range: HttpRange) -> bytes:
         """下载 xorb 数据。
 
@@ -537,6 +542,26 @@ class CASClient:
                     # 2. 主动检查 token 过期
                     self._ensure_token()
 
+                    # 2.5. 预检 URL 新鲜度：reconstruction 中的 presigned URL 有时效性
+                    #    如果距离上次获取 recon 已超过阈值（或换了文件），主动刷新
+                    _need_fresh_recon = (
+                        file_hash != self._last_recon_file
+                        or time.time() - self._last_recon_time > CASClient._recon_refresh_interval
+                    )
+                    if _need_fresh_recon and attempt == 0:
+                        try:
+                            _fresh_recon = self.get_reconstruction(file_hash)
+                            _fresh_url, _fresh_range = self._find_xorb_in_recon(
+                                xorb_hash, _fresh_recon, url_range
+                            )
+                            current_url = _fresh_url
+                            current_range = _fresh_range
+                            self._last_recon_time = time.time()
+                            self._last_recon_file = file_hash
+                            logger.debug(f"[CAS] 预检刷新 URL: {xorb_hash[:16]}...")
+                        except Exception:
+                            pass  # 预检失败不阻塞，后续 403 时再刷新
+
                     # 3. 下载 xorb 数据
                     if use_streaming:
                         data = self.get_xorb_data_streaming(current_url, current_range)
@@ -608,6 +633,7 @@ class CASClient:
                                 current_url, current_range = self._find_xorb_in_recon(
                                     xorb_hash, recon, url_range
                                 )
+                                self._last_recon_time = time.time()  # 更新新鲜度
                                 self._url_coordinator.release_refresh(success=True)
                                 logger.info(
                                     f"[CAS] 403 恢复: 获取新 URL {current_url[:60]}..."
@@ -763,7 +789,7 @@ class CASClient:
                 self._auth.clear_cache()
                 new_info = self._auth.get_token(self._repo_id, auth_url=self._auth_url)
                 self.access_token = new_info.access_token
-                logger.info(f"[CAS] Token 刷新成功，有效期至 {new_info.expiration}")
+                logger.warning(f"[CAS] Token 刷新成功，有效期至 {new_info.expiration}")
                 return
             except Exception as e:
                 if attempt == max_retries - 1:

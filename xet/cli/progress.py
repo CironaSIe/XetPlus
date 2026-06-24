@@ -8,6 +8,7 @@ from rich.progress import (
     TimeRemainingColumn,
     TextColumn,
 )
+from rich.table import Column
 from rich.console import Console
 
 
@@ -20,6 +21,19 @@ class _BinaryDownloadColumn:
 
     def __init__(self):
         self.units = ["B", "KiB", "MiB", "GiB", "TiB"]
+
+    def get_table_column(self):
+        """返回表格列定义（Progress 初始化时调用）。"""
+        return Column(
+            header="Downloaded",
+            justify="right",
+            min_width=20,
+            max_width=30,
+        )
+
+    def __call__(self, task):
+        """Rich Progress 通过 column(task) 调用（兼容 ProgressColumn 协议）。"""
+        return self.render(task)
 
     def render(self, task):
         """Render 进度条中的已下载/总量。"""

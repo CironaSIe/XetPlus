@@ -14,6 +14,13 @@ from xet.protocol.types import XetTokenInfo
 
 logger = logging.getLogger(__name__)
 
+# 仓库类型 → API URL 中复数路径的映射表
+REPO_TYPE_PLURAL_MAP = {
+    "model": "models",
+    "dataset": "datasets",
+    "space": "spaces",
+}
+
 
 class XetAuth:
     """HuggingFace → CAS Token 认证管理器。
@@ -30,15 +37,17 @@ class XetAuth:
         _token_cache: 缓存的 XetTokenInfo 对象
     """
 
-    def __init__(self, hf_token: str, session: requests.Session):
+    def __init__(self, hf_token: str, session: requests.Session, hf_endpoint: Optional[str] = None):
         """初始化认证管理器。
 
         Args:
             hf_token: HuggingFace 用户 access token
             session: 已配置好的 requests.Session（含代理等设置）
+            hf_endpoint: 自定义 HF API 端点（如 https://hf-mirror.com），默认 huggingface.co
         """
         self.hf_token = hf_token
         self.session = session
+        self.hf_endpoint = (hf_endpoint or "https://huggingface.co").rstrip("/")
         self._token_cache: Optional[XetTokenInfo] = None
 
     def get_token(
@@ -88,9 +97,9 @@ class XetAuth:
     def _resolve_revision(
         self, repo_id: str, repo_type: str, revision: str
     ) -> Tuple[str, Optional[str]]:
-        """将 revision（分支名/tag）解析为 commit hash，同时获取 Link header 中的 auth URL。
+        """将 revision（分支名/tag）解析为 commit hash。
 
-        通过 HEAD 请求 resolve 端点，不跟随重定向。
+        通过 GET 请求 /api/{type}s/{repo}/revision/ 端点获取 commit hash。
 
         Args:
             repo_id: 仓库 ID
@@ -99,42 +108,24 @@ class XetAuth:
 
         Returns:
             (commit_hash, auth_url) 元组
-            - commit_hash: 40 字符 git commit hash
-            - auth_url: 来自 Link header 的 xet-auth URL（可能为 None）
+            - commit_hash: 40 字符 git commit hash（来自 JSON body 的 "sha" 字段）
+            - auth_url: 始终为 None（/revision/ 端点不返回 Link header）
         """
-        REPO_TYPE_PLURAL = {
-            "model": "models",
-            "dataset": "datasets",
-            "space": "spaces"
-        }
-        repo_type_plural = REPO_TYPE_PLURAL.get(repo_type, f"{repo_type}s")
-        url = f"https://huggingface.co/{repo_type_plural}/{repo_id}/resolve/{revision}"
+        repo_type_plural = REPO_TYPE_PLURAL_MAP.get(repo_type, f"{repo_type}s")
+        url = f"{self.hf_endpoint}/api/{repo_type_plural}/{repo_id}/revision/{revision}"
 
         logger.debug(f"[XetAuth] 解析 revision: {repo_id}@{revision}")
 
         headers = {"Authorization": f"Bearer {self.hf_token}"} if self.hf_token else {}
-        resp = self.session.head(
-            url, headers=headers, allow_redirects=False, timeout=30
-        )
+        resp = self.session.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
 
-        if resp.status_code in (301, 302, 307, 308):
-            location = resp.headers.get("Location", "")
-            # Location: /{repo_type_plural}/{repo_id}/resolve/{commit_hash}/{filename}
-            parts = location.split("/resolve/")
-            if len(parts) > 1:
-                commit_hash = parts[1].split("/")[0]
-            else:
-                raise ValueError(
-                    f"[XetAuth] 无法从 Location header 解析 commit hash: {location}"
-                )
-        else:
-            resp.raise_for_status()
-            raise ValueError(f"[XetAuth] 预期重定向，但收到 {resp.status_code}")
+        data = resp.json()
+        commit_hash = data.get("sha")
+        if not commit_hash:
+            raise ValueError(f"[XetAuth] /revision/ 响应中无 sha 字段")
 
-        link_header = resp.headers.get("Link", "")
-        auth_url = self._parse_link_header(link_header)
-
-        return commit_hash, auth_url
+        return commit_hash, None
 
     def _request_token(
         self, repo_id: str, repo_type: str, revision: str
@@ -158,14 +149,9 @@ class XetAuth:
         if auth_url:
             return self._request_token_from_url(auth_url)
 
-        # 无 Link header 时的 fallback：用正确 URL 格式
-        REPO_TYPE_PLURAL = {
-            "model": "models",
-            "dataset": "datasets",
-            "space": "spaces"
-        }
-        repo_type_plural = REPO_TYPE_PLURAL.get(repo_type, f"{repo_type}s")
-        url = f"https://huggingface.co/api/{repo_type_plural}/{repo_id}/xet-read-token/{commit_hash}"
+        # 无 auth_url 时：用 commit hash 构造 xet-read-token URL
+        repo_type_plural = REPO_TYPE_PLURAL_MAP.get(repo_type, f"{repo_type}s")
+        url = f"{self.hf_endpoint}/api/{repo_type_plural}/{repo_id}/xet-read-token/{commit_hash}"
 
         return self._request_token_from_url(url)
 

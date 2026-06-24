@@ -398,7 +398,7 @@ def info_command(args):
 
             # 获取 CAS token
             from xet.network.auth import XetAuth
-            auth = XetAuth(hf_token=hf_token, session=session)
+            auth = XetAuth(hf_token=hf_token, session=session, hf_endpoint=hf_endpoint)
             token_info = auth.get_token(
                 repo_id=repo_id,
                 repo_type=repo_type,
@@ -517,7 +517,7 @@ def info_command(args):
                 # 初始化 CAS 客户端（首次）
                 if cas_client is None:
                     from xet.network.auth import XetAuth
-                    auth = XetAuth(hf_token=hf_token, session=session)
+                    auth = XetAuth(hf_token=hf_token, session=session, hf_endpoint=hf_endpoint)
                     token_info = auth.get_token(
                         repo_id=repo_id,
                         repo_type=repo_type,

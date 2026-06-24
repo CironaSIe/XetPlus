@@ -253,9 +253,8 @@ def test_get_xorb_data_http_error(mock_session):
     url = "https://cdn.example.com/xorb/abc123"
     url_range = HttpRange(start=0, end=1023)
 
-    # 装饰器会重试 5 次，最终抛出 RetryError
-    from xet.network.retry import RetryError
-    with pytest.raises(RetryError):
+    # @with_retry 已移除，get_xorb_data 直接抛出 HTTPError
+    with pytest.raises(requests.HTTPError):
         client.get_xorb_data(url, url_range)
 
 

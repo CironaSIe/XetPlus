@@ -877,7 +877,34 @@ def download_single_file(
         raise
 
     except Exception as e:
-        print(f"✗ 下载失败: {e}", file=sys.stderr)
+        # 显示已下载进度和存盘尺寸
+        assembled = _latest_stats.get('assembled_bytes', 0)
+        total = _latest_stats.get('total_bytes', 0)
+        completed_seg = _latest_stats.get('completed_segments', 0)
+        total_seg = _latest_stats.get('total_segments', 0)
+
+        is_403_exhausted = (
+            'URL 刷新失败次数过多' in str(e)
+            or '下载失败，已重试' in str(e)
+            or '403' in str(e).upper()
+        )
+
+        if total > 0:
+            pct = assembled / total * 100
+            progress_str = f"{format_bytes(assembled)}/{format_bytes(total)} ({pct:.1f}%)"
+        else:
+            progress_str = format_bytes(assembled)
+        seg_str = f", {completed_seg}/{total_seg}段" if total_seg > 0 else ""
+
+        if is_403_exhausted:
+            print(
+                f"\n  ✗ 下载因连续失败而停止: {e}\n"
+                f"  ↳ 已保存断点: {progress_str}{seg_str} (可重新运行命令续传)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"\n  ✗ 下载失败: {e}", file=sys.stderr)
+
         import traceback
         traceback.print_exc()
         return False
@@ -1022,7 +1049,7 @@ def download_command(args):
         token_info = None
         if _first_auth_url:
             from xet.network.auth import XetAuth
-            auth = XetAuth(hf_token=hf_token, session=session)
+            auth = XetAuth(hf_token=hf_token, session=session, hf_endpoint=hf_endpoint)
             try:
                 token_info = auth.get_token(repo_id=_first_repo_id, repo_type=_first_repo_type, auth_url=_first_auth_url)
                 logger.info(f"提前获取到 CAS token, endpoint={token_info.endpoint}")
@@ -1256,13 +1283,13 @@ def download_command(args):
         if not token_info:
             # 提前获取失败或未触发，在此处重试
             from xet.network.auth import XetAuth
-            auth = XetAuth(hf_token=hf_token, session=session)
+            auth = XetAuth(hf_token=hf_token, session=session, hf_endpoint=hf_endpoint)
             token_info = auth.get_token(repo_id=first_repo, repo_type=first_repo_type, auth_url=auth_url)
             logger.info(f"获取到 CAS token, endpoint={token_info.endpoint}")
         else:
             logger.info(f"复用提前获取的 CAS token, endpoint={token_info.endpoint}")
             # 确保 auth 对象可用（CASClient 需要它）
-            auth = XetAuth(hf_token=hf_token, session=session)
+            auth = XetAuth(hf_token=hf_token, session=session, hf_endpoint=hf_endpoint)
 
         # 7. 初始化自适应并发控制器（如果启用）
         acc = None

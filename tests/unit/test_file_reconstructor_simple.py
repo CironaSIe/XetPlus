@@ -111,11 +111,8 @@ def test_reconstruct_file_success(mock_cas_client, temp_dir):
         output_path=output_path,
     )
 
-    # Mock 下载和组装
-    with patch.object(reconstructor.scheduler, "download_all_xorbs") as mock_download, \
-         patch.object(reconstructor.assembler, "assemble_file") as mock_assemble:
-
-        mock_download.return_value = {"xorb1": b"xorb_data"}
+    # Mock 下载和组装（新代码路径使用 assemble_file_with_prefetch）
+    with patch.object(reconstructor.assembler, "assemble_file_with_prefetch") as mock_assemble:
 
         # 创建输出文件（模拟组装）
         def create_output(*args, **kwargs):
@@ -128,7 +125,7 @@ def test_reconstruct_file_success(mock_cas_client, temp_dir):
             expected_size=100,
         )
 
-        assert result == output_path
+        assert result[0] == output_path  # 返回值是 (path, xorb_hashes) 元组
         assert output_path.exists()
         assert output_path.stat().st_size == 100
 
@@ -142,10 +139,7 @@ def test_reconstruct_file_size_mismatch(mock_cas_client, temp_dir):
         output_path=output_path,
     )
 
-    with patch.object(reconstructor.scheduler, "download_all_xorbs") as mock_download, \
-         patch.object(reconstructor.assembler, "assemble_file") as mock_assemble:
-
-        mock_download.return_value = {}
+    with patch.object(reconstructor.assembler, "assemble_file_with_prefetch") as mock_assemble:
 
         def create_wrong_size(*args, **kwargs):
             output_path.write_bytes(b"A" * 50)  # 实际 50，期望 100
@@ -168,8 +162,8 @@ def test_reconstruct_file_download_failure(mock_cas_client, temp_dir):
         output_path=output_path,
     )
 
-    with patch.object(reconstructor.scheduler, "download_all_xorbs") as mock_download:
-        mock_download.side_effect = RuntimeError("Download failed")
+    with patch.object(reconstructor.assembler, "assemble_file_with_prefetch") as mock_assemble:
+        mock_assemble.side_effect = RuntimeError("Download failed")
 
         with pytest.raises(ReconstructionError, match="文件重建失败"):
             reconstructor.reconstruct_file(
@@ -187,8 +181,8 @@ def test_reconstruct_file_keyboard_interrupt(mock_cas_client, temp_dir):
         output_path=output_path,
     )
 
-    with patch.object(reconstructor.scheduler, "download_all_xorbs") as mock_download:
-        mock_download.side_effect = KeyboardInterrupt("用户中断")
+    with patch.object(reconstructor.assembler, "assemble_file_with_prefetch") as mock_assemble:
+        mock_assemble.side_effect = KeyboardInterrupt("用户中断")
 
         with pytest.raises(KeyboardInterrupt):
             reconstructor.reconstruct_file(

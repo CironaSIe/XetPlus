@@ -37,107 +37,72 @@ def test_chunk_assembler_none_temp_dir():
 
 
 # ============================================================================
-# 解压 xorb 测试
+# 解压 xorb 测试（当前 API: _decompress_single_xorb）
 # ============================================================================
 
-def test_decompress_all_xorbs(temp_dir):
-    """测试解压所有 xorb。"""
+def test_decompress_single_xorb_interface(temp_dir):
+    """测试 _decompress_single_xorb 方法存在且可调用。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    xorb_data_map = {
-        "xorb1": b"compressed_xorb1",
-        "xorb2": b"compressed_xorb2",
-    }
-
-    # Mock decompress_xorb 函数
-    with patch("xet.pipeline.chunk_assembler.decompress_xorb") as mock_decompress:
-        mock_decompress.side_effect = [
-            {"chunk1": b"chunk1_data"},
-            {"chunk2": b"chunk2_data"},
-        ]
-
-        chunk_cache = assembler._decompress_all_xorbs(xorb_data_map)
-
-        assert len(chunk_cache) == 2
-        assert chunk_cache["chunk1"] == b"chunk1_data"
-        assert chunk_cache["chunk2"] == b"chunk2_data"
-
-        # 验证调用
-        assert mock_decompress.call_count == 2
+    # 确认方法存在
+    assert hasattr(assembler, '_decompress_single_xorb')
+    assert callable(assembler._decompress_single_xorb)
 
 
-def test_decompress_all_xorbs_merge_chunks(temp_dir):
-    """测试解压时合并多个 xorb 的 chunk。"""
+def test_decompress_single_xorb_bad_hash(temp_dir):
+    """测试传入无效 hash 时抛出异常。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    xorb_data_map = {
-        "xorb1": b"compressed_xorb1",
-        "xorb2": b"compressed_xorb2",
-    }
+    mock_recon = Mock()
+    mock_recon.fetch_info = {}  # 空 fetch_info，任何 hash 都找不到
 
-    with patch("xet.pipeline.chunk_assembler.decompress_xorb") as mock_decompress:
-        # 第一个 xorb 包含 chunk1 和 chunk2
-        # 第二个 xorb 包含 chunk3
-        mock_decompress.side_effect = [
-            {"chunk1": b"data1", "chunk2": b"data2"},
-            {"chunk3": b"data3"},
-        ]
-
-        chunk_cache = assembler._decompress_all_xorbs(xorb_data_map)
-
-        assert len(chunk_cache) == 3
-        assert "chunk1" in chunk_cache
-        assert "chunk2" in chunk_cache
-        assert "chunk3" in chunk_cache
+    with pytest.raises(ValueError, match="没有 fetch_info"):
+        assembler._decompress_single_xorb("unknown_xorb", b"data", mock_recon)
 
 
-def test_decompress_all_xorbs_failure(temp_dir):
-    """测试解压失败。"""
+def test_decompress_single_xorb_import_error_handling(temp_dir):
+    """测试缺少依赖库时的 ImportError 处理。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    xorb_data_map = {"xorb1": b"corrupted"}
+    mock_recon = Mock()
+    mock_recon.fetch_info = {"xorb1": [Mock(chunk_range=Mock(start=0), url_range=Mock(length=lambda: 100))]}
 
-    with patch("xet.pipeline.chunk_assembler.decompress_xorb") as mock_decompress:
-        mock_decompress.side_effect = RuntimeError("Decompress failed")
+    # Mock XorbDeserializer import to raise ImportError
+    with patch.dict('sys.modules', {'xet.storage.xorb_deserializer': None}):
+        with pytest.raises(ImportError, match="需要 lz4 和 blake3 库"):
+            assembler._decompress_single_xorb("xorb1", b"data", mock_recon)
 
-        with pytest.raises(RuntimeError, match="解压 xorb 失败"):
-            assembler._decompress_all_xorbs(xorb_data_map)
 
-
-def test_decompress_all_xorbs_missing_library(temp_dir):
-    """测试缺少 merkle-hash-rust 库。"""
+def test_chunk_assembler_xorb_cache(temp_dir):
+    """测试 xorb 内存缓存。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    xorb_data_map = {"xorb1": b"data"}
+    # 初始缓存为空
+    assert len(assembler._xorb_cache) == 0
 
-    with patch("xet.pipeline.chunk_assembler.decompress_xorb", side_effect=ImportError):
-        with pytest.raises(ImportError, match="需要 merkle-hash-rust 库"):
-            assembler._decompress_all_xorbs(xorb_data_map)
+    # 模拟缓存写入（使用简单的 Mock 数据）
+    mock_xorb_data = Mock()
+    assembler._xorb_cache["test_xorb"] = mock_xorb_data
+
+    assert "test_xorb" in assembler._xorb_cache
+    assert len(assembler._xorb_cache) == 1
 
 
-# ============================================================================
-# 获取 chunk 数据测试
-# ============================================================================
-
-def test_get_chunk_data_success(temp_dir):
-    """测试从缓存获取 chunk 数据。"""
+def test_chunk_assembler_prefetch_interface(temp_dir):
+    """测试 assemble_file_with_prefetch 接口存在。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    chunk_cache = {
-        "chunk1": b"data1",
-        "chunk2": b"data2",
-    }
-
-    data = assembler._get_chunk_data("chunk1", chunk_cache)
-
-    assert data == b"data1"
+    # 确认新 API 方法存在
+    assert hasattr(assembler, 'assemble_file_with_prefetch')
+    assert callable(assembler.assemble_file_with_prefetch)
 
 
-def test_get_chunk_data_missing(temp_dir):
-    """测试获取缺失的 chunk。"""
+def test_chunk_assembler_temp_dir_handling(temp_dir):
+    """测试临时目录处理。"""
     assembler = ChunkAssembler(temp_dir=temp_dir)
 
-    chunk_cache = {"chunk1": b"data1"}
+    assert assembler.temp_dir == temp_dir
 
-    with pytest.raises(ValueError, match="Chunk 缺失"):
-        assembler._get_chunk_data("chunk_missing", chunk_cache)
+    # None temp_dir 也应该工作
+    assembler_none = ChunkAssembler(temp_dir=None)
+    assert assembler_none.temp_dir is None

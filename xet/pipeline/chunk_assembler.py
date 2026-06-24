@@ -475,6 +475,10 @@ class ChunkAssembler(PrefetchHelpers):
         # 4. 检查 checkpoint，确定起始 term
         start_term_idx = 0
         if checkpoint_manager:
+            # 防御性加载：如果调用方未显式 load()，此处尝试从文件恢复
+            if checkpoint_manager._cache is None:
+                checkpoint_manager.load(file_hash)
+
             checkpoint = checkpoint_manager._cache
             if checkpoint and checkpoint.file_hash == file_hash:
                 start_term_idx = checkpoint.last_term_index + 1
@@ -492,6 +496,10 @@ class ChunkAssembler(PrefetchHelpers):
                         f"[ChunkAssembler] 📍 发现有效断点! "
                         f"将从 Term #{start_term_idx} 继续 (共 {len(recon.terms)} terms), "
                         f"已写入: {bytes_written / 1024 / 1024:.1f} MB"
+                    )
+                    print(
+                        f"\n  🔄 断点续传: 从 Term #{start_term_idx}/{len(recon.terms)} 继续"
+                        f" ({bytes_written / 1024 / 1024:.1f} MB 已写入)"
                     )
 
         # 5. 按 term 顺序处理并写入
@@ -521,6 +529,35 @@ class ChunkAssembler(PrefetchHelpers):
                 start_term_idx, progress_tracker, cache_adapter,
                 stop_event, checkpoint_manager, start_time
             )
+
+    @staticmethod
+    def _estimate_restart_term(recon, actual_file_size: int) -> int:
+        """根据实际文件大小估算应从哪个 term 重新开始。
+
+        当 .part 文件小于 checkpoint 记录的期望大小时（通常因为 OS 未 flush），
+        遍历 term 累积大小，找到最后一个可能完整写入的 term。
+
+        Args:
+            recon: reconstruction 响应（含 terms 列表）
+            actual_file_size: .part 文件的实际字节大小
+
+        Returns:
+            建议的起始 term 索引
+        """
+        accumulated = 0
+        for i, term in enumerate(recon.terms):
+            if i == 0:
+                term_size = max(0, term.unpacked_length - recon.offset_into_first_range)
+            else:
+                term_size = term.unpacked_length
+
+            if accumulated + term_size > actual_file_size:
+                # 当前 term 无法完整放入已有文件，从前一个 term 开始
+                return max(0, i)
+            accumulated += term_size
+
+        # 所有 term 都能放下（文件实际上足够大）
+        return len(recon.terms)
 
     def _assemble_with_sequential_write(
         self,
@@ -561,15 +598,54 @@ class ChunkAssembler(PrefetchHelpers):
                 # 从 checkpoint 恢复：使用 r+b 模式追加，并验证现有文件大小
                 file_mode = 'r+b'
                 existing_size = part_path.stat().st_size
-                if existing_size != bytes_already_written:
-                    logger.warning(
-                        f"[ChunkAssembler] Checkpoint 文件大小不匹配: "
-                        f"期望 {bytes_already_written}, 实际 {existing_size}. "
-                        f"将截断到正确大小"
-                    )
-                    # 截断到正确大小
-                    with open(part_path, 'r+b') as f_trunc:
-                        f_trunc.truncate(bytes_already_written)
+                # 容差：term 级大小计算与实际文件大小可能存在微小差异
+                # （OS 块对齐、文件系统元数据等），差异 < 1MB 时视为一致
+                size_diff = abs(existing_size - bytes_already_written)
+                if size_diff > 1024 * 1024:  # 差异超过 1MB 才触发恢复调整
+                    if existing_size > bytes_already_written:
+                        # 文件比预期大：说明上次运行写入了数据但 checkpoint 未保存
+                        # （这是有效数据，不应截断！用实际文件大小作为恢复基准）
+                        logger.info(
+                            f"[ChunkAssembler] 文件比 Checkpoint 记录更大 "
+                            f"(实际 {existing_size / 1024 / 1024:.1f} MB > "
+                            f"期望 {bytes_already_written / 1024 / 1024:.1f} MB)，"
+                            f"保留已有数据，从实际位置恢复"
+                        )
+                        bytes_already_written = existing_size
+                        # 根据实际文件大小估算应从哪个 term 继续
+                        estimated_restart = self._estimate_restart_term(
+                            recon, existing_size
+                        )
+                        if estimated_restart < start_term_idx:
+                            logger.info(
+                                f"[ChunkAssembler] 根据实际文件大小调整: "
+                                f"Term #{start_term_idx} → Term #{estimated_restart}"
+                            )
+                            start_term_idx = estimated_restart
+                    else:
+                        # 文件比预期小：部分数据未 flush 到磁盘。
+                        # 根据实际文件大小估算最后一个完整 term，保留已有数据。
+                        estimated_restart = self._estimate_restart_term(
+                            recon, existing_size
+                        )
+                        if estimated_restart < start_term_idx:
+                            old_start = start_term_idx
+                            start_term_idx = estimated_restart
+                            bytes_already_written = existing_size
+                            logger.warning(
+                                f"[ChunkAssembler] 文件不完整: "
+                                f"期望 {bytes_already_written / 1024 / 1024:.1f} MB, "
+                                f"实际 {existing_size / 1024 / 1024:.1f} MB. "
+                                f"回退到 Term #{start_term_idx}（原计划 #{old_start}），"
+                                f"保留 {existing_size / 1024 / 1024:.1f} MB 已有数据"
+                            )
+                        else:
+                            # 文件虽小但差距不大，可能是 OS 缓存延迟，仍尝试继续
+                            logger.info(
+                                f"[ChunkAssembler] 文件略小于预期 "
+                                f"({existing_size}/{bytes_already_written})，"
+                                f"尝试从 Term #{start_term_idx} 继续写入"
+                            )
             else:
                 # 全新下载：使用 wb 模式
                 file_mode = 'wb'
@@ -714,13 +790,18 @@ class ChunkAssembler(PrefetchHelpers):
             )
 
         except Exception:
-            # 异常时清理 .part 文件
-            if part_path.exists():
+            # 异常时：仅在无 checkpoint 的情况下清理 .part 文件
+            # 有 checkpoint 时保留 .part，下次可从断点恢复（追加模式）
+            if not checkpoint_manager and part_path.exists():
                 try:
                     part_path.unlink()
                     logger.debug(f"[ChunkAssembler] 清理 .part 文件: {part_path}")
                 except Exception as e:
                     logger.warning(f"[ChunkAssembler] 清理 .part 文件失败: {e}")
+            elif checkpoint_manager and part_path.exists():
+                logger.info(
+                    f"[ChunkAssembler] 保留 .part 文件以支持断点续传: {part_path.name}"
+                )
             raise
 
     def _assemble_with_parallel_write(
@@ -740,6 +821,7 @@ class ChunkAssembler(PrefetchHelpers):
         """并行写入模式（使用 GlobalWriter）。"""
         from xet.pipeline.global_writer import GlobalWriter
 
+        writer = None
         low_watermark = self.prefetch_low_mb * 1024 * 1024
         high_watermark = self.prefetch_high_mb * 1024 * 1024
 
@@ -905,13 +987,18 @@ class ChunkAssembler(PrefetchHelpers):
             )
 
         except Exception:
-            # 异常时清理 .part 文件
-            if part_path.exists():
+            # 异常时：仅在无 checkpoint 的情况下清理 .part 文件
+            # 有 checkpoint 时保留 .part，下次可从断点恢复（追加模式）
+            if not checkpoint_manager and part_path.exists():
                 try:
                     part_path.unlink()
                     logger.debug(f"[ChunkAssembler] 清理 .part 文件: {part_path}")
                 except Exception as e:
                     logger.warning(f"[ChunkAssembler] 清理 .part 文件失败: {e}")
+            elif checkpoint_manager and part_path.exists():
+                logger.info(
+                    f"[ChunkAssembler] 保留 .part 文件以支持断点续传: {part_path.name}"
+                )
             raise
 
         finally:

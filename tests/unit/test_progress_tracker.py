@@ -131,7 +131,8 @@ def test_speed_calculation():
     # 手动设置开始时间（通过私有属性，仅测试用）
     tracker._start_time = time.time() - 1.0  # 1 秒前开始
 
-    tracker.increment_assembled(500)
+    # 速度基于 _downloaded_bytes 计算
+    tracker.increment_downloaded(500)
 
     stats = tracker.get_stats()
     # 500 字节 / 1 秒 = 500 B/s
@@ -143,7 +144,8 @@ def test_eta_calculation():
     tracker = ProgressTracker(total_bytes=1000)
 
     tracker._start_time = time.time() - 1.0  # 1 秒前开始
-    tracker.increment_assembled(250)  # 完成 25%
+    tracker.increment_downloaded(250)  # 速度基于 downloaded_bytes
+    tracker.increment_assembled(250)   # 进度百分比和剩余量基于 assembled
 
     stats = tracker.get_stats()
     # 剩余 750 字节，速度 250 B/s，ETA = 3 秒
@@ -187,7 +189,8 @@ def test_format_stats():
     tracker = ProgressTracker(total_bytes=100_000_000)  # 100 MB
 
     tracker._start_time = time.time() - 10.0
-    tracker.increment_assembled(50_000_000)  # 50 MB
+    tracker.increment_assembled(50_000_000)  # 50 MB assembled
+    tracker.increment_downloaded(50_000_000)  # 50 MB downloaded (speed 基于 downloaded)
 
     formatted = tracker.format_stats()
 

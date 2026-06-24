@@ -345,7 +345,7 @@ class SegmentedReconstructor:
         )
 
         try:
-            # 1. 加载 checkpoint
+            # 1. 加载段级 checkpoint
             if resume:
                 self.completed_set = self.segment_checkpoint.load(self.file_hash)
                 # 重建 completed_segments 列表
@@ -360,11 +360,47 @@ class SegmentedReconstructor:
                         })
 
                 if self.completed_segments:
+                    done_bytes = sum(s.get('size', 0) for s in self.completed_segments)
                     logger.info(
                         f"[SegmentedReconstructor] 发现 {len(self.completed_segments)} 个已完成段，跳过"
                     )
+                    print(
+                        f"\n  🔄 断点恢复: 跳过 {len(self.completed_segments)}/{len(self.segments)} 个已完成的段"
+                        f" ({_format_size(done_bytes)} 已写入)"
+                    )
 
-            # 2. 创建输出目录
+            # 2. 断点续传：在开始处理任何段之前，向进度条报告已有数据总量
+            # （包括已完成段 + 当前段的 .part 文件），这样进度条和中断报告都正确
+            if resume and self.progress_callback:
+                initial_bytes = 0
+                # 已完成段的累计大小
+                initial_bytes += sum(s.get('size', 0) for s in self.completed_segments)
+                # 第一个未完成段的 .part 文件（正在下载中的数据）
+                first_pending = None
+                for seg in self.segments:
+                    if not getattr(seg, 'completed', False):
+                        first_pending = seg
+                        break
+                if first_pending:
+                    part_path = self.temp_dir / f"seg_{first_pending.index}.tmp.part"
+                    if part_path.exists():
+                        initial_bytes += part_path.stat().st_size
+                # 报告初始进度（仅当有已有数据时）
+                if initial_bytes > 0:
+                    self.progress_callback({
+                        'assembled_bytes': initial_bytes,
+                        'total_bytes': self.file_size,
+                        'downloaded_bytes': 0,
+                        'progress_pct': (initial_bytes / self.file_size * 100) if self.file_size > 0 else 0,
+                        'completed_segments': len(self.completed_segments),
+                        'total_segments': len(self.segments),
+                    })
+                    logger.info(
+                        f"[SegmentedReconstructor] 进度条初始化: "
+                        f"{_format_size(initial_bytes)} 已有数据"
+                    )
+
+            # 3. 创建输出目录
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
             # 仅在并行写入模式下预分配文件空间（随机偏移写入需要）
@@ -557,12 +593,15 @@ class SegmentedReconstructor:
             f"offset={seg.start}, size={seg.size}"
         )
 
-        # 1. 请求 segment reconstruction
-        recon = self.cas_client.get_segment_reconstruction(
-            file_hash=self.file_hash,
-            start=seg.start,
-            end=seg.end,
-        )
+        # 1. 请求 segment reconstruction（优先从本地缓存加载）
+        recon = self._load_recon_cache(seg)
+        if recon is None:
+            recon = self.cas_client.get_segment_reconstruction(
+                file_hash=self.file_hash,
+                start=seg.start,
+                end=seg.end,
+            )
+            self._save_recon_cache(seg, recon)
 
         logger.debug(
             f"[SegmentedReconstructor] 段 {seg.index} reconstruction: "
@@ -588,11 +627,24 @@ class SegmentedReconstructor:
             recon: segment 的 reconstruction 响应
             seg_temp: 临时文件路径
         """
-        progress_tracker = ProgressTracker(callback=self.progress_callback)
+        # 在创建 ProgressTracker 之前先计算基础值（断点续传时 .part 文件已有数据）
+        base_bytes = seg.start  # 已完成段的偏移
+        part_path = self.temp_dir / f"seg_{seg.index}.tmp.part"
+        if part_path.exists():
+            base_bytes += part_path.stat().st_size
+
+        progress_tracker = ProgressTracker(
+            callback=self.progress_callback,
+            initial_assembled=base_bytes,
+        )
         # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
         progress_tracker.set_total_bytes(self.file_size)
-        # 已完成段的偏移量作为初始已组装字节数
-        progress_tracker.increment_assembled(seg.start)
+
+        if base_bytes > seg.start:
+            logger.debug(
+                f"[SegmentedReconstructor] 段 {seg.index} ProgressTracker 基线: "
+                f"{base_bytes / 1024 / 1024:.1f} MB (含 {part_path.stat().st_size / 1024 / 1024:.1f} MB 已有数据)"
+            )
 
         assembler = ChunkAssembler(
             temp_dir=self.temp_dir,
@@ -609,6 +661,8 @@ class SegmentedReconstructor:
         # 创建 term 级 checkpoint manager（支持段内断点续传）
         ckpt_path = self.temp_dir / f"seg_{seg.index}.term_ckpt.json"
         checkpoint_manager = CheckpointManager(ckpt_path)
+        # 加载已有 checkpoint（关键：否则断点续传不会生效）
+        checkpoint_manager.load(self.file_hash)
 
         assembler.assemble_file_with_prefetch(
             recon=recon,
@@ -621,6 +675,64 @@ class SegmentedReconstructor:
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _get_recon_cache_path(self, seg: SegmentInfo) -> Path:
+        """获取 segment reconstruction 缓存文件路径。"""
+        return self.temp_dir / f"seg_{seg.index}.recon.json"
+
+    def _load_recon_cache(self, seg: SegmentInfo):
+        """从本地缓存加载 reconstruction 响应（避免重复请求 CAS API）。
+
+        Returns:
+            QueryReconstructionResponse 或 None（缓存不存在/不匹配）
+        """
+        cache_path = self._get_recon_cache_path(seg)
+        if not cache_path.exists():
+            return None
+
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # 验证 file_hash 和范围匹配
+            if (data.get('file_hash') != self.file_hash
+                    or data.get('start') != seg.start
+                    or data.get('end') != seg.end):
+                logger.debug("[SegmentedReconstructor] Recon 缓存不匹配，重新请求")
+                return None
+
+            from xet.protocol.types import QueryReconstructionResponse
+            recon = QueryReconstructionResponse.from_dict(data['response'])
+            logger.info(
+                f"[SegmentedReconstructor] 📋 Recon 缓存命中: "
+                f"段 {seg.index} ({len(recon.terms)} terms, "
+                f"{len(recon.fetch_info)} xorbs), 跳过 CAS 请求"
+            )
+            return recon
+
+        except (json.JSONDecodeError, KeyError, Exception) as e:
+            logger.debug(f"[SegmentedReconstructor] Recon 缓存加载失败: {e}")
+            return None
+
+    def _save_recon_cache(self, seg: SegmentInfo, recon) -> None:
+        """保存 reconstruction 响应到本地缓存。"""
+        cache_path = self._get_recon_cache_path(seg)
+        try:
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'file_hash': self.file_hash,
+                    'start': seg.start,
+                    'end': seg.end,
+                    'cached_at': int(time.time()),
+                    'response': recon.to_dict(),
+                }, f)
+            logger.debug(
+                f"[SegmentedReconstructor] Recon 缓存已保存: "
+                f"seg_{seg.index}.recon.json"
+            )
+        except Exception as e:
+            logger.warning(f"[SegmentedReconstructor] Recon 缓存保存失败: {e}")
+
     def _process_segment(self, seg: SegmentInfo) -> None:
         """处理单个分段（顺序模式，流式写入，无全量内存中转）。
 
@@ -632,11 +744,16 @@ class SegmentedReconstructor:
             f"offset={seg.start}, size={seg.size}"
         )
 
-        recon = self.cas_client.get_segment_reconstruction(
-            file_hash=self.file_hash,
-            start=seg.start,
-            end=seg.end,
-        )
+        # 优先从本地缓存加载 reconstruction（避免 ~2 分钟的 CAS API 等待）
+        recon = self._load_recon_cache(seg)
+        if recon is None:
+            recon = self.cas_client.get_segment_reconstruction(
+                file_hash=self.file_hash,
+                start=seg.start,
+                end=seg.end,
+            )
+            # 缓存到本地，下次启动秒级加载
+            self._save_recon_cache(seg, recon)
 
         logger.debug(
             f"[SegmentedReconstructor] 段 {seg.index} reconstruction: "
@@ -654,9 +771,17 @@ class SegmentedReconstructor:
                 with open(seg_temp, 'rb') as src:
                     shutil.copyfileobj(src, f)
 
-        finally:
+            # 仅在成功完成后清理临时文件（中断时保留以支持断点续传）
             if seg_temp.exists():
                 seg_temp.unlink()
+
+        except Exception:
+            # 异常时保留 .tmp 文件，下次运行可从 checkpoint + 残留文件恢复
+            logger.info(
+                f"[SegmentedReconstructor] 段 {seg.index} 处理中断，"
+                f"保留临时文件 {seg_temp.name} 以支持断点续传"
+            )
+            raise
 
         logger.info(f"[SegmentedReconstructor] 段 {seg.index} 完成: {seg.size} bytes")
 
@@ -716,11 +841,22 @@ class SegmentedReconstructor:
         try:
             # 清理临时目录
             if self.temp_dir and self.temp_dir.exists():
-                for seg_checkpoint in self.temp_dir.glob(f"{self.output_path.name}.seg*.json"):
-                    seg_checkpoint.unlink()
+                for pattern in ("*.recon.json", "seg_*.term_ckpt.json", "seg_*.tmp",
+                                f"{self.output_path.name}.seg*.json"):
+                    for f in self.temp_dir.glob(pattern):
+                        f.unlink()
 
                 if not any(self.temp_dir.iterdir()):
                     self.temp_dir.rmdir()
                     logger.info(f"[SegmentedReconstructor] 清理临时目录: {self.temp_dir}")
         except Exception as e:
             logger.warning(f"[SegmentedReconstructor] 清理失败: {e}")
+
+
+def _format_size(n: int) -> str:
+    """格式化字节数为人类可读字符串（用于控制台输出）。"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"

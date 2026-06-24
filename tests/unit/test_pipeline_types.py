@@ -101,7 +101,7 @@ def test_reconstruction_checkpoint_default_values():
     assert checkpoint.file_hash == TEST_FILE_HASH
     assert len(checkpoint.completed_xorbs) == 0
     assert checkpoint.timestamp == 0
-    assert checkpoint.version == 1
+    assert checkpoint.version == 2
 
 
 def test_reconstruction_checkpoint_validation_empty_hash():

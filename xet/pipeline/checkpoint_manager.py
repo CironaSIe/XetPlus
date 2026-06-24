@@ -40,6 +40,7 @@ class CheckpointManager:
         self.checkpoint_path = checkpoint_path
         self._lock = threading.Lock()
         self._cache: Optional[ReconstructionCheckpoint] = None
+        self._last_save_time: float = 0.0  # 时间兜底：上次保存的 unix 时间戳
 
     def load(self, file_hash: str) -> Optional[ReconstructionCheckpoint]:
         """加载指定文件的 checkpoint。
@@ -159,14 +160,14 @@ class CheckpointManager:
             self._save_unsafe(checkpoint)
 
     def mark_term_completed(self, file_hash: str, term_idx: int, xorb_hash: str,
-                            save_interval: int = 10) -> None:
+                            save_interval: int = 1) -> None:
         """标记一个 term 为已完成并定期保存。
 
         Args:
             file_hash: 文件的 MerkleHash
             term_idx: term 索引
             xorb_hash: term 所属的 xorb hash
-            save_interval: 保存间隔（每 N 个 term 保存一次，默认 10）
+            save_interval: 保存间隔（每 N 个 term 保存一次，默认 1）
         """
         with self._lock:
             # 尝试从缓存加载
@@ -188,9 +189,17 @@ class CheckpointManager:
             checkpoint.mark_term_completed(term_idx, xorb_hash)
             checkpoint.timestamp = int(time.time())
 
-            # 每 N 个 term 保存一次（减少磁盘写入）
-            if term_idx % save_interval == 0 or term_idx == 0:
+            # 双重保存策略：
+            # 1. 计数触发：每 N 个 term 保存一次（默认每个 term 都保存）
+            # 2. 时间兜底：超过 5 秒未保存则强制保存（防止长 xorb 下载期间丢失进度）
+            now = time.time()
+            should_save = (
+                term_idx % save_interval == 0 or term_idx == 0
+                or (now - self._last_save_time) > 5.0
+            )
+            if should_save:
                 self._save_unsafe(checkpoint)
+                self._last_save_time = now
                 logger.debug(
                     f"[Checkpoint] Term {term_idx} 已保存 "
                     f"({len(checkpoint.completed_terms)} terms total)"

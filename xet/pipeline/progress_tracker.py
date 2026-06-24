@@ -29,18 +29,20 @@ class ProgressTracker:
         self,
         total_bytes: int = 0,
         callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        initial_assembled: int = 0,
     ):
         """初始化进度跟踪器。
 
         Args:
             total_bytes: 预期总字节数（0 表示未知）
             callback: 进度更新回调函数，每次更新时调用
+            initial_assembled: 初始已组装字节数（断点续传时用于恢复基线）
         """
         self.total_bytes = total_bytes
         self.callback = callback
 
         self._downloaded_bytes = 0
-        self._assembled_bytes = 0
+        self._assembled_bytes = initial_assembled  # 断点续传：从已有数据开始而非 0
         self._start_time = time.time()
         self._lock = threading.Lock()
 
