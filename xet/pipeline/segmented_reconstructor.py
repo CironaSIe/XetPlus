@@ -692,7 +692,8 @@ class SegmentedReconstructor:
                 if k in (
                     'total_xorbs', 'completed_xorbs', 'active_xorbs',
                     'total_terms', 'processed_terms',
-                    'total_segments', 'completed_segments', 'current_segment',
+                    # 不包含 completed_segments/total_segments — 这些由 writer 上报
+                    'current_segment',
                 )
             })
         else:
