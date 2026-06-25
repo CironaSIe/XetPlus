@@ -575,8 +575,8 @@ class SegmentedReconstructor:
     def _writer_worker(self) -> None:
         """全局writer线程（接收写入任务并执行）。
 
-        从write_queue接收 (offset, data, seg_index) 元组，写入文件。
-        写入+fsync后负责标记段完成和上报进度。
+        从write_queue接收 (offset, seg_index, seg_temp, seg_size) 4元组，
+        从临时文件流式复制到最终文件偏移处，fsync落盘后标记段完成。
         收到 None 时退出。
         """
         logger.debug("[SegmentWriter] 启动")
@@ -602,21 +602,23 @@ class SegmentedReconstructor:
                         logger.debug("[SegmentWriter] 收到停止信号")
                         break
 
-                    offset, data, seg_index = item
+                    offset, seg_index, seg_temp, seg_size = item
 
-                    # 写入文件
-                    f.seek(offset)
-                    f.write(data)
+                    # 从临时文件流式复制到最终文件（不加载整个 segment 到内存）
+                    with open(seg_temp, 'rb') as src:
+                        f.seek(offset)
+                        shutil.copyfileobj(src, f)
                     f.flush()
                     os.fsync(f.fileno())
-
-                    self._total_written += len(data)
+                    seg_temp.unlink(missing_ok=True)
 
                     # Writer 负责标记段完成（数据已落盘）
                     self._mark_segment_completed_by_index(seg_index)
 
+                    self._total_written += seg_size
+
                     logger.debug(
-                        f"[SegmentWriter] 写入完成: offset={offset}, size={len(data)}, "
+                        f"[SegmentWriter] 写入完成: offset={offset}, size={seg_size}, "
                         f"seg_index={seg_index}, total_written={self._total_written}"
                     )
 
@@ -674,31 +676,44 @@ class SegmentedReconstructor:
             f"{len(recon.terms)} terms, {len(recon.fetch_info)} xorbs"
         )
 
-        # 2. 下载和重建数据到内存
-        segment_data = self._download_and_assemble_segment(seg, recon)
+        # 2. 下载和重建数据到临时文件
+        seg_temp = self._download_and_assemble_segment(seg, recon)
 
         # 2.5. 检查是否已被停止（其他 worker 失败或 Ctrl+C）
         if self._stop_event.is_set():
-            logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 已取消，丢弃下载数据")
+            logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 已取消，丢弃临时文件")
+            seg_temp.unlink(missing_ok=True)
             return
 
         # 3. 发送到write_queue（含 seg_index，由 writer 落盘后标记完成）
         assert self._write_queue is not None  # 仅 _reconstruct_parallel 调用该方法
-        self._write_queue.put((seg.start, segment_data, seg.index))
+        seg_size = seg_temp.stat().st_size
+        self._write_queue.put((seg.start, seg.index, seg_temp, seg_size))
 
-        logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 下载+解压完成: {len(segment_data)} bytes, 已入队等待写入")
+        logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 下载+解压完成: {seg_size} bytes, 已入队等待写入")
 
-    def _stream_assembly_to_temp(self, seg: SegmentInfo, recon, seg_temp: Path) -> None:
-        """用 ChunkAssembler 流式组装段数据到临时文件。
+    def _assemble_segment_data(
+        self, seg: SegmentInfo, recon,
+        seg_temp: Optional[Path] = None,
+        output_path: Optional[Path] = None,
+        output_offset: int = 0,
+    ) -> None:
+        """用 ChunkAssembler 流式组装段数据。
 
         Args:
             seg: 分段信息
             recon: segment 的 reconstruction 响应
-            seg_temp: 临时文件路径
+            seg_temp: 临时文件路径（并行模式用）
+            output_path: 直接写入的目标文件路径（串行模式用）
+            output_offset: 在目标文件中的起始偏移（串行模式用）
         """
+        # 确定输出目标
+        target = output_path if output_path else seg_temp
+        if target is None:
+            raise ValueError("必须指定 seg_temp 或 output_path")
+
         # 在创建 ProgressTracker 之前先计算基础值（断点续传时 .part 文件已有数据）
         if self.parallel_segments > 1:
-            # 并行模式：bytes 级进度由 writer 线程上报，worker 只报 xorbs/terms/segments
             base_bytes = 0
             _worker_cb = None
             if self.progress_callback:
@@ -712,7 +727,6 @@ class SegmentedReconstructor:
                     k: v for k, v in stats.items() if k in _progress_keys
                 })
         else:
-            # 串行模式：seg.start 是已完成段的偏移，累加显示正确
             base_bytes = seg.start
             _worker_cb = self.progress_callback
         part_path = self.temp_dir / f"seg_{seg.index}.tmp.part"
@@ -723,7 +737,6 @@ class SegmentedReconstructor:
             callback=_worker_cb,
             initial_assembled=base_bytes,
         )
-        # 使用文件总大小（而非段大小）作为进度条总量，这样进度百分比是文件级别的
         progress_tracker.set_total_bytes(self.file_size)
         progress_tracker.set_total_xorbs(len(recon.fetch_info))
         progress_tracker.set_total_terms(len(recon.terms))
@@ -747,21 +760,20 @@ class SegmentedReconstructor:
             xorb_cache=self.xorb_cache,
         )
 
-        # 创建 term 级 checkpoint manager（支持段内断点续传）
         ckpt_path = self.temp_dir / f"seg_{seg.index}.term_ckpt.json"
         checkpoint_manager = CheckpointManager(ckpt_path)
-        # 加载已有 checkpoint（关键：否则断点续传不会生效）
         checkpoint_manager.load(self.file_hash)
 
         assembler.assemble_file_with_prefetch(
             recon=recon,
             cas_client=self.cas_client,
-            output_path=seg_temp,
+            output_path=target,
             file_hash=self.file_hash,
             progress_tracker=progress_tracker,
             cache_adapter=cache_adapter,
             stop_event=self._stop_event,
             checkpoint_manager=checkpoint_manager,
+            output_offset=output_offset,
         )
 
     def _get_recon_cache_path(self, seg: SegmentInfo) -> Path:
@@ -849,56 +861,41 @@ class SegmentedReconstructor:
             f"{len(recon.terms)} terms, {len(recon.fetch_info)} xorbs"
         )
 
-        # 流式组装到临时文件（水位线控制内存，不加载全量 xorb）
-        seg_temp = self.temp_dir / f"seg_{seg.index}.tmp"
+        # 直接将组装后的数据写入最终文件的目标偏移（跳过 .tmp 中转）
         try:
-            self._stream_assembly_to_temp(seg, recon, seg_temp)
-
-            # 流式复制到最终文件（不加载整个 segment 到内存）
-            with open(self.output_path, 'r+b') as f:
-                f.seek(seg.start)
-                with open(seg_temp, 'rb') as src:
-                    shutil.copyfileobj(src, f)
-                f.flush()
-                os.fsync(f.fileno())
-
-            # 仅在成功完成后清理临时文件（中断时保留以支持断点续传）
-            if seg_temp.exists():
-                seg_temp.unlink()
+            self._assemble_segment_data(
+                seg, recon,
+                output_path=self.output_path, output_offset=seg.start,
+            )
 
         except Exception:
-            # 异常时保留 .tmp 文件，下次运行可从 checkpoint + 残留文件恢复
+            # 异常时保留断点续传文件
             logger.info(
                 f"[SegmentedReconstructor] 段 {seg.index} 处理中断，"
-                f"保留临时文件 {seg_temp.name} 以支持断点续传"
+                f"保留断点续传文件"
             )
             raise
 
         logger.info(f"[SegmentedReconstructor] 段 {seg.index} 完成: {seg.size} bytes")
 
-    def _download_and_assemble_segment(self, seg: SegmentInfo, recon) -> bytes:
-        """下载并组装segment数据（并行模式用，返回 bytes 用于 write queue）。
+    def _download_and_assemble_segment(self, seg: SegmentInfo, recon) -> Path:
+        """下载并组装segment数据（并行模式用，返回 Path 给 write queue）。
 
         使用 ChunkAssembler 的预取水位线机制流式处理，
         避免将所有 xorb 同时加载到内存。
+
+        调用方负责在写入完成后清理返回的临时文件。
 
         Args:
             seg: 分段信息
             recon: segment的reconstruction响应
 
         Returns:
-            组装后的segment数据（bytes）
+            包含组装后数据的临时文件路径
         """
         seg_temp = self.temp_dir / f"seg_{seg.index}.tmp"
-
-        try:
-            self._stream_assembly_to_temp(seg, recon, seg_temp)
-            return seg_temp.read_bytes()
-
-        finally:
-            if seg_temp.exists():
-                seg_temp.unlink()
-                logger.debug(f"[SegmentedReconstructor] 清理临时文件: {seg_temp}")
+        self._assemble_segment_data(seg, recon, seg_temp=seg_temp)
+        return seg_temp
 
     def _mark_segment_completed(self, seg: SegmentInfo) -> None:
         """标记段为已完成并保存 checkpoint（同步模式，模式 ② 使用）。

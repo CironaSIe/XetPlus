@@ -9,6 +9,7 @@
 """
 import hashlib
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -86,6 +87,9 @@ class ChunkAssembler(PrefetchHelpers):
         self._stop_event = threading.Event()
         # 完成速率估算器（用于自适应预取）
         self._rate_estimator = CompletionRateEstimator(half_life=3)
+        # 文件系统同步：每 N term 做一次 fsync（默认 5 term ≈ 几百 KB 粒度）
+        self.fsync_interval: int = 5
+        self._term_write_count: int = 0
 
         if self.temp_dir:
             self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +131,7 @@ class ChunkAssembler(PrefetchHelpers):
         stop_event: Optional[threading.Event] = None,
         checkpoint_manager = None,
         parallel_write: bool = False,
+        output_offset: int = 0,
     ) -> None:
         """组装最终文件（预取模式，推荐）。
 
@@ -169,7 +174,7 @@ class ChunkAssembler(PrefetchHelpers):
             self._assemble_with_prefetch(
                 recon, cas_client, output_path, file_hash,
                 progress_tracker, cache_adapter, checkpoint_manager,
-                stop_event, parallel_write
+                stop_event, parallel_write, output_offset
             )
 
         finally:
@@ -452,6 +457,7 @@ class ChunkAssembler(PrefetchHelpers):
         checkpoint_manager=None,
         stop_event: Optional[threading.Event] = None,
         parallel_write: bool = False,
+        output_offset: int = 0,
     ) -> None:
         """预取模式：按需下载和解压，水位线控制内存。"""
         # 1. 确保输出目录存在
@@ -525,11 +531,18 @@ class ChunkAssembler(PrefetchHelpers):
                 stop_event, checkpoint_manager, start_time
             )
         else:
-            # 顺序写入模式（现有逻辑）
+            # 顺序写入模式
+            if output_offset > 0:
+                # 直写模式（模式②）：写入 output_path 的指定偏移，无 .part
+                write_path = output_path
+            else:
+                # 标准模式：写入 .part 文件，完成后 rename
+                write_path = part_path
             self._assemble_with_sequential_write(
-                recon, cas_client, part_path, output_path, file_hash,
+                recon, cas_client, write_path, output_path, file_hash,
                 start_term_idx, progress_tracker, cache_adapter,
-                stop_event, checkpoint_manager, start_time
+                stop_event, checkpoint_manager, start_time,
+                output_offset=output_offset,
             )
 
     @staticmethod
@@ -673,8 +686,9 @@ class ChunkAssembler(PrefetchHelpers):
         stop_event,
         checkpoint_manager,
         start_time,
+        output_offset: int = 0,
     ):
-        """顺序写入模式（现有逻辑）。"""
+        """顺序写入模式。"""
         low_watermark = self.prefetch_low_mb * 1024 * 1024
         high_watermark = self.prefetch_high_mb * 1024 * 1024
         total_written = 0
@@ -737,9 +751,13 @@ class ChunkAssembler(PrefetchHelpers):
                     need_truncate = True
 
         try:
-            # 根据是否有 checkpoint 选择文件打开模式
+            # 根据 output_offset 和 checkpoint 选择文件打开模式
             existing_size = 0
-            if start_term_idx > 0 and part_path.exists():
+            if output_offset > 0:
+                # 直写模式（模式②）：写入 output_path 的指定偏移，无 .part 文件
+                file_mode = 'r+b' if output_path.exists() else 'wb'
+                # 注意：直写模式不支持 term 级别的断点恢复（段级别由调用方负责）
+            elif start_term_idx > 0 and part_path.exists():
                 # 从 checkpoint 恢复：使用 r+b 模式追加，并验证现有文件大小
                 file_mode = 'r+b'
                 existing_size = part_path.stat().st_size
@@ -824,8 +842,14 @@ class ChunkAssembler(PrefetchHelpers):
                 # 全新下载：使用 wb 模式
                 file_mode = 'wb'
 
-            with open(part_path, file_mode) as f:
-                if file_mode == 'r+b':
+            # 直写模式使用 output_path，.part 模式使用 part_path
+            open_path = output_path if output_offset > 0 else part_path
+            with open(open_path, file_mode) as f:
+                if output_offset > 0:
+                    # 直写模式：跳到目标偏移
+                    f.seek(output_offset)
+                    logger.debug(f"[ChunkAssembler] 直写模式: offset={output_offset}")
+                elif file_mode == 'r+b':
                     if need_truncate:
                         # 修正进度基线：baseline 之前包含了整个 .part 文件大小，
                         # truncate 后实际已确认数据变少，需同步调低
@@ -859,18 +883,18 @@ class ChunkAssembler(PrefetchHelpers):
                         logger.info("[ChunkAssembler] 检测到中断信号")
                         raise KeyboardInterrupt("用户中断")
 
-                    # 确保 xorb 已加载（触发下载/解压）
-                    self._ensure_xorb_ready(
-                        term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
-                    )
-
-                    # 检查水位线，预取后续 xorb
+                    # 先检查水位线、预取后续 xorb（在同步下载前触发，给预取更多时间）
                     current_cache_bytes = sum(x.memory_footprint() for x in self._xorb_cache.values())
                     if current_cache_bytes < low_watermark:
                         self._prefetch_upcoming_xorbs(
                             term_idx, recon, cas_client, file_hash,
                             cache_adapter, high_watermark, progress_tracker
                         )
+
+                    # 再确保 xorb 已加载（可能触发同步下载）
+                    self._ensure_xorb_ready(
+                        term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
+                    )
 
                     # 从 xorb 提取数据
                     xorb_data = self._xorb_cache[term.hash]
@@ -933,6 +957,12 @@ class ChunkAssembler(PrefetchHelpers):
                     f.write(segment)
                     total_written += len(segment)
 
+                    # 周期性 fsync：防止崩溃时 .part 文件在 confirmed_bytes 之后不完整
+                    self._term_write_count += 1
+                    if self._term_write_count % self.fsync_interval == 0:
+                        f.flush()
+                        os.fsync(f.fileno())
+
                     # 更新完成速率估算器
                     self._rate_estimator.update(len(segment))
 
@@ -978,8 +1008,9 @@ class ChunkAssembler(PrefetchHelpers):
                             f"已写入: {total_written / 1024 / 1024:.1f}MB"
                         )
 
-            # 写入完成后重命名 .part -> 目标文件
-            part_path.rename(output_path)
+            # 写入完成后重命名 .part -> 目标文件（直写模式跳过）
+            if output_offset == 0:
+                part_path.rename(output_path)
 
             # 完成统计
             duration = time.time() - start_time
@@ -997,8 +1028,9 @@ class ChunkAssembler(PrefetchHelpers):
             )
 
         except Exception:
-            # 异常时：仅在无 checkpoint 的情况下清理 .part 文件
-            # 有 checkpoint 时保留 .part，下次可从断点恢复（追加模式）
+            if output_offset > 0:
+                logger.error(f"[ChunkAssembler] 直写模式写入失败: output={output_path}, offset={output_offset}")
+                raise
             if not checkpoint_manager and part_path.exists():
                 try:
                     part_path.unlink()
@@ -1069,18 +1101,18 @@ class ChunkAssembler(PrefetchHelpers):
                     logger.info("[ChunkAssembler] 检测到中断信号")
                     raise KeyboardInterrupt("用户中断")
 
-                # 确保 xorb 已加载（触发下载/解压）
-                self._ensure_xorb_ready(
-                    term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
-                )
-
-                # 检查水位线，预取后续 xorb
+                # 先检查水位线、预取后续 xorb（在同步下载前触发，给预取更多时间）
                 current_cache_bytes = sum(x.memory_footprint() for x in self._xorb_cache.values())
                 if current_cache_bytes < low_watermark:
                     self._prefetch_upcoming_xorbs(
                         term_idx, recon, cas_client, file_hash,
                         cache_adapter, high_watermark, progress_tracker
                     )
+
+                # 再确保 xorb 已加载（可能触发同步下载）
+                self._ensure_xorb_ready(
+                    term.hash, recon, cas_client, file_hash, cache_adapter, progress_tracker
+                )
 
                 # 从 xorb 提取数据
                 xorb_data = self._xorb_cache[term.hash]

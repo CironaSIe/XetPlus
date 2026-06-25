@@ -290,24 +290,10 @@ class CASClient:
                 self._v2_available = False
                 logger.debug(f"[CAS] V2 Segment 失败: {e}, fallback V1")
 
-        # 使用 V1 API（可能不支持分段查询）
-        # 如果 V1 不支持，则先获取完整 reconstruction，然后在客户端过滤
-        url_v1 = f"{self.endpoint}/v1/reconstructions/{file_hash}"
-        logger.debug(
-            f"[CAS] 使用 V1 API（可能需要客户端过滤）: {url_v1[:80]}..."
-        )
-
-        resp = self.session.get(url_v1, headers=headers, timeout=self.timeout)
-
-        if resp.status_code == 401:
-            self._refresh_token()
-            headers = self._get_headers()
-            resp = self.session.get(
-                url_v1, headers=headers, timeout=self.timeout
-            )
-
-        resp.raise_for_status()
-        full_recon = QueryReconstructionResponse.from_dict(resp.json())
+        # 使用 get_reconstruction（有 _recon_cache 内存缓存，TTL 1800s）
+        # 取代直接调 V1 API（无缓存，N 段下载 N 次全量 recon）
+        logger.debug("[CAS] V2 不支持分段查询，通过 get_reconstruction 获取全量后本地过滤")
+        full_recon = self.get_reconstruction(file_hash)
 
         # 客户端过滤：只保留 [start, end) 范围内的 terms
         return self._filter_reconstruction_by_range(full_recon, start, end)
