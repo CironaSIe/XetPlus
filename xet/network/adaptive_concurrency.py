@@ -77,6 +77,7 @@ class AdaptiveConcurrencyController:
         self._current = initial
         self._semaphore = threading.Semaphore(initial)
         self._lock = threading.Lock()
+        self._pending_acquire: int = 0  # _maybe_decrease 欠债计数
 
         # EWMA 成功率跟踪
         self._ewma_success_rate: float = 1.0  # 初始假设成功率 100%
@@ -110,8 +111,12 @@ class AdaptiveConcurrencyController:
         return acquired
 
     def release(self):
-        """释放下载许可。"""
-        self._semaphore.release()
+        """释放下载许可（消费 _pending_acquire 欠债）。"""
+        with self._lock:
+            if self._pending_acquire > 0:
+                self._pending_acquire -= 1
+            else:
+                self._semaphore.release()
 
     def report_success(self, bytes_transferred: int = 0, rtt: Optional[float] = None):
         """报告成功，可能触发并发数增加。
@@ -224,8 +229,8 @@ class AdaptiveConcurrencyController:
             # 降低并发
             old_value = self._current
             self._current -= 1
-            # 注意：不能调用 acquire，因为可能阻塞
-            # 只是减少逻辑上的并发数，信号量会在下次 release 时自然对齐
+            # 不能调用 acquire（可能阻塞），用 _pending_acquire 标记告知 release 消费
+            self._pending_acquire += 1
             self._last_adjustment_time = now
 
             logger.info(
@@ -262,3 +267,4 @@ class AdaptiveConcurrencyController:
             self._success_count = 0
             self._total_count = 0
             self._last_adjustment_time = 0.0
+            self._pending_acquire = 0

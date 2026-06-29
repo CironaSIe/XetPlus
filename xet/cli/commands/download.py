@@ -787,6 +787,7 @@ def download_single_file(
 
     # 执行下载
     try:
+        xorb_hashes = []  # 初始化，非 segmented 路径会覆写
         with progress:
             if use_segmented:
                 # 使用分段下载

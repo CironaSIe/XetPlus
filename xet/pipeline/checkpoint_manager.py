@@ -3,6 +3,7 @@
 管理文件重建的 checkpoint，记录已完成的 xorb，支持中断后恢复。
 """
 import json
+import os
 import time
 import threading
 import logging
@@ -287,7 +288,7 @@ class CheckpointManager:
             return None
 
     def _save_unsafe(self, checkpoint: ReconstructionCheckpoint) -> None:
-        """保存 checkpoint（不加锁，仅供内部使用）。
+        """保存 checkpoint（不加锁，仅供内部使用，tmp+replace 原子写入）。
 
         Args:
             checkpoint: 要保存的 checkpoint 对象
@@ -299,8 +300,12 @@ class CheckpointManager:
             self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
             data = checkpoint.to_dict()
-            with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
+            tmp_path = self.checkpoint_path.with_suffix('.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(self.checkpoint_path)
 
             self._cache = checkpoint
 

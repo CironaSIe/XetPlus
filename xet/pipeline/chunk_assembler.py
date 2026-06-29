@@ -756,7 +756,7 @@ class ChunkAssembler(PrefetchHelpers):
             if output_offset > 0:
                 # 直写模式（模式②）：写入 output_path 的指定偏移，无 .part 文件
                 file_mode = 'r+b' if output_path.exists() else 'wb'
-                # 注意：直写模式不支持 term 级别的断点恢复（段级别由调用方负责）
+                # 续传时 seek 到 confirmed_bytes（在 line 850+ 处理）
             elif start_term_idx > 0 and part_path.exists():
                 # 从 checkpoint 恢复：使用 r+b 模式追加，并验证现有文件大小
                 file_mode = 'r+b'
@@ -846,9 +846,20 @@ class ChunkAssembler(PrefetchHelpers):
             open_path = output_path if output_offset > 0 else part_path
             with open(open_path, file_mode) as f:
                 if output_offset > 0:
-                    # 直写模式：跳到目标偏移
-                    f.seek(output_offset)
-                    logger.debug(f"[ChunkAssembler] 直写模式: offset={output_offset}")
+                    # 直写模式：跳到目标偏移（续传时优先用 confirmed_bytes）
+                    seek_pos = output_offset
+                    if start_term_idx > 0:
+                        if confirmed_bytes > 0:
+                            seek_pos = confirmed_bytes
+                        else:
+                            for i in range(start_term_idx):
+                                term = recon.terms[i]
+                                if i == 0:
+                                    seek_pos += max(0, term.unpacked_length - recon.offset_into_first_range)
+                                else:
+                                    seek_pos += term.unpacked_length
+                    f.seek(seek_pos)
+                    logger.debug(f"[ChunkAssembler] 直写模式: offset={output_offset}, seek_pos={seek_pos}")
                 elif file_mode == 'r+b':
                     if need_truncate:
                         # 修正进度基线：baseline 之前包含了整个 .part 文件大小，
@@ -857,6 +868,10 @@ class ChunkAssembler(PrefetchHelpers):
                         logger.info(
                             f"[ChunkAssembler] 截断文件到 {bytes_already_written / 1024 / 1024:.1f} MB, "
                             f"清除损坏数据"
+                        )
+                        # 顺序写入不变量：若 term N 损坏，则 N 之后的数据不可信
+                        assert bytes_already_written <= existing_size, (
+                            f"[ChunkAssembler] truncate 将丢数据: {bytes_already_written} > {existing_size}"
                         )
                         f.truncate(bytes_already_written)
                         f.seek(bytes_already_written)
@@ -1007,6 +1022,11 @@ class ChunkAssembler(PrefetchHelpers):
                             f"缓存: {cache_mb:.1f}MB, "
                             f"已写入: {total_written / 1024 / 1024:.1f}MB"
                         )
+
+                # final fsync：确保最后一个 fsync_interval 不足的 term 也落盘
+                if file_mode != 'wb' or total_written > 0:
+                    f.flush()
+                    os.fsync(f.fileno())
 
             # 写入完成后重命名 .part -> 目标文件（直写模式跳过）
             if output_offset == 0:

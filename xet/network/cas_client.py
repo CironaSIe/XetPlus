@@ -107,6 +107,12 @@ class CASClient:
             for k in list(self._recon_cache.keys()):
                 if k != file_hash:
                     del self._recon_cache[k]
+        # 顺带清理过期共享结果
+        with self._shared_refresh_lock:
+            if self._shared_refresh_recon is not None:
+                s_hash, _, s_ts = self._shared_refresh_recon
+                if s_hash != file_hash or time.time() - s_ts > 120:
+                    self._shared_refresh_recon = None
 
     def _get_headers(self) -> dict:
         """获取标准请求头（含认证）。
@@ -534,7 +540,14 @@ class CASClient:
         is_retrying = False  # 标记当前是否在重试状态
 
         try:
-            for attempt in range(self.retry_max):
+            _real_attempt = 0  # 真实重试计数（排除低速续传）
+            _low_speed_count = 0  # 低速超时计数（安全阀）
+            for attempt in range(self.retry_max * 10):  # 大预算，_real_attempt 做真实限流
+                if _real_attempt >= self.retry_max:
+                    raise RuntimeError(
+                        f"[CAS] 下载失败，已重试 {self.retry_max} 次: {xorb_hash[:16]}..."
+                    )
+
                 self._check_interrupt()
 
                 # 优先使用共享刷新结果中的新 URL（防止同一 file_hash 反复 403）
@@ -542,7 +555,7 @@ class CASClient:
                     if self._shared_refresh_recon is not None:
                         s_file_hash, s_recon, s_ts = self._shared_refresh_recon
                         if s_file_hash == file_hash and time.time() - s_ts < 120:
-                            if attempt == 0:
+                            if _real_attempt == 0:
                                 logger.debug(
                                     f"[CAS] xorb={xorb_hash[:16]}... 使用共享 reconstruction"
                                 )
@@ -618,11 +631,10 @@ class CASClient:
                     # 401: Token 过期 → 强制刷新 + 重新获取 reconstruction
                     if status_code == 401:
                         logger.warning(
-                            f"[CAS] 401 Token 过期 (尝试 {attempt + 1}/{self.retry_max})"
+                            f"[CAS] 401 Token 过期 (尝试 {_real_attempt + 1}/{self.retry_max})"
                         )
                         try:
                             self._force_refresh_token()
-                            # token 已变，清除缓存强制获取新 presigned URL
                             with self._recon_cache_lock:
                                 self._recon_cache.pop(file_hash, None)
                             recon = self.get_reconstruction(file_hash)
@@ -635,13 +647,20 @@ class CASClient:
                             continue
                         except Exception as refresh_err:
                             logger.error(f"[CAS] 401 恢复失败: {refresh_err}")
-                            if attempt == self.retry_max - 1:
+                            _real_attempt += 1
+                            if _real_attempt >= self.retry_max:
                                 raise
 
                     # 403: URL 过期 → 通过 URLRefreshCoordinator 协调刷新
                     elif status_code == 403:
+                        _real_attempt += 1
+                        if _real_attempt >= self.retry_max:
+                            raise RuntimeError(
+                                f"[CAS] 403 重试耗尽 ({self.retry_max} 次): {xorb_hash[:16]}..."
+                            )
+
                         logger.warning(
-                            f"[CAS] 403 URL 过期 (尝试 {attempt + 1}/{self.retry_max})"
+                            f"[CAS] 403 URL 过期 (尝试 {_real_attempt + 1}/{self.retry_max})"
                         )
 
                         # 检查协调器是否 exhausted
@@ -659,8 +678,12 @@ class CASClient:
                                 with self._recon_cache_lock:
                                     self._recon_cache.pop(file_hash, None)
                                 recon = self.get_reconstruction(file_hash)
-                                # 共享给其他等待中的线程
+                                # 共享给其他等待中的线程（写入前清理过期条目）
                                 with self._shared_refresh_lock:
+                                    if self._shared_refresh_recon is not None:
+                                        _, _, old_ts = self._shared_refresh_recon
+                                        if time.time() - old_ts > 120:
+                                            self._shared_refresh_recon = None
                                     self._shared_refresh_recon = (
                                         file_hash, recon, time.time()
                                     )
@@ -674,15 +697,14 @@ class CASClient:
                             except Exception as refresh_err:
                                 self._url_coordinator.release_refresh(success=False)
                                 logger.error(f"[CAS] 403 恢复失败: {refresh_err}")
-                                if attempt == self.retry_max - 1:
-                                    raise
+                                raise
                         else:
                             # 其他线程在刷新或冷却期，尝试使用共享结果
                             logger.info("[CAS] 403: 等待刷新结果...")
 
                         # 403 专用退避（比普通错误更长）
                         base_403 = 5.0
-                        delay = base_403 * (2.5 ** attempt) * random.uniform(0.7, 1.3)
+                        delay = base_403 * (2.5 ** _real_attempt) * random.uniform(0.7, 1.3)
                         logger.debug(f"[CAS] 403 退避: {delay:.2f}s")
                         self._interruptible_sleep(delay)
 
@@ -708,9 +730,10 @@ class CASClient:
 
                     else:
                         # 其他 HTTP 错误：标准退避
-                        if attempt == self.retry_max - 1:
+                        _real_attempt += 1
+                        if _real_attempt >= self.retry_max:
                             raise
-                        delay = 1.5 ** attempt * random.uniform(0.8, 1.2)
+                        delay = 1.5 ** _real_attempt * random.uniform(0.8, 1.2)
                         logger.warning(
                             f"[CAS] HTTP {status_code} 错误，{delay:.2f}s 后重试..."
                         )
@@ -738,6 +761,11 @@ class CASClient:
                     )
 
                     # 低速超时不算入重试次数（只调整范围）
+                    _low_speed_count += 1
+                    if _low_speed_count > self.retry_max * 5:
+                        raise RuntimeError(
+                            f"[CAS] 低速续传累计 {_low_speed_count} 次，放弃: {xorb_hash[:16]}..."
+                        )
                     continue
 
                 except Exception as e:
@@ -751,10 +779,11 @@ class CASClient:
                         self._acc.release()
                         self._acc.report_failure()
 
-                    if attempt == self.retry_max - 1:
+                    _real_attempt += 1
+                    if _real_attempt >= self.retry_max:
                         raise
 
-                    delay = 1.5 ** attempt
+                    delay = 1.5 ** _real_attempt
                     logger.warning(f"[CAS] 下载失败: {e}, {delay:.2f}s 后重试...")
                     self._interruptible_sleep(delay)
 

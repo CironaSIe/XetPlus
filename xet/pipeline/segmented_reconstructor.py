@@ -688,7 +688,17 @@ class SegmentedReconstructor:
         # 3. 发送到write_queue（含 seg_index，由 writer 落盘后标记完成）
         assert self._write_queue is not None  # 仅 _reconstruct_parallel 调用该方法
         seg_size = seg_temp.stat().st_size
-        self._write_queue.put((seg.start, seg.index, seg_temp, seg_size))
+        # 带超时的 put，防止 writer 崩溃后 worker 永久阻塞
+        while True:
+            try:
+                self._write_queue.put((seg.start, seg.index, seg_temp, seg_size), timeout=5.0)
+                break
+            except queue.Full:
+                if self._stop_event.is_set():
+                    logger.debug(f"[SegmentedReconstructor] 段 {seg.index} 写入取消（停止信号）")
+                    seg_temp.unlink(missing_ok=True)
+                    return
+                continue
 
         logger.info(f"[SegmentedReconstructor] [并行] 段 {seg.index} 下载+解压完成: {seg_size} bytes, 已入队等待写入")
 
@@ -718,9 +728,8 @@ class SegmentedReconstructor:
             _worker_cb = None
             if self.progress_callback:
                 _progress_keys = (
-                    'total_xorbs', 'completed_xorbs', 'active_xorbs',
-                    'total_terms', 'processed_terms',
-                    'current_segment',
+                    'completed_xorbs', 'active_xorbs',
+                    'processed_terms',
                 )
                 _cb: Callable = self.progress_callback
                 _worker_cb = lambda stats: _cb({
@@ -790,49 +799,51 @@ class SegmentedReconstructor:
         if not cache_path.exists():
             return None
 
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        with self._lock:
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
 
-            # 验证 file_hash 和范围匹配
-            if (data.get('file_hash') != self.file_hash
-                    or data.get('start') != seg.start
-                    or data.get('end') != seg.end):
-                logger.debug("[SegmentedReconstructor] Recon 缓存不匹配，重新请求")
+                # 验证 file_hash 和范围匹配
+                if (data.get('file_hash') != self.file_hash
+                        or data.get('start') != seg.start
+                        or data.get('end') != seg.end):
+                    logger.debug("[SegmentedReconstructor] Recon 缓存不匹配，重新请求")
+                    return None
+
+                from xet.protocol.types import QueryReconstructionResponse
+                recon = QueryReconstructionResponse.from_dict(data['response'])
+                logger.info(
+                    f"[SegmentedReconstructor] 📋 Recon 缓存命中: "
+                    f"段 {seg.index} ({len(recon.terms)} terms, "
+                    f"{len(recon.fetch_info)} xorbs), 跳过 CAS 请求"
+                )
+                return recon
+
+            except (json.JSONDecodeError, KeyError, Exception) as e:
+                logger.debug(f"[SegmentedReconstructor] Recon 缓存加载失败: {e}")
                 return None
-
-            from xet.protocol.types import QueryReconstructionResponse
-            recon = QueryReconstructionResponse.from_dict(data['response'])
-            logger.info(
-                f"[SegmentedReconstructor] 📋 Recon 缓存命中: "
-                f"段 {seg.index} ({len(recon.terms)} terms, "
-                f"{len(recon.fetch_info)} xorbs), 跳过 CAS 请求"
-            )
-            return recon
-
-        except (json.JSONDecodeError, KeyError, Exception) as e:
-            logger.debug(f"[SegmentedReconstructor] Recon 缓存加载失败: {e}")
-            return None
 
     def _save_recon_cache(self, seg: SegmentInfo, recon) -> None:
         """保存 reconstruction 响应到本地缓存。"""
         cache_path = self._get_recon_cache_path(seg)
-        try:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'file_hash': self.file_hash,
-                    'start': seg.start,
-                    'end': seg.end,
-                    'cached_at': int(time.time()),
-                    'response': recon.to_dict(),
-                }, f)
-            logger.debug(
-                f"[SegmentedReconstructor] Recon 缓存已保存: "
-                f"seg_{seg.index}.recon.json"
-            )
-        except Exception as e:
-            logger.warning(f"[SegmentedReconstructor] Recon 缓存保存失败: {e}")
+        with self._lock:
+            try:
+                self.temp_dir.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'file_hash': self.file_hash,
+                        'start': seg.start,
+                        'end': seg.end,
+                        'cached_at': int(time.time()),
+                        'response': recon.to_dict(),
+                    }, f)
+                logger.debug(
+                    f"[SegmentedReconstructor] Recon 缓存已保存: "
+                    f"seg_{seg.index}.recon.json"
+                )
+            except Exception as e:
+                logger.warning(f"[SegmentedReconstructor] Recon 缓存保存失败: {e}")
 
     def _process_segment(self, seg: SegmentInfo) -> None:
         """处理单个分段（顺序模式，流式写入，无全量内存中转）。
